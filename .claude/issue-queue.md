@@ -1,5 +1,11 @@
 # File d'issues — alcoLoco
 
+> **Socle en attente : PR #38** (`docs/spec-corrections`) — correction du coefficient Watson,
+> du tableau §10.1, et arbitrages §10.0-H→K. **#1 ne démarre qu'une fois #38 mergée** : un
+> worktree ne transporte que le contenu commité, et `main` ne porte encore ni README, ni
+> `.gitignore`, ni la spec corrigée. Corps de #2, #5, #6, #7, #13, #16, #17 et #37 déjà
+> réalignés sur GitHub le 2026-08-17.
+
 Milestone **V1** : 30 issues (#1–#29 + #37). Milestone **V2+** (#30–#36) hors file.
 Aucune issue `bug` ouverte — l'ordre est donc numérique, et il se trouve être déjà
 topologiquement valide au regard des « Bloqué par » déclarés dans chaque corps.
