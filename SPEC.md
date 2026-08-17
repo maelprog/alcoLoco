@@ -96,6 +96,22 @@ Relation clé : une consommation appartient **toujours** à l'historique du prof
   - durée d'absorption par défaut.
 - **[V1]** L'historique des paramètres du profil est conservé (versionnage), pour recalculer
   fidèlement les courbes historiques et préparer l'export **[V2+]**.
+- **[V1] Date d'effet choisie par l'utilisateur (§10.0-J).** À chaque modification des paramètres
+  physiologiques, l'API accepte un `valid_from` explicite, dont la valeur par défaut est l'instant
+  de la modification. Ce champ existe pour séparer deux gestes que le produit doit distinguer :
+  - *« j'ai grossi »* → `valid_from` = maintenant ; les courbes passées ne bougent pas ;
+  - *« je m'étais trompé de poids »* → `valid_from` antérieur ; les courbes de la période concernée
+    sont recalculées avec la valeur corrigée.
+
+  Règles associées, à respecter par l'implémentation :
+  - les versions d'un profil forment une suite **sans chevauchement ni trou** : poser une version à
+    `valid_from = T` ferme la précédente à `T` ; toute version déjà entièrement postérieure à `T`
+    est **remplacée**, et la réponse indique combien l'ont été ;
+  - `valid_from` ne peut pas être dans le futur ;
+  - la version la plus ancienne d'un profil a une borne basse ouverte, de sorte qu'une consommation
+    antérieure à toute modification trouve toujours une version applicable ;
+  - les **préférences de saisie** (unité, durées par défaut) **ne sont pas versionnées** : elles
+    n'entrent dans aucun calcul, seulement dans le pré-remplissage du formulaire.
 - **[V2+]** Authentification et gestion de comptes.
 
 ### 5.2 Événements
@@ -246,9 +262,16 @@ par les équations de **Watson (1980)**, qui exploitent poids, taille, âge et s
 l'âge sont donc des données de profil obligatoires.
 
 ```
-TBW_homme (L) = 2,447 − 0,09516 × âge + 0,1074 × taille(cm) + 0,3362 × poids(kg)
+TBW_homme (L) = 2,447 − 0,09156 × âge + 0,1074 × taille(cm) + 0,3362 × poids(kg)
 TBW_femme (L) = −2,097            + 0,1069 × taille(cm) + 0,2466 × poids(kg)
 ```
+
+> **Coefficient d'âge** : `0,09156`, valeur de Watson et al. (1980). Une version antérieure de ce
+> document portait `0,09516` — deux chiffres transposés. Corrigé le 2026-08-17 ; ne pas « rétablir ».
+>
+> **Âge à retenir** : l'âge est calculé à l'**heure d'ingestion de la boisson**, à partir de la date
+> de naissance portée par la `ProfileSettingsVersion` en vigueur. Aucun âge n'est figé en base : le
+> calcul reste ainsi rejouable à l'identique sans snapshot supplémentaire.
 
 > À noter : l'équation féminine de Watson n'a pas de terme d'âge. L'âge n'influence donc le calcul
 > que pour les profils masculins. C'est une propriété du modèle, pas un oubli — si l'on veut un âge
@@ -273,6 +296,10 @@ L'élimination est d'ordre zéro (saturée) :
 ```
 β = 0,15 g/L/h par défaut     (littérature : 0,10 – 0,20)
 ```
+
+**Décision actée (§10.0-H)** : en V1, `β` est une **constante** du crate `domain`, exposée en
+paramètre de fonction pour les tests — ce n'est **pas** une donnée de profil et elle n'apparaît pas
+en base. Le réglage par profil relève du calibrage **[V2+]** (#34).
 
 Le résultat est **borné à zéro par le bas** : à alcoolémie nulle, l'élimination s'arrête. Aucune
 « dette » ne peut être reportée sur une consommation ultérieure.
@@ -377,6 +404,12 @@ d'un module depuis un autre.
 | C | Coefficient de diffusion | **Watson**, exploitant poids, taille, âge et sexe (§6.2). Repli sur les constantes Widmark si une donnée manque. |
 | D | Paramètres profil obligatoires | **Poids, taille, sexe, date de naissance.** |
 | E | Note de ressenti par défaut | La suggestion **ne dépasse jamais le niveau 6** : le niveau 7 et au-delà ne sont jamais proposés, l'utilisateur peut les sélectionner lui-même. Barème indicatif : 1 < 0,2 ; 2 : 0,2–0,5 ; 3 : 0,5–0,8 ; 4 : 0,8–1,2 ; 5 : 1,2–1,8 ; 6 : > 1,8 g/L. |
+| F | Profil d'absorption | **Trapèze** (§6.4) retenu comme **défaut d'implémentation**. Arbitrage produit final avant release V1 → **#37**. |
+| G | Superposition | Les débits `R` se somment ; `β` est global au corps et ne s'applique **qu'une fois** (§6.5). |
+| H | Taux d'élimination `β` | **Constante** du crate `domain` en V1 (0,15 g/L/h), exposée en paramètre de fonction pour les tests. Ni donnée de profil, ni colonne en base. Calibrage par profil = **[V2+]** (#34). |
+| I | Granularité des courbes | **Pas d'intégration interne fixe à 1 min**, fenêtre = durée de l'événement **+ 3 h** de décroissance. Le `?step=` de l'API (§5.7, #17) ne fait que **sous-échantillonner** la série intégrée, et est **borné à [1 min, 1 h]** — il ne change jamais le pas d'intégration, donc jamais le résultat. |
+| J | Effet d'un changement de paramètres profil | La date d'effet (`valid_from`) est **choisie par l'utilisateur**, pour distinguer une correction de saisie d'une évolution réelle. Voir §5.1. |
+| K | Âge retenu par Watson | Calculé à l'**heure d'ingestion** de chaque boisson, depuis la date de naissance de la version en vigueur. Aucun âge figé en base (§6.2). |
 
 ### 10.1 Modèle d'ingestion et d'absorption — **défaut retenu, arbitrage final avant release V1 (#37)**
 
@@ -394,13 +427,19 @@ des courbes réelles, avec le porteur du produit, **avant la release V1**.
 
 | Variante | Pic | Instant du pic |
 |---|---|---|
-| Widmark pur (durées ignorées) | 0,347 g/L | t = 0 |
-| Rampe linéaire sur `t_ing + t_abs` | 0,222 g/L | 50 min |
-| **Trapèze — défaut actuel** | **0,222 g/L** | **50 min** |
-| Absorption exponentielle d'ordre 1 (`k_a = 3 / t_abs`) | 0,256 g/L | 26 min |
+| Widmark pur (durées ignorées) | 0,346 g/L | t = 0 |
+| Rampe linéaire sur `t_ing + t_abs` | 0,221 g/L | 50 min |
+| **Trapèze — défaut actuel** | **0,227 g/L** | **45,7 min** |
+| Absorption exponentielle d'ordre 1 (`k_a = 3 / t_abs`) | 0,255 g/L | 26 min |
 
-Cas de comparaison : homme 80 kg / 180 cm / 30 ans → `TBW` = 45,8 L ; 50 cL à 5 % vol → 19,7 g →
-`C₀` = 0,347 g/L ; `t_ing` = 20 min, `t_abs` = 30 min, `β` = 0,15.
+Cas de comparaison : homme 80 kg / 180 cm / 30 ans → `TBW` = 45,93 L ; 50 cL à 5 % vol → 19,725 g →
+`C₀` = 0,346 g/L ; `t_ing` = 20 min, `t_abs` = 30 min, `β` = 0,15.
+
+> **Tableau recalculé le 2026-08-17.** La ligne « Trapèze » reprenait par erreur les valeurs de la
+> ligne « Rampe linéaire ». Les deux modèles ne peuvent pas coïncider : le trapèze concentre
+> l'absorption au milieu de la fenêtre et pique donc **plus haut et plus tôt** que la rampe, qui
+> l'étale uniformément. Le pic se lit là où `κ × R(τ) = β`, sur la branche descendante de `R` pour
+> le trapèze. Les trois autres lignes n'ont bougé que du fait de la correction du coefficient Watson.
 
 > Les quatre variantes **convergent après le pic** : on retombe sur `C₀ − β × t`. L'arbitrage ne
 > joue donc que sur la première heure suivant chaque verre — mais c'est précisément la fenêtre qui
@@ -422,9 +461,18 @@ En V1 la bibliothèque personnelle n'existe pas : une composante saisie à la ma
 persistée que dans la boisson elle-même, et n'est réutilisable que par duplication depuis
 l'historique. À confirmer.
 
-### 10.3 Granularité des courbes — ouvert
-Pas d'échantillonnage et fenêtre d'affichage à définir (proposition : pas de 1 min, fenêtre =
-durée de l'événement + 3 h de décroissance).
+### 10.3 Granularité des courbes — **acté le 2026-08-17, voir §10.0-I**
+
+- **Pas d'intégration interne : 1 min**, fixe. C'est lui qui détermine le résultat du calcul, et il
+  n'est jamais exposé au client.
+- **Fenêtre** : durée de l'événement **+ 3 h** de décroissance. Pour un événement à fin ouverte,
+  la borne haute est `min(maintenant, fin) + 3 h`.
+- **`?step=` de `GET /profiles/{id}/bac` (#17)** : sous-échantillonne la série déjà intégrée,
+  **borné à [1 min, 1 h]**, valeur par défaut 1 min. Une valeur hors bornes est rejetée en 400. Ce
+  paramètre ne peut pas altérer le résultat du calcul — seulement la densité de points rendus.
+
+Motif du plafond : sans borne, une soirée de 12 h à 10 participants demandée au pas de la seconde
+produit ~432 000 points par requête.
 
 ### 10.4 Ajout d'un item à la bibliothèque **[V2+]** — ouvert
 La spec initiale s'interrompt sur « lors de l'ajout d'un item … (reste à spécifier) ». À reprendre

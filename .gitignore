@@ -1,0 +1,11 @@
+# Rust
+/target/
+
+# Node / Angular
+node_modules/
+/web/dist/
+/web/.angular/
+
+# Environnement local
+.env
+.env.local
