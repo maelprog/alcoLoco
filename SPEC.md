@@ -262,12 +262,22 @@ par les équations de **Watson (1980)**, qui exploitent poids, taille, âge et s
 l'âge sont donc des données de profil obligatoires.
 
 ```
-TBW_homme (L) = 2,447 − 0,09156 × âge + 0,1074 × taille(cm) + 0,3362 × poids(kg)
+TBW_homme (L) = 2,447 − 0,09516 × âge + 0,1074 × taille(cm) + 0,3362 × poids(kg)
 TBW_femme (L) = −2,097            + 0,1069 × taille(cm) + 0,2466 × poids(kg)
 ```
 
-> **Coefficient d'âge** : `0,09156`, valeur de Watson et al. (1980). Une version antérieure de ce
-> document portait `0,09516` — deux chiffres transposés. Corrigé le 2026-08-17 ; ne pas « rétablir ».
+> **Coefficient d'âge — attention aux sources divergentes.** La valeur retenue est **`0,09516`**,
+> celle de la publication d'origine : Watson PE, Watson ID, Batt RD, « Total body water volumes for
+> adult males and females estimated from simple anthropometric measurements », *Am J Clin Nutr*
+> 1980;33(1):27-39, dont l'abrégé donne `TBW = 2.447 − 0.09516 A + 0.1074 height + 0.3362 weight`
+> (SD 3,76 ; r² 70,4 %). Concordant : [Wikipedia — Body water](https://en.wikipedia.org/wiki/Body_water),
+> [Medscape](https://reference.medscape.com/calculator/344/total-body-water-watson-formula), QxMD.
+>
+> Une variante `0,09156` — les deux chiffres du milieu transposés — circule sur plusieurs
+> calculateurs grand public ([Omnicalculator](https://www.omnicalculator.com/health/body-water),
+> Calcipedia, iCalculator). **Ce n'est pas la valeur de l'article** : ne pas l'adopter sur la foi
+> d'un de ces sites. L'écart est faible (0,11 L sur ~45,8 L, soit 0,24 %) mais visible au 3ᵉ
+> décimal des g/L, donc dans les tests de #5 et #16.
 >
 > **Âge à retenir** : l'âge est calculé à l'**heure d'ingestion de la boisson**, à partir de la date
 > de naissance portée par la `ProfileSettingsVersion` en vigueur. Aucun âge n'est figé en base : le
@@ -427,19 +437,19 @@ des courbes réelles, avec le porteur du produit, **avant la release V1**.
 
 | Variante | Pic | Instant du pic |
 |---|---|---|
-| Widmark pur (durées ignorées) | 0,346 g/L | t = 0 |
-| Rampe linéaire sur `t_ing + t_abs` | 0,221 g/L | 50 min |
+| Widmark pur (durées ignorées) | 0,347 g/L | t = 0 |
+| Rampe linéaire sur `t_ing + t_abs` | 0,222 g/L | 50 min |
 | **Trapèze — défaut actuel** | **0,227 g/L** | **45,7 min** |
-| Absorption exponentielle d'ordre 1 (`k_a = 3 / t_abs`) | 0,255 g/L | 26 min |
+| Absorption exponentielle d'ordre 1 (`k_a = 3 / t_abs`) | 0,256 g/L | 26 min |
 
-Cas de comparaison : homme 80 kg / 180 cm / 30 ans → `TBW` = 45,93 L ; 50 cL à 5 % vol → 19,725 g →
-`C₀` = 0,346 g/L ; `t_ing` = 20 min, `t_abs` = 30 min, `β` = 0,15.
+Cas de comparaison : homme 80 kg / 180 cm / 30 ans → `TBW` = 45,82 L ; 50 cL à 5 % vol → 19,725 g →
+`C₀` = 0,347 g/L ; `t_ing` = 20 min, `t_abs` = 30 min, `β` = 0,15.
 
-> **Tableau recalculé le 2026-08-17.** La ligne « Trapèze » reprenait par erreur les valeurs de la
-> ligne « Rampe linéaire ». Les deux modèles ne peuvent pas coïncider : le trapèze concentre
-> l'absorption au milieu de la fenêtre et pique donc **plus haut et plus tôt** que la rampe, qui
-> l'étale uniformément. Le pic se lit là où `κ × R(τ) = β`, sur la branche descendante de `R` pour
-> le trapèze. Les trois autres lignes n'ont bougé que du fait de la correction du coefficient Watson.
+> **Ligne « Trapèze » corrigée le 2026-08-17.** Elle reprenait par erreur les valeurs de la ligne
+> « Rampe linéaire ». Les deux modèles ne peuvent pas coïncider : le trapèze concentre l'absorption
+> au milieu de la fenêtre et pique donc **plus haut et plus tôt** que la rampe, qui l'étale
+> uniformément. Le pic se lit là où `κ × R(τ) = β`, sur la branche descendante de `R` pour le
+> trapèze. Les trois autres lignes sont inchangées.
 
 > Les quatre variantes **convergent après le pic** : on retombe sur `C₀ − β × t`. L'arbitrage ne
 > joue donc que sur la première heure suivant chaque verre — mais c'est précisément la fenêtre qui

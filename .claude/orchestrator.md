@@ -124,7 +124,7 @@ Ces points étaient ouverts ou faux dans la spec initiale. Ils sont désormais t
 
 | Réf. | Décision |
 |---|---|
-| §6.2 | Coefficient d'âge de Watson = **`0,09156`** (et non `0,09516` : deux chiffres transposés dans la spec initiale, corrigé après vérification en littérature). **Ne pas « rétablir » l'ancienne valeur.** |
+| §6.2 | Coefficient d'âge de Watson = **`0,09516`**, valeur de l'article d'origine (*Am J Clin Nutr* 1980;33:27-39). Une variante `0,09156` circule sur des calculateurs en ligne : **c'est elle qui est fausse**, ne pas l'introduire. |
 | §10.0-K | L'**âge** est calculé à l'**heure d'ingestion** de la boisson, depuis la date de naissance de la version en vigueur. Aucun âge n'est stocké. |
 | §10.0-H | **`β` est une constante** du crate `domain` (0,15 g/L/h), paramétrable en argument de fonction pour les tests. **Pas de colonne en base, pas de champ d'API.** |
 | §10.0-I | Pas d'intégration interne **fixe à 1 min** ; fenêtre = durée de l'événement **+ 3 h**. Le `?step=` de #17 **sous-échantillonne seulement**, borné à **[1 min, 1 h]**, hors bornes → 400. |
