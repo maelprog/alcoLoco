@@ -11,8 +11,9 @@ individuellement et en comparaison des autres participants d'un même événemen
 
 ## État du projet
 
-Phase de spécification : le dépôt ne contient pour l'instant que le document de référence.
-Aucun code n'est encore écrit.
+Squelette technique en place : workspace Rust, application Angular, PostgreSQL local et CI. Aucune
+fonctionnalité métier n'est encore implémentée — le backend n'expose qu'un point de santé et le
+front qu'une page vide.
 
 La source de vérité unique est **[SPEC.md](SPEC.md)**. Toute question de périmètre, de modèle de
 domaine ou de règle de calcul s'y tranche ; ce README n'en est qu'un résumé d'entrée.
@@ -24,6 +25,94 @@ domaine ou de règle de calcul s'y tranche ; ce README n'en est qu'un résumé d
 | Backend | Rust — framework **axum** |
 | Frontend | TypeScript — **Angular** |
 | Base de données | **PostgreSQL** |
+
+---
+
+## Démarrage local
+
+### Prérequis
+
+| Outil | Version de référence | Sert à |
+|---|---|---|
+| Docker + Docker Compose | v2 (`docker compose`) | base de données locale |
+| Rust (`rustup`) | **1.97.1**, avec `rustfmt` et `clippy` | backend |
+| Node.js + npm | **22.x** | frontend |
+
+La version de Rust est celle épinglée par la CI (`.github/workflows/ci.yml`) : s'en écarter en local
+expose à des écarts de `rustfmt` et de `clippy`.
+
+### Arborescence
+
+```
+crates/api/       binaire axum — point d'entrée HTTP
+crates/domain/    moteur de calcul, sans I/O ni framework (SPEC.md §7, §9)
+web/              application Angular
+docker-compose.yml  PostgreSQL local
+```
+
+### Base de données
+
+```bash
+docker compose up -d          # démarre PostgreSQL 16
+docker compose logs -f db     # suit les journaux
+docker compose down           # arrête ; ajouter -v pour effacer les données
+```
+
+Le service écoute sur `localhost:5432` et les identifiants par défaut sont
+`alcoloco` / `alcoloco` / base `alcoloco`. Ils sont surchargeables par variables d'environnement —
+utile pour faire tourner plusieurs instances en parallèle :
+
+```bash
+POSTGRES_PORT=55432 docker compose -p alcoloco-autre up -d
+```
+
+| Variable | Défaut |
+|---|---|
+| `POSTGRES_USER` | `alcoloco` |
+| `POSTGRES_PASSWORD` | `alcoloco` |
+| `POSTGRES_DB` | `alcoloco` |
+| `POSTGRES_PORT` | `5432` |
+
+### Backend
+
+```bash
+cargo run -p api              # sert sur http://localhost:8080
+curl http://localhost:8080/health   # -> ok
+```
+
+L'adresse d'écoute est surchargeable par `ALCOLOCO_API_ADDR` (défaut `0.0.0.0:8080`).
+
+Contrôles qualité, identiques à ceux de la CI :
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace
+```
+
+### Frontend
+
+```bash
+cd web
+npm ci
+npm start                     # sert sur http://localhost:4200
+npm run build                 # bundle de production dans web/dist/
+```
+
+Contrôles qualité, identiques à ceux de la CI :
+
+```bash
+npm run lint
+npm run test -- --watch=false
+```
+
+Les tests unitaires du front tournent sous **Vitest** avec l'environnement `jsdom` : aucun
+navigateur n'est nécessaire.
+
+### Intégration continue
+
+Le workflow `.github/workflows/ci.yml` s'exécute sur chaque *pull request* et sur `main`. Il porte
+deux jobs : **`rust`** (format, clippy, tests) et **`web`** (lint, tests).
 
 ## Périmètre V1
 
