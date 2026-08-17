@@ -1,0 +1,8 @@
+[package]
+name = "domain"
+description = "Pure blood alcohol computation engine, free of any I/O or framework dependency."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
