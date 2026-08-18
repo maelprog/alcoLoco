@@ -3,10 +3,10 @@
 Application de suivi d'alcoolémie. Backend **Rust / axum**, frontend **Angular**,
 base **PostgreSQL**. Dépôt public `maelprog/alcoLoco`, branche par défaut `main`.
 
-> **État au 2026-08-17 : dépôt vierge de code.** Il ne contient que `SPEC.md` et
-> `README.md`. Il n'y a **ni workspace Cargo, ni app Angular, ni CI** : c'est
-> l'issue **#1** qui les crée. Tant que #1 n'est pas mergée, la section *Gates*
-> ci-dessous est **provisoire** — voir l'encadré qui l'ouvre.
+> **État au 2026-08-18 : socle en place.** #1 est mergée (PR #39, `5a9f96f`). `main`
+> porte le workspace Cargo (`crates/api` axum + `crates/domain`), l'app Angular dans
+> `web/`, `docker-compose.yml` (Postgres 16) et le workflow CI. La section *Gates*
+> ci-dessous n'est plus provisoire : elle recopie `.github/workflows/ci.yml`.
 
 ---
 
@@ -58,36 +58,52 @@ docker run --rm -v "$PWD/web":/w -w /w node:22-bookworm-slim <commande npm/ng>
 
 ### Postgres
 
-`docker-compose.yml` est créé par #1. **Chaque worktree doit utiliser son propre
-nom de projet compose et son propre port**, sinon deux issues en parallèle se
-marchent dessus sur le port 5432 :
+`docker-compose.yml` est sur `main` depuis #1 : service `db`, image
+**`postgres:16-alpine`**, healthcheck `pg_isready`, volume nommé `db_data`. Il lit
+quatre variables, avec défauts : `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`
+= `alcoloco`, et `POSTGRES_PORT` = `5432`.
+
+**Chaque worktree doit poser son propre nom de projet compose *et* son propre port
+hôte.** Le nom de projet seul ne suffit pas : le port hôte est publié en dur par la
+variable, donc deux projets se disputent quand même `5432`.
 
 ```bash
-docker compose -p alcoloco-<numéro d'issue> up -d
+POSTGRES_PORT=54<numéro d'issue sur 2 chiffres> docker compose -p alcoloco-<numéro d'issue> up -d
+# ex. issue #2 → POSTGRES_PORT=5402 docker compose -p alcoloco-2 up -d
 ```
+
+Arrêt et nettoyage en fin d'issue : `docker compose -p alcoloco-<n> down -v`
+(le `-v` jette `db_data`, propre au projet).
 
 ---
 
 ## Gates
 
-> **Provisoire jusqu'à la fusion de #1.** L'issue #1 a pour livrable explicite la
-> « CI minimale : `cargo fmt --check`, `cargo clippy`, `cargo test`, `ng lint`,
-> `ng test` ». **Dès #1 mergée, l'orchestrateur remplace cette section par les
-> noms de jobs et les commandes exactes lus dans `.github/workflows/`** — pas par
-> une approximation.
+> **Recopié de `.github/workflows/ci.yml` le 2026-08-18** (workflow `CI`, sur
+> `pull_request` et sur `push` vers `main`). Deux jobs, tous deux `ubuntu-latest` :
+> **`rust`** (gates 1 à 3) et **`web`** (gates 4 et 5, `working-directory: web`).
+> Ce sont les deux checks à attendre verts sur une PR.
 >
-> `TODO` : noms de jobs CI — inconnus, aucun workflow n'existe (`actions/workflows`
-> renvoie 0).
+> La CI épingle sa toolchain par variable d'environnement du workflow —
+> `RUST_TOOLCHAIN: 1.97.1` et `NODE_VERSION: 22` — et **il n'y a pas de
+> `rust-toolchain.toml`** : les images `alcoloco-rust:dev` (rust 1.97.1) et
+> `node:22-bookworm-slim` de la section *Environnement* sont donc alignées sur la
+> CI, mais rien ne le garantit mécaniquement. Toute bascule de version se fait des
+> deux côtés à la fois.
 
 Dans l'ordre, tous doivent être verts avant d'ouvrir la PR :
 
-| # | Gate | Commande (dans le conteneur, cf. *Environnement*) |
-|---|---|---|
-| 1 | Format Rust | `cargo fmt --all -- --check` |
-| 2 | Lint Rust | `cargo clippy --all-targets --all-features -- -D warnings` |
-| 3 | Tests Rust | `cargo test --workspace` |
-| 4 | Lint front | `npm run lint` (dans `web/`) |
-| 5 | Tests front | `npm run test -- --watch=false --browsers=ChromeHeadless` |
+| # | Gate | Job CI | Commande (dans le conteneur, cf. *Environnement*) |
+|---|---|---|---|
+| 1 | Format Rust | `rust` | `cargo fmt --all -- --check` |
+| 2 | Lint Rust | `rust` | `cargo clippy --all-targets --all-features -- -D warnings` |
+| 3 | Tests Rust | `rust` | `cargo test --workspace` |
+| 4 | Lint front | `web` | `npm run lint` (dans `web/`, → `ng lint`) |
+| 5 | Tests front | `web` | `npm run test -- --watch=false` (dans `web/`, → `ng test`) |
+
+⚠ **Gate 5 : plus de `--browsers=ChromeHeadless`.** Angular 22 utilise le lanceur
+**vitest + jsdom** par défaut ; l'ancienne forme Karma échoue. Aucun navigateur
+n'est nécessaire dans le conteneur. La CI lance exactement `npm run test -- --watch=false`.
 
 Les gates 4 et 5 ne s'appliquent qu'aux issues touchant `web/`, les gates 1 à 3
 qu'à celles touchant du Rust. Une issue purement backend ne lance pas les gates
@@ -169,9 +185,17 @@ spec exige qu'il soit « isolé du reste du backend (module dédié, testable
 unitairement) », et §10.1 impose que le profil d'absorption soit derrière une
 **abstraction remplaçable** (`AbsorptionProfile` dans le crate `domain`).
 
-Il n'existe encore **aucun test à imiter** : les premiers modèles seront ceux
-posés par #3 (tests d'intégration API) et #5 / #16 (cas de référence du moteur).
+Seul modèle existant à ce jour : les deux tests unitaires de
+`crates/domain/src/lib.rs` (module `#[cfg(test)] mod tests`, comparaison de flottants
+par `assert!((x - attendu).abs() < 1e-9)`). Les modèles suivants viendront de #3
+(tests d'intégration API) et #5 / #16 (cas de référence du moteur).
 `TODO` : citer des fichiers réels une fois #3 et #16 mergées.
+
+⚠ **#1 a déjà posé un morceau du périmètre de #16** : `crates/domain` porte
+`ETHANOL_DENSITY_G_PER_ML` (0,789) et `ingested_alcohol_grams(volume_ml, abv_percent)`,
+conformes à §6.1 — formule et constante vérifiées le 2026-08-18, ainsi que le cas de
+test (250 mL à 5 % → 9,8625 g). **#16 les réutilise, ne les réécrit pas** et ne
+duplique pas la constante ailleurs.
 
 Contrainte forte issue de #5, à ne pas contourner : les cas de référence qui
 dépendent du modèle d'absorption sont écrits **marqués `#[ignore]`** :
@@ -188,7 +212,12 @@ un `#[ignore]` pour faire passer la CI est interdit dans tous les cas.
 
 ## Dépendances
 
-Aucune politique posée à ce jour (dépôt vierge). Règles de départ :
+**Il n'y a aucun audit de sécurité en CI** : `cargo audit` et `npm audit` ont été
+**écartés** du workflow par #1 (constaté dans `.github/workflows/ci.yml` le
+2026-08-18 — les jobs `rust` et `web` s'arrêtent au format, au lint et aux tests).
+Rien ne contrôle donc les CVE des dépendances aujourd'hui. C'est une dette assumée,
+pas un oubli à corriger au passage : l'ajouter modifie la CI, ce qui relève de
+l'*Escalade*.
 
 - Pas d'ajout de dépendance qui ne serve pas directement l'issue en cours ; toute
   nouvelle dépendance est justifiée en une ligne dans le corps de la PR.
@@ -196,9 +225,9 @@ Aucune politique posée à ce jour (dépôt vierge). Règles de départ :
 - **Interdit pour faire passer la CI** : ajouter un ignore d'audit de sécurité,
   désactiver une règle clippy en `allow` à l'échelle d'un crate, ou relâcher une
   contrainte de version.
-
-`TODO` : à revoir quand #1 aura fixé l'outillage (présence ou non de
-`cargo audit` / `npm audit` en CI).
+- Le workspace est en **`edition = "2024"` / `resolver = "3"`** (posé par #1, hors
+  spec). Les crates ajoutés ensuite héritent de `[workspace.package]` et ne
+  redéfinissent pas leur édition.
 
 ---
 
@@ -235,8 +264,9 @@ Section vivante — une ligne à ajouter après chaque mur rencontré.
 2. **Aucune toolchain hôte.** `cargo`/`node`/`npm`/`psql` sont introuvables et le
    resteront : c'est la configuration normale de cette machine, pas une panne.
 3. **`SPEC_CORRECTED.md` n'existe pas** — lire `SPEC.md` (les §§ cités sont bons).
-4. **Collision de port Postgres entre worktrees** : toujours
-   `docker compose -p alcoloco-<issue>`, jamais le nom de projet par défaut.
+4. **Collision de port Postgres entre worktrees** : `docker compose -p alcoloco-<issue>`
+   isole les conteneurs et le volume, **mais pas le port hôte**, publié en dur à
+   `${POSTGRES_PORT:-5432}`. Toujours passer *aussi* `POSTGRES_PORT` — cf. *Environnement*.
 5. **Fichiers appartenant à `root`** : les conteneurs écrivent en `root` sur les
    volumes montés (`target/`, `node_modules/`). Un `git worktree remove` peut
    alors échouer. Passer `--user "$(id -u):$(id -g)"` au `docker run` quand c'est
@@ -244,6 +274,15 @@ Section vivante — une ligne à ajouter après chaque mur rencontré.
 6. **`cargo fmt` reformate tout le workspace**, pas seulement les fichiers
    touchés. Sur un dépôt déjà formaté c'est sans effet ; au premier passage,
    vérifier que le diff ne déborde pas de l'issue.
+7. **Volume `alcoloco-cargo` appartenant à `root`** : avec `--user "$(id -u):$(id -g)"`,
+   `cargo` ne peut pas écrire dans le cache partagé tant que le volume appartient à
+   `root`. Rencontré par l'agent de #1, qui l'a corrigé une fois pour toutes par un
+   `chown -R 1000:1000` du volume. Si l'erreur réapparaît (volume recréé) :
+   ```bash
+   docker run --rm -v alcoloco-cargo:/c alpine chown -R 1000:1000 /c
+   ```
+8. **Gate 5 sans navigateur** : Angular 22 teste avec vitest + jsdom.
+   `--browsers=ChromeHeadless` n'est plus une option valide — cf. *Gates*.
 
 ---
 

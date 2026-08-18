@@ -9,3 +9,7 @@ node_modules/
 # Environnement local
 .env
 .env.local
+
+# Worktrees des agents : contenu volatil, jamais versionné.
+# Le reste de .claude/ (briefing, file d'issues, journaux) l'est.
+/.claude/worktrees/
