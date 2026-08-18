@@ -45,6 +45,7 @@ expose à des écarts de `rustfmt` et de `clippy`.
 
 ```
 crates/api/       binaire axum — point d'entrée HTTP
+crates/db/        schéma PostgreSQL, migrations et jeu de données de développement
 crates/domain/    moteur de calcul, sans I/O ni framework (SPEC.md §7, §9)
 web/              application Angular
 docker-compose.yml  PostgreSQL local
@@ -72,6 +73,38 @@ POSTGRES_PORT=55432 docker compose -p alcoloco-autre up -d
 | `POSTGRES_PASSWORD` | `alcoloco` |
 | `POSTGRES_DB` | `alcoloco` |
 | `POSTGRES_PORT` | `5432` |
+
+### Migrations et jeu de données de développement
+
+Le schéma vit dans `crates/db/migrations/`. Les migrations sont **embarquées à la compilation** et
+appliquées par l'outil `db`, qui les enregistre dans la table `_sqlx_migrations` : relancer
+`migrate` sur une base déjà à jour ne réexécute rien.
+
+```bash
+cargo run -p db -- migrate    # applique les migrations en attente
+cargo run -p db -- seed       # insère le jeu de données de développement (base vide)
+cargo run -p db -- reset      # supprime le schéma public, remigre, puis seed
+```
+
+La chaîne de connexion vient de `DATABASE_URL`, par défaut
+`postgres://alcoloco:alcoloco@localhost:5432/alcoloco` — les identifiants du `docker-compose.yml`.
+
+Les migrations sont **append-only** une fois sur `main` : on n'édite jamais un fichier déjà appliqué
+(l'outil rejetterait la somme de contrôle), on en ajoute un nouveau.
+
+Points de schéma utiles à connaître avant d'écrire une requête :
+
+- les identifiants sont des `uuid` **sans valeur par défaut** : l'application fournit un **UUID v7**
+  (PostgreSQL 16 n'a pas de `uuidv7()` natif) ;
+- les paramètres physiologiques (poids, taille, sexe, date de naissance) vivent **uniquement** dans
+  `profile_settings_version` ; `profile` ne porte que l'identité et les préférences de saisie, qui
+  ne sont pas versionnées ;
+- `profile_settings_at(profile_id, instant)` rend la version en vigueur à un instant donné, avec
+  repli sur la plus ancienne (borne basse ouverte) ;
+- une version ne stocke que sa borne basse : la borne haute est le `valid_from` suivant, ce qui rend
+  chevauchements et trous **non représentables** ;
+- les durées sont des entiers de secondes (`*_duration_seconds`), les volumes des millilitres
+  (`*_ml`).
 
 ### Backend
 
@@ -139,7 +172,9 @@ personnalisé avec calibrage · extraction du service mixologie en microservice 
 
 ## Modèle de domaine
 
-- **Profile** — identité, paramètres physiologiques courants et préférences de saisie.
+- **Profile** — identité, paramètres physiologiques courants et préférences de saisie. En base, les
+  paramètres physiologiques ne sont pas dupliqués sur `profile` : les « courants » sont ceux de la
+  version en vigueur maintenant.
 - **ProfileSettingsVersion** — snapshot horodaté des paramètres physiologiques ; chaque consommation
   est rattachée à la version en vigueur à son heure d'ingestion, pour rejouer fidèlement les courbes
   passées.
