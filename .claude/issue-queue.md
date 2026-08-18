@@ -1,17 +1,18 @@
 # File d'issues — alcoLoco
 
-> **Socle en attente : PR #38** (`docs/spec-corrections`) — correction du coefficient Watson,
-> du tableau §10.1, et arbitrages §10.0-H→K. **#1 ne démarre qu'une fois #38 mergée** : un
-> worktree ne transporte que le contenu commité, et `main` ne porte encore ni README, ni
-> `.gitignore`, ni la spec corrigée. Corps de #2, #5, #6, #7, #13, #16, #17 et #37 déjà
-> réalignés sur GitHub le 2026-08-17.
+> **Socle posé, #1 mergée.** PR #38 le 2026-08-17 (`36b3179`) : coefficient Watson, tableau
+> §10.1 et arbitrages §10.0-H→K sur `main`. PR #39 le 2026-08-17 (`5a9f96f`) : workspace Cargo,
+> app Angular, Postgres local et CI. Corps de #2, #5, #6, #7, #13, #16, #17 et #37 réalignés
+> sur GitHub le 2026-08-17. Les trois `TODO` du briefing ouverts par #1 sont soldés
+> (2026-08-18) : jobs CI `rust` et `web`, commandes exactes des gates, **pas d'audit de
+> sécurité en CI**.
 
 Milestone **V1** : 30 issues (#1–#29 + #37). Milestone **V2+** (#30–#36) hors file.
 Aucune issue `bug` ouverte — l'ordre est donc numérique, et il se trouve être déjà
 topologiquement valide au regard des « Bloqué par » déclarés dans chaque corps.
 Détail d'une issue en cours : `.claude/issue-log/<N>.md`.
 
-- [ ] #1  infra  — Bootstrap du dépôt : workspace Rust, app Angular, Postgres local | statut: à faire
+- [x] #1  infra  — Bootstrap du dépôt : workspace Rust, app Angular, Postgres local | PR #39 mergée (`5a9f96f`) | journal: issue-log/archive/1.md
 - [ ] #2  bdd    — Schéma de base initial et outillage de migrations                | dép: #1 | statut: à faire
 - [ ] #3  back   — Squelette de l'API axum : config, erreurs, healthcheck, OpenAPI   | dép: #1 #2 | statut: à faire
 - [ ] #4  front  — Squelette de l'app Angular : routing, layout, client HTTP         | dép: #1 | statut: à faire
