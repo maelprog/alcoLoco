@@ -99,8 +99,11 @@ Points de schéma utiles à connaître avant d'écrire une requête :
 - les paramètres physiologiques (poids, taille, sexe, date de naissance) vivent **uniquement** dans
   `profile_settings_version` ; `profile` ne porte que l'identité et les préférences de saisie, qui
   ne sont pas versionnées ;
+- tout profil possède **au moins une version** de paramètres : deux triggers de contrainte différés
+  rejettent au `COMMIT` un profil créé sans version, la suppression de sa dernière version et
+  l'`UPDATE` qui déplacerait cette dernière version vers un autre profil ;
 - `profile_settings_at(profile_id, instant)` rend la version en vigueur à un instant donné, avec
-  repli sur la plus ancienne (borne basse ouverte) ;
+  repli sur la plus ancienne (borne basse ouverte) ; un argument NULL rend NULL, jamais un repli ;
 - une version ne stocke que sa borne basse : la borne haute est le `valid_from` suivant, ce qui rend
   chevauchements et trous **non représentables** ;
 - les durées sont des entiers de secondes (`*_duration_seconds`), les volumes des millilitres
