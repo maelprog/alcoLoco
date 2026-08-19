@@ -41,7 +41,8 @@ extraction ultérieure (voir §9).
 - Affichage de l'alcoolémie instantanée (g/L de sang) et des courbes des participants sur la durée
   de l'événement.
 - Historique des consommations par profil (toutes soirées confondues), modifiable et supprimable.
-- Historique versionné des paramètres physiologiques du profil (poids, taille, sexe, âge).
+- Historique versionné des paramètres physiologiques du profil (poids, taille, sexe, date de
+  naissance).
 - Note de ressenti à la saisie d'une consommation, avec valeur par défaut proposée selon l'alcoolémie.
 
 ### 3.2 Reporté en V2+
@@ -89,10 +90,13 @@ Relation clé : une consommation appartient **toujours** à l'historique du prof
   de profils prédéfinis.
 - **[V1]** Les paramètres nécessaires au calcul — **poids, taille, sexe et date de naissance** —
   ne sont pas portés par le profil lui-même mais par sa **version de paramètres en vigueur**, et se
-  lisent à travers elle (§10.0-L). Ils restent **tous obligatoires** (§10.0-D) : l'obligation est
-  tenue en base par des **triggers de contrainte différés** garantissant qu'un profil possède
-  toujours au moins une version de paramètres. L'âge et la taille sont exploités par les équations
-  de Watson (§6.2).
+  lisent à travers elle (§10.0-L). Ils restent **tous obligatoires** (§10.0-D). L'obligation prend
+  la forme d'un invariant tenu par la base, énoncé par son effet observable : **toute transaction
+  qui laisserait un profil existant sans aucune version de paramètres est rejetée à sa validation**,
+  quel que soit l'ordre des écritures en son sein. Cette garantie porte sur les écritures ordinaires
+  de l'application ; elle a des limites, énumérées en §10.0-L, et ne doit pas être lue comme
+  absolue. La taille et l'âge sont exploités par les équations de Watson (§6.2), l'âge étant dérivé
+  de la date de naissance à l'heure d'ingestion (§10.0-K).
 - **[V1]** Le profil porte les préférences de saisie par défaut :
   - unité de quantité par défaut pour les composantes (cL ou %) ;
   - durée d'ingestion par défaut d'une boisson ;
@@ -261,8 +265,9 @@ exprimée en % est d'abord convertie en volume via le volume total de la boisson
 ### 6.2 Volume de diffusion — Watson
 
 **Décision actée** : le coefficient de diffusion est dérivé de l'eau corporelle totale (TBW) estimée
-par les équations de **Watson (1980)**, qui exploitent poids, taille, âge et sexe — la taille et
-l'âge sont donc des données de profil obligatoires.
+par les équations de **Watson (1980)**, qui exploitent poids, taille, âge et sexe — la taille et la
+**date de naissance** sont donc des paramètres obligatoires de la version en vigueur (§10.0-D,
+§10.0-L), l'âge étant dérivé de la date de naissance à l'heure d'ingestion (§10.0-K).
 
 ```
 TBW_homme (L) = 2,447 − 0,09516 × âge + 0,1074 × taille(cm) + 0,3362 × poids(kg)
@@ -423,7 +428,7 @@ d'un module depuis un autre.
 | I | Granularité des courbes | **Pas d'intégration interne fixe à 1 min**, fenêtre = durée de l'événement **+ 3 h** de décroissance. Le `?step=` de l'API (§5.7, #17) ne fait que **sous-échantillonner** la série intégrée, et est **borné à [1 min, 1 h]** — il ne change jamais le pas d'intégration, donc jamais le résultat. |
 | J | Effet d'un changement de paramètres profil | La date d'effet (`valid_from`) est **choisie par l'utilisateur**, pour distinguer une correction de saisie d'une évolution réelle. Voir §5.1. |
 | K | Âge retenu par Watson | Calculé à l'**heure d'ingestion** de chaque boisson, depuis la date de naissance de la version en vigueur. Aucun âge figé en base (§6.2). |
-| L | Emplacement des paramètres physiologiques | Poids, taille, sexe et date de naissance vivent **uniquement** sur `ProfileSettingsVersion` ; `Profile` ne porte que l'identité et les préférences de saisie, et **aucune copie courante** de ces quatre paramètres. Une telle copie serait une **seconde source de vérité**, libre de diverger de la version en vigueur dès la première modification, et qu'aucun calcul ne lirait puisque §10.0-K et §5.6 imposent déjà la version en vigueur **à l'heure d'ingestion**. Contrepartie assumée : l'obligation de §10.0-D n'est plus tenue par le typage mais par des **triggers de contrainte différés** en base, qui garantissent qu'un profil possède toujours au moins une version. Voir §4 et §5.1. |
+| L | Emplacement des paramètres physiologiques | Poids, taille, sexe et date de naissance vivent **uniquement** sur `ProfileSettingsVersion` ; `Profile` ne porte que l'identité et les préférences de saisie, et **aucune copie courante** de ces quatre paramètres. Une telle copie serait une **seconde source de vérité**, libre de diverger de la version en vigueur dès la première modification, et qu'aucun calcul ne lirait puisque §10.0-K et §5.6 imposent déjà la version en vigueur **à l'heure d'ingestion**. Contrepartie assumée : l'obligation de §10.0-D n'est plus tenue par le typage mais par un invariant de la base, que cette spécification énonce par son **effet observable** et non par le mécanisme qui le réalise — celui-ci appartient au schéma (#2) et peut évoluer sans que cette ligne change. L'invariant : **toute transaction qui laisserait un profil existant sans aucune version de paramètres est rejetée à sa validation** (`COMMIT`), quel que soit l'ordre des écritures en son sein ; il tient sur les écritures ordinaires — `INSERT`, `UPDATE`, `DELETE`, `COPY`, `MERGE`. **Réserve, à ne pas lire comme une garantie absolue** : il ne tient pas (a) sur un vidage en bloc de la table des versions (`TRUNCATE`), (b) sur toute opération qui suspend ou retire les contrôles de la base, ni (c) à l'intérieur de la transaction écrivante avant sa validation, où son propre état intermédiaire lui est visible. Les cas (a) et (b) laissent un état durablement incohérent, dans lequel la lecture des paramètres d'un profil existant ne rend **aucune ligne** et ne signale rien. Aucun des trois ne s'atteint par les écritures ordinaires de l'application ; ils concernent une restauration, une remise à zéro de jeu d'essai ou un import en masse, et le schéma de #2 est l'endroit où leur portée exacte est détaillée. Voir §4 et §5.1. |
 
 ### 10.1 Modèle d'ingestion et d'absorption — **défaut retenu, arbitrage final avant release V1 (#37)**
 
