@@ -63,8 +63,9 @@ COMMENT ON FUNCTION set_updated_at() IS
 -- they are exactly the versioned parameters, and duplicating a "current" copy
 -- here would create two sources of truth able to contradict each other. The
 -- current values of a profile are the ones of `profile_settings_at(id, now())`,
--- and the deferred constraint triggers below guarantee that query always returns
--- a row for a profile that exists.
+-- which the deferred constraint triggers below keep non-empty for every profile
+-- that exists — under ordinary DML, and with the reservations spelled out where
+-- those triggers are declared.
 --
 -- Input preferences are *not* versioned (SPEC.md §10.0-J): they enter no
 -- computation, only the pre-filling of the entry form, so they stay here.
@@ -150,11 +151,55 @@ COMMENT ON COLUMN profile_settings_version.birth_date IS
 -- transaction (the profile first, its foreign key is immediate), and the check
 -- only fires once both statements have run.
 --
--- Three statements can leave a profile with no version at all, and the two
--- triggers below cover the three: inserting the profile itself, deleting its
--- last version, and moving that last version to another profile with an UPDATE
--- of `profile_id`. Deleting the profile is not one of them: its versions cascade
--- away, and the function returns early once the profile itself is gone.
+-- Three writes can leave a profile with no version at all, and the two triggers
+-- below cover the three: inserting the profile itself, deleting its last
+-- version, and moving that last version to another profile with an UPDATE of
+-- `profile_id`. `COPY` and `MERGE`, including its update and delete branches,
+-- fire the very same row triggers, so they need no declaration of their own.
+-- Two more writes only look like holes: deleting the profile cascades its
+-- versions away and the function returns early once the profile itself is gone;
+-- renumbering a profile is refused outright by the foreign key, which is
+-- NO ACTION on update and so rejects while any version still points at the old
+-- id.
+--
+-- Scope of the guarantee, stated so that it can be checked rather than
+-- believed. It holds for `INSERT`, `UPDATE`, `DELETE`, `COPY` and `MERGE`, and
+-- it is enforced at `COMMIT`: a transaction that would leave a profile without
+-- a version does not commit. It does **not** hold in the three cases below,
+-- each of them reproduced against PostgreSQL 16 on this schema rather than
+-- deduced from the manual.
+--
+--   * `TRUNCATE profile_settings_version` empties the table and leaves the
+--     profiles standing. It walks no row, so no `FOR EACH ROW` trigger runs,
+--     and this schema declares no `AFTER TRUNCATE` trigger. PostgreSQL refuses
+--     a truncation only when a foreign key in *another* table points at the
+--     truncated one: `TRUNCATE profile` is indeed refused, `TRUNCATE
+--     profile_settings_version` is not, since the reference runs the other way.
+--     It takes the TRUNCATE privilege, which a role holding only DML grants
+--     does not have;
+--   * anything that switches the triggers off or takes them away:
+--     `SET session_replication_role = replica`, which wants superuser and also
+--     disables genuine foreign keys, and `ALTER TABLE <table> DISABLE TRIGGER
+--     USER` or `DROP TRIGGER`, which want table ownership and leave the foreign
+--     keys enforcing — an orphan version is still rejected while the constraint
+--     triggers are off, which makes them the narrower bypass. Whichever table
+--     is unguarded decides which hole opens: `profile` lets a versionless
+--     profile be inserted, `profile_settings_version` lets the last version be
+--     deleted;
+--   * inside the writing transaction, between the statement and the `COMMIT`.
+--     `DEFERRABLE INITIALLY DEFERRED` is exactly what lets a profile and its
+--     first version be inserted in either order, and the price of it is that
+--     the writing transaction can read its own intermediate state:
+--     `profile_settings_at()` answers NULL there for a profile whose versions
+--     it has just deleted. `SET CONSTRAINTS ALL DEFERRED` changes nothing to
+--     the check itself, which still runs at `COMMIT`.
+--
+-- In each of the first two cases `profile_settings_at()` then returns no row
+-- for a profile that still exists, and says nothing about it. None of the three
+-- arises from the application's ordinary writes, which are DML; they are worth
+-- knowing to whoever writes a restore, a fixture reset or a bulk import. The local development role owns these tables and is superuser, so all
+-- three are within its reach; an application role holding only DML grants
+-- reaches none of them.
 
 CREATE FUNCTION assert_profile_settings_version_present() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -201,16 +246,29 @@ CREATE CONSTRAINT TRIGGER profile_settings_version_keeps_last
 -- It returns the latest version starting at or before `at`, and falls back to
 -- the oldest version of the profile otherwise — that is the open lower bound of
 -- SPEC.md §5.1. Combined with the constraint triggers above, it returns a row
--- for every profile that exists and every instant `at`.
+-- for every profile that exists and every non-NULL `at` — as far as those
+-- triggers reach, which the paragraph declaring them delimits.
 --
--- A NULL argument returns NULL rather than a fallback row: `valid_from <= NULL`
--- is NULL, which would empty the FILTER and silently fall back to the oldest
--- version — that is, answer an unknown instant with real settings. An unknown
--- profile already returns NULL for the same reason of honesty.
+-- A NULL argument returns **no row** rather than a fallback one: `valid_from <=
+-- NULL` is NULL, which would empty the FILTER and silently fall back to the
+-- oldest version — that is, answer an unknown instant with real settings. An
+-- unknown profile returns no row for the same reason of honesty.
+--
+-- `SETOF` is what makes "no row" expressible. A function declared `RETURNS
+-- profile_settings_version` returns a composite, and a composite whose SQL body
+-- yields nothing is NULL — which reads as NULL in scalar position but expands
+-- to **one row of NULLs** in `FROM` position, the position a caller uses. A
+-- caller asking for the settings of an unknown profile would then receive a
+-- fictitious row instead of an empty result. `SETOF ... ROWS 1` returns zero or
+-- one row in both positions; at most one row can ever come out, since the inner
+-- query pins a single `valid_from` and `UNIQUE (profile_id, valid_from)` makes
+-- it unique. The price of `SETOF` is that the function is set-returning in the
+-- select list too, so `SELECT (profile_settings_at(...)).weight_kg` yields zero
+-- rows rather than one NULL when there is no applicable version.
 
 CREATE FUNCTION profile_settings_at(target_profile uuid, at timestamptz)
-RETURNS profile_settings_version
-LANGUAGE sql STABLE AS $$
+RETURNS SETOF profile_settings_version
+LANGUAGE sql STABLE ROWS 1 AS $$
     SELECT v.*
     FROM profile_settings_version AS v
     WHERE target_profile IS NOT NULL
@@ -227,7 +285,7 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 COMMENT ON FUNCTION profile_settings_at(uuid, timestamptz) IS
-    'Physiological parameters in force at a given instant; falls back to the oldest version (open lower bound). NULL argument, NULL result.';
+    'Physiological parameters in force at a given instant; falls back to the oldest version (open lower bound). Returns zero or one row: no row for an unknown profile or a NULL instant.';
 
 -- ---------------------------------------------------------------------------
 -- event

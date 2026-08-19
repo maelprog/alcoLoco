@@ -388,13 +388,23 @@ mod tests {
     #[test]
     fn the_identifiers_this_crate_generates_sort_in_generation_order() {
         // The property the API relies on: v7 is time ordered, which is what makes
-        // an identifier usable as a pagination cursor. Two identifiers generated
-        // in distinct milliseconds always compare in generation order.
-        let first = new_id();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = new_id();
-
-        assert!(first < second, "{first} should sort before {second}");
+        // an identifier usable as a pagination cursor.
+        //
+        // Checked on a long run of consecutive draws rather than on two draws
+        // separated by a sleep. A sleep only exercises the easy case, two
+        // identifiers born in distinct milliseconds; the draws the API actually
+        // makes are bursts inside a single millisecond, where the ordering rests
+        // on the counter v7 keeps there. This form is also deterministic: it
+        // waits for nothing and asserts on no clock.
+        let ids: Vec<Uuid> = (0..10_000).map(|_| new_id()).collect();
+        for pair in ids.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "{} should sort before {}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     /// `docker-compose.yml` of the repository root, read at compile time so that
@@ -402,14 +412,33 @@ mod tests {
     const DOCKER_COMPOSE: &str = include_str!("../../../docker-compose.yml");
 
     /// Default value of `${KEY:-default}` as written in `docker-compose.yml`.
+    ///
+    /// Every occurrence is collected, not just the first: the compose file
+    /// repeats `POSTGRES_USER` and `POSTGRES_DB` in the healthcheck of the `db`
+    /// service, and reading only the first occurrence would let the file
+    /// contradict itself — a healthcheck probing a user the server never
+    /// creates — without this test noticing. Disagreeing defaults are a failure
+    /// here, so the value returned is unambiguous.
     fn compose_default(key: &str) -> &'static str {
         let marker = format!("${{{key}:-");
-        let (_, after) = DOCKER_COMPOSE
-            .split_once(&marker)
+        let defaults: Vec<&'static str> = DOCKER_COMPOSE
+            .split(marker.as_str())
+            .skip(1)
+            .map(|after| {
+                after
+                    .split_once('}')
+                    .unwrap_or_else(|| panic!("unterminated `{marker}` in docker-compose.yml"))
+                    .0
+            })
+            .collect();
+
+        let (value, others) = defaults
+            .split_first()
             .unwrap_or_else(|| panic!("docker-compose.yml defines no `{marker}...}}`"));
-        let (value, _) = after
-            .split_once('}')
-            .unwrap_or_else(|| panic!("unterminated `{marker}` in docker-compose.yml"));
+        assert!(
+            others.iter().all(|other| other == value),
+            "docker-compose.yml gives `{marker}...}}` several different defaults: {defaults:?}"
+        );
         value
     }
 
