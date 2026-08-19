@@ -64,6 +64,17 @@ pub async fn reset(pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// Identifier generated for every row this crate writes.
+///
+/// Every table takes its primary key from the application: PostgreSQL 16 has no
+/// native `uuidv7()`, and no column carries a default. Funnelling the generation
+/// through this single function is what makes the convention testable — v7 is
+/// time ordered, and the API uses that ordering as its pagination cursor, so a
+/// v4 slipped in here would silently break paging rather than fail loudly.
+fn new_id() -> Uuid {
+    Uuid::now_v7()
+}
+
 /// Number of profiles already present, used to keep [`seed`] from running twice.
 async fn profile_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
     let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM profile")
@@ -102,7 +113,7 @@ pub async fn seed(pool: &PgPool) -> Result<(), sqlx::Error> {
             "INSERT INTO library_item (id, name, category, default_abv_percent)
              VALUES ($1, $2, $3::library_item_category, $4)",
         )
-        .bind(Uuid::now_v7())
+        .bind(new_id())
         .bind(name)
         .bind(category)
         .bind(abv)
@@ -111,7 +122,7 @@ pub async fn seed(pool: &PgPool) -> Result<(), sqlx::Error> {
     }
 
     // Alice: a single settings version, so her whole history uses it.
-    let alice = Uuid::now_v7();
+    let alice = new_id();
     insert_profile(&mut tx, alice, "Alice", "cl").await?;
     insert_settings_version(
         &mut tx,
@@ -126,7 +137,7 @@ pub async fn seed(pool: &PgPool) -> Result<(), sqlx::Error> {
 
     // Bob: two versions, to exercise the "parameters in force at ingestion time"
     // rule of SPEC.md §5.6. The oldest one has an open lower bound.
-    let bob = Uuid::now_v7();
+    let bob = new_id();
     insert_profile(&mut tx, bob, "Bob", "percent").await?;
     insert_settings_version(
         &mut tx,
@@ -150,7 +161,7 @@ pub async fn seed(pool: &PgPool) -> Result<(), sqlx::Error> {
     .await?;
 
     // An open-ended event with both profiles.
-    let event = Uuid::now_v7();
+    let event = new_id();
     sqlx::query(
         "INSERT INTO event (id, name, starts_at, ends_at)
          VALUES ($1, $2, now() - interval '4 hours', NULL)",
@@ -261,7 +272,7 @@ async fn insert_settings_version(
          ) VALUES ($1, $2, {valid_from_sql}, $3, $4, $5::sex, $6::date)"
     );
     sqlx::query(&statement)
-        .bind(Uuid::now_v7())
+        .bind(new_id())
         .bind(profile_id)
         .bind(weight_kg)
         .bind(height_cm)
@@ -286,7 +297,7 @@ struct DrinkSeed<'a> {
 }
 
 async fn insert_drink(tx: &mut Tx<'_>, drink: &DrinkSeed<'_>) -> Result<Uuid, sqlx::Error> {
-    let id = Uuid::now_v7();
+    let id = new_id();
     let statement = format!(
         "INSERT INTO drink (
              id, profile_id, event_id, name, ingested_at,
@@ -320,7 +331,7 @@ async fn insert_component(
         "INSERT INTO drink_component (id, drink_id, sort_order, name, abv_percent, quantity)
          VALUES ($1, $2, $3, $4, $5, $6)",
     )
-    .bind(Uuid::now_v7())
+    .bind(new_id())
     .bind(drink_id)
     .bind(sort_order)
     .bind(name)
@@ -362,13 +373,63 @@ mod tests {
     }
 
     #[test]
-    fn generated_identifiers_are_uuid_v7() {
-        // The whole schema relies on the application supplying v7 identifiers.
-        assert_eq!(Uuid::now_v7().get_version_num(), 7);
+    fn the_identifiers_this_crate_generates_are_uuid_v7() {
+        // Guards `new_id`, through which every identifier written by this crate
+        // is generated — not the `uuid` crate, which is not ours to test.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let id = new_id();
+            assert_eq!(id.get_version_num(), 7, "{id} is not a UUID v7");
+            assert_eq!(id.get_variant(), uuid::Variant::RFC4122, "{id}");
+            assert!(seen.insert(id), "{id} was generated twice");
+        }
+    }
+
+    #[test]
+    fn the_identifiers_this_crate_generates_sort_in_generation_order() {
+        // The property the API relies on: v7 is time ordered, which is what makes
+        // an identifier usable as a pagination cursor. Two identifiers generated
+        // in distinct milliseconds always compare in generation order.
+        let first = new_id();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = new_id();
+
+        assert!(first < second, "{first} should sort before {second}");
+    }
+
+    /// `docker-compose.yml` of the repository root, read at compile time so that
+    /// the test below compares the real file rather than a copy of it.
+    const DOCKER_COMPOSE: &str = include_str!("../../../docker-compose.yml");
+
+    /// Default value of `${KEY:-default}` as written in `docker-compose.yml`.
+    fn compose_default(key: &str) -> &'static str {
+        let marker = format!("${{{key}:-");
+        let (_, after) = DOCKER_COMPOSE
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("docker-compose.yml defines no `{marker}...}}`"));
+        let (value, _) = after
+            .split_once('}')
+            .unwrap_or_else(|| panic!("unterminated `{marker}` in docker-compose.yml"));
+        value
     }
 
     #[test]
     fn the_default_database_url_matches_docker_compose() {
-        assert!(DEFAULT_DATABASE_URL.starts_with("postgres://alcoloco:alcoloco@"));
+        // The default connection string exists to make `cargo run -p db` work
+        // against the compose stack without any environment variable. It is only
+        // useful while it stays equal to what the compose file actually starts,
+        // so the whole string is rebuilt from that file instead of being spot
+        // checked: user, password, published port and database name all move
+        // together or the test fails.
+        let user = compose_default("POSTGRES_USER");
+        let password = compose_default("POSTGRES_PASSWORD");
+        let database = compose_default("POSTGRES_DB");
+        let port = compose_default("POSTGRES_PORT");
+
+        assert_eq!(
+            DEFAULT_DATABASE_URL,
+            format!("postgres://{user}:{password}@localhost:{port}/{database}"),
+            "DEFAULT_DATABASE_URL no longer matches docker-compose.yml"
+        );
     }
 }
