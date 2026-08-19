@@ -102,8 +102,22 @@ Points de schéma utiles à connaître avant d'écrire une requête :
 - tout profil possède **au moins une version** de paramètres : deux triggers de contrainte différés
   rejettent au `COMMIT` un profil créé sans version, la suppression de sa dernière version et
   l'`UPDATE` qui déplacerait cette dernière version vers un autre profil ;
+- **portée exacte de cette garantie**, à connaître avant d'écrire une restauration, une remise à
+  zéro de fixtures ou un import en masse : elle vaut pour `INSERT`, `UPDATE`, `DELETE`, `COPY` et
+  `MERGE`, et elle est vérifiée au `COMMIT` — une transaction qui laisserait un profil sans version
+  ne commite pas. Trois chemins y échappent, tous trois reproduits sur PostgreSQL 16 :
+  `TRUNCATE profile_settings_version`, qui ne parcourt aucune ligne et ne déclenche donc aucun
+  trigger `FOR EACH ROW` (les profils restent, leurs versions disparaissent) ; la désactivation ou
+  la suppression des triggers (`SET session_replication_role = replica`, `ALTER TABLE … DISABLE
+  TRIGGER USER`, `DROP TRIGGER`) ; et, la vérification étant différée, la transaction **qui écrit**
+  elle-même, qui lit son propre état intermédiaire entre le `DELETE` et le `COMMIT`. Dans les deux
+  premiers cas, `profile_settings_at()` ne rend ensuite aucune ligne pour un profil qui existe
+  toujours. Aucun des trois n'est atteignable par un rôle limité au DML ;
 - `profile_settings_at(profile_id, instant)` rend la version en vigueur à un instant donné, avec
-  repli sur la plus ancienne (borne basse ouverte) ; un argument NULL rend NULL, jamais un repli ;
+  repli sur la plus ancienne (borne basse ouverte). Elle rend **zéro ou une ligne** (`RETURNS SETOF`)
+  et **aucune ligne** pour un profil inconnu ou un instant NULL, jamais un repli silencieux : à
+  écrire `SELECT * FROM profile_settings_at($1, $2)` ou `LEFT JOIN LATERAL`, et non
+  `SELECT (profile_settings_at($1, $2)).*` ;
 - une version ne stocke que sa borne basse : la borne haute est le `valid_from` suivant, ce qui rend
   chevauchements et trous **non représentables** ;
 - les durées sont des entiers de secondes (`*_duration_seconds`), les volumes des millilitres
