@@ -60,10 +60,10 @@ extraction ultérieure (voir §9).
 
 Entités principales (nommage indicatif) :
 
-- **Profile** — identité + paramètres physiologiques courants (poids, taille, sexe, date de
-  naissance) et
-  préférences de saisie (unité par défaut cL/%, durée d'ingestion par défaut, durée d'absorption
-  par défaut).
+- **Profile** — identité et préférences de saisie (unité par défaut cL/%, durée d'ingestion par
+  défaut, durée d'absorption par défaut). Le profil ne porte **aucun paramètre physiologique** :
+  poids, taille, sexe et date de naissance sont portés par sa **version en vigueur** et se lisent à
+  travers elle (§10.0-L).
 - **ProfileSettingsVersion** — snapshot horodaté des paramètres physiologiques d'un profil.
   Toute consommation est rattachée à la version en vigueur à son heure d'ingestion, afin de pouvoir
   rejouer fidèlement les courbes passées même après un changement de poids.
@@ -87,9 +87,12 @@ Relation clé : une consommation appartient **toujours** à l'historique du prof
 
 - **[V1]** Aucune authentification. Au lancement, l'utilisateur choisit un profil parmi une liste
   de profils prédéfinis.
-- **[V1]** Le profil porte les paramètres nécessaires au calcul : **poids, taille, sexe et date de
-  naissance**, tous obligatoires (l'âge et la taille sont exploités par les équations de Watson,
-  §6.2).
+- **[V1]** Les paramètres nécessaires au calcul — **poids, taille, sexe et date de naissance** —
+  ne sont pas portés par le profil lui-même mais par sa **version de paramètres en vigueur**, et se
+  lisent à travers elle (§10.0-L). Ils restent **tous obligatoires** (§10.0-D) : l'obligation est
+  tenue en base par des **triggers de contrainte différés** garantissant qu'un profil possède
+  toujours au moins une version de paramètres. L'âge et la taille sont exploités par les équations
+  de Watson (§6.2).
 - **[V1]** Le profil porte les préférences de saisie par défaut :
   - unité de quantité par défaut pour les composantes (cL ou %) ;
   - durée d'ingestion par défaut d'une boisson ;
@@ -412,7 +415,7 @@ d'un module depuis un autre.
 | A | Quantité en % | Le **volume total de la boisson est obligatoire** dès qu'au moins une composante est exprimée en %. Sans lui, la boisson est invalide. |
 | B | Composantes « majoritaires » | Majorité **en volume**, toutes composantes confondues — un soft peut donc figurer dans le nom au même titre qu'un alcool. |
 | C | Coefficient de diffusion | **Watson**, exploitant poids, taille, âge et sexe (§6.2). Repli sur les constantes Widmark si une donnée manque. |
-| D | Paramètres profil obligatoires | **Poids, taille, sexe, date de naissance.** |
+| D | Paramètres profil obligatoires | **Poids, taille, sexe, date de naissance.** Portés par la version en vigueur, jamais par `Profile` (§10.0-L). |
 | E | Note de ressenti par défaut | La suggestion **ne dépasse jamais le niveau 6** : le niveau 7 et au-delà ne sont jamais proposés, l'utilisateur peut les sélectionner lui-même. Barème indicatif : 1 < 0,2 ; 2 : 0,2–0,5 ; 3 : 0,5–0,8 ; 4 : 0,8–1,2 ; 5 : 1,2–1,8 ; 6 : > 1,8 g/L. |
 | F | Profil d'absorption | **Trapèze** (§6.4) retenu comme **défaut d'implémentation**. Arbitrage produit final avant release V1 → **#37**. |
 | G | Superposition | Les débits `R` se somment ; `β` est global au corps et ne s'applique **qu'une fois** (§6.5). |
@@ -420,6 +423,7 @@ d'un module depuis un autre.
 | I | Granularité des courbes | **Pas d'intégration interne fixe à 1 min**, fenêtre = durée de l'événement **+ 3 h** de décroissance. Le `?step=` de l'API (§5.7, #17) ne fait que **sous-échantillonner** la série intégrée, et est **borné à [1 min, 1 h]** — il ne change jamais le pas d'intégration, donc jamais le résultat. |
 | J | Effet d'un changement de paramètres profil | La date d'effet (`valid_from`) est **choisie par l'utilisateur**, pour distinguer une correction de saisie d'une évolution réelle. Voir §5.1. |
 | K | Âge retenu par Watson | Calculé à l'**heure d'ingestion** de chaque boisson, depuis la date de naissance de la version en vigueur. Aucun âge figé en base (§6.2). |
+| L | Emplacement des paramètres physiologiques | Poids, taille, sexe et date de naissance vivent **uniquement** sur `ProfileSettingsVersion` ; `Profile` ne porte que l'identité et les préférences de saisie, et **aucune copie courante** de ces quatre paramètres. Une telle copie serait une **seconde source de vérité**, libre de diverger de la version en vigueur dès la première modification, et qu'aucun calcul ne lirait puisque §10.0-K et §5.6 imposent déjà la version en vigueur **à l'heure d'ingestion**. Contrepartie assumée : l'obligation de §10.0-D n'est plus tenue par le typage mais par des **triggers de contrainte différés** en base, qui garantissent qu'un profil possède toujours au moins une version. Voir §4 et §5.1. |
 
 ### 10.1 Modèle d'ingestion et d'absorption — **défaut retenu, arbitrage final avant release V1 (#37)**
 
