@@ -63,7 +63,8 @@ COMMENT ON FUNCTION set_updated_at() IS
 -- they are exactly the versioned parameters, and duplicating a "current" copy
 -- here would create two sources of truth able to contradict each other. The
 -- current values of a profile are the ones of `profile_settings_at(id, now())`,
--- and the deferred constraint below guarantees that query always returns a row.
+-- and the deferred constraint triggers below guarantee that query always returns
+-- a row for a profile that exists.
 --
 -- Input preferences are *not* versioned (SPEC.md §10.0-J): they enter no
 -- computation, only the pre-filling of the entry form, so they stay here.
@@ -108,11 +109,15 @@ CREATE TRIGGER profile_set_updated_at
 -- falls back to it for any instant earlier than the whole sequence, so a drink
 -- ingested before any recorded change always finds an applicable version.
 --
--- Two rules stay on the application side, where they belong:
---   * `valid_from` may not be in the future — a CHECK cannot call `now()`,
---     which is not immutable;
+-- Two rules are deliberately left out of this migration and belong to the write
+-- policy of issue #7:
+--   * `valid_from` may not be in the future (SPEC.md §5.1, §10.0-J). A CHECK
+--     cannot express it, since it may not call `now()`, but a BEFORE
+--     INSERT/UPDATE trigger could — the file already creates three triggers.
+--     Not enforcing it here is a scope choice, not a PostgreSQL limitation:
+--     until #7 lands, a future `valid_from` is accepted by the database;
 --   * posting a version at T replaces every version strictly later than T
---     (SPEC.md §5.1). That is a write policy, implemented by issue #7.
+--     (SPEC.md §5.1).
 
 CREATE TABLE profile_settings_version (
     id uuid PRIMARY KEY,
@@ -129,7 +134,7 @@ CREATE TABLE profile_settings_version (
 COMMENT ON TABLE profile_settings_version IS
     'Versioned physiological parameters. A version stores its lower bound only; the upper bound is the next valid_from.';
 COMMENT ON COLUMN profile_settings_version.valid_from IS
-    'Effective date supplied by the user (SPEC.md §10.0-J); may be retroactive, never in the future.';
+    'Effective date supplied by the user (SPEC.md §10.0-J); may be retroactive, never in the future — a rule enforced by the write policy of issue #7, not by this schema.';
 COMMENT ON COLUMN profile_settings_version.birth_date IS
     'Birth date, not an age: the age used by Watson is computed at the ingestion time of each drink (SPEC.md §10.0-K).';
 
@@ -144,6 +149,12 @@ COMMENT ON COLUMN profile_settings_version.birth_date IS
 -- at commit: the profile and its first version are inserted in the same
 -- transaction (the profile first, its foreign key is immediate), and the check
 -- only fires once both statements have run.
+--
+-- Three statements can leave a profile with no version at all, and the two
+-- triggers below cover the three: inserting the profile itself, deleting its
+-- last version, and moving that last version to another profile with an UPDATE
+-- of `profile_id`. Deleting the profile is not one of them: its versions cascade
+-- away, and the function returns early once the profile itself is gone.
 
 CREATE FUNCTION assert_profile_settings_version_present() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -179,7 +190,7 @@ CREATE CONSTRAINT TRIGGER profile_requires_settings_version
     FOR EACH ROW EXECUTE FUNCTION assert_profile_settings_version_present();
 
 CREATE CONSTRAINT TRIGGER profile_settings_version_keeps_last
-    AFTER DELETE ON profile_settings_version
+    AFTER DELETE OR UPDATE OF profile_id ON profile_settings_version
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION assert_profile_settings_version_present();
 
@@ -187,17 +198,24 @@ CREATE CONSTRAINT TRIGGER profile_settings_version_keeps_last
 -- Settings applicable at a given instant
 -- ---------------------------------------------------------------------------
 --
--- Total function: it returns the latest version starting at or before `at`,
--- and falls back to the oldest version of the profile otherwise — that is the
--- open lower bound of SPEC.md §5.1. Combined with the trigger above, it returns
--- a row for every existing profile and every instant.
+-- It returns the latest version starting at or before `at`, and falls back to
+-- the oldest version of the profile otherwise — that is the open lower bound of
+-- SPEC.md §5.1. Combined with the constraint triggers above, it returns a row
+-- for every profile that exists and every instant `at`.
+--
+-- A NULL argument returns NULL rather than a fallback row: `valid_from <= NULL`
+-- is NULL, which would empty the FILTER and silently fall back to the oldest
+-- version — that is, answer an unknown instant with real settings. An unknown
+-- profile already returns NULL for the same reason of honesty.
 
 CREATE FUNCTION profile_settings_at(target_profile uuid, at timestamptz)
 RETURNS profile_settings_version
 LANGUAGE sql STABLE AS $$
     SELECT v.*
     FROM profile_settings_version AS v
-    WHERE v.profile_id = target_profile
+    WHERE target_profile IS NOT NULL
+      AND at IS NOT NULL
+      AND v.profile_id = target_profile
       AND v.valid_from = (
           SELECT coalesce(
               max(w.valid_from) FILTER (WHERE w.valid_from <= at),
@@ -209,7 +227,7 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 COMMENT ON FUNCTION profile_settings_at(uuid, timestamptz) IS
-    'Physiological parameters in force at a given instant; falls back to the oldest version (open lower bound).';
+    'Physiological parameters in force at a given instant; falls back to the oldest version (open lower bound). NULL argument, NULL result.';
 
 -- ---------------------------------------------------------------------------
 -- event
