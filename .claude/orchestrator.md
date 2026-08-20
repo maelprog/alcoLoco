@@ -13,8 +13,19 @@ base **PostgreSQL**. Dépôt public `maelprog/alcoLoco`, branche par défaut `ma
 ## Environnement
 
 **Il n'y a aucune toolchain sur l'hôte.** Vérifié : `cargo`, `rustc`, `rustup`,
-`node`, `npm`, `psql` sont **absents**. Seuls `docker` (29.1.3, démon actif),
-`docker compose` (v5.4.0), `git` et `gh` sont disponibles.
+`node`, `npm`, `psql` sont **absents**. Seuls `docker` (démon actif), `git` et `gh`
+sont disponibles.
+
+⚠ **`docker compose` n'existe pas non plus** — corrigé le 2026-08-19, après qu'un
+agent s'y soit cassé les dents. Ce briefing annonçait un `docker compose` v5.4.0 :
+c'était faux. Vérifié deux fois, par le vérificateur de #2 puis par l'orchestrateur :
+
+```
+$ docker compose version     → docker: unknown command: docker compose
+$ docker-compose version     → could not be found in this WSL 2 distro
+```
+
+Ne cherche pas à l'installer. Postgres se lance en `docker run` direct, cf. plus bas.
 
 **Tout gate passe donc par un conteneur.** N'essaie pas d'installer une
 toolchain sur l'hôte, et ne rapporte jamais un gate comme non exécutable au
@@ -63,17 +74,43 @@ docker run --rm -v "$PWD/web":/w -w /w node:22-bookworm-slim <commande npm/ng>
 quatre variables, avec défauts : `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`
 = `alcoloco`, et `POSTGRES_PORT` = `5432`.
 
-**Chaque worktree doit poser son propre nom de projet compose *et* son propre port
-hôte.** Le nom de projet seul ne suffit pas : le port hôte est publié en dur par la
-variable, donc deux projets se disputent quand même `5432`.
+⚠ **Mais `docker compose` est indisponible** (cf. *Environnement*) : ce fichier
+décrit le service et la documentation. **On ne peut pas le lancer sur cette machine.**
+⚠ Il n'est **pas** exécuté par la CI (aucune étape `compose` dans `ci.yml`) mais il **est**
+lu par un test : `crates/db/src/lib.rs` fait `include_str!` dessus et compare ses défauts à
+`DEFAULT_DATABASE_URL`. En changer une valeur casse `cargo test --workspace`. Lance Postgres en `docker run` direct, en reprenant les
+mêmes valeurs, avec **ton propre nom de conteneur et ton propre port hôte** :
 
 ```bash
-POSTGRES_PORT=54<numéro d'issue sur 2 chiffres> docker compose -p alcoloco-<numéro d'issue> up -d
-# ex. issue #2 → POSTGRES_PORT=5402 docker compose -p alcoloco-2 up -d
+# agent A (implémentation) : nom alcoloco-<n>,   port 54<nn>
+# agent B (vérification)   : nom alcoloco-<n>-b, port 55<nn>
+docker run -d --name alcoloco-<n> \
+  -e POSTGRES_USER=alcoloco -e POSTGRES_PASSWORD=alcoloco -e POSTGRES_DB=alcoloco \
+  -p 54<n sur 2 chiffres>:5432 postgres:16-alpine
+# prêt quand (via TCP, pas la socket unix — cf. ci-dessous) :
+#   docker exec alcoloco-<n> pg_isready -h 127.0.0.1 -p 5432
+# DATABASE_URL=postgres://alcoloco:alcoloco@localhost:54<nn>/alcoloco
 ```
 
-Arrêt et nettoyage en fin d'issue : `docker compose -p alcoloco-<n> down -v`
-(le `-v` jette `db_data`, propre au projet).
+Le **nom** et le **port** dérivent tous deux du numéro d'issue : deux agents sur la
+même issue se collisionneraient (`Conflict. The container name … is already in use`),
+et le nettoyage de A détruirait la base de B en pleine vérification. D'où les deux
+gammes ci-dessus — **A prend `alcoloco-<n>` / `54<nn>`, B prend `alcoloco-<n>-b` /
+`55<nn>`**, sans négociation.
+
+⚠ `pg_isready -U alcoloco` **sur la socket unix répond « accepting connections »
+pendant `initdb`**, avant que le port TCP n'écoute : l'entrypoint postgres lance un
+serveur temporaire en `listen_addresses=''`. Sonder en TCP comme ci-dessus, ou
+attendre la **deuxième** occurrence de « database system is ready to accept
+connections » dans `docker logs`.
+
+Depuis le conteneur Rust, ajoute `--network host` au `docker run` pour joindre
+`localhost:54<nn>`.
+
+Arrêt et nettoyage en fin d'issue : **`docker rm -fv alcoloco-<n>`**. Le `-v` n'est pas
+facultatif : `postgres:16-alpine` déclare `VOLUME /var/lib/postgresql/data`, donc chaque
+`docker run` crée un volume **anonyme** que `docker rm -f` seul laisse derrière lui.
+(Constaté le 2026-08-20 : 29 volumes orphelins, 2,4 Go récupérables.)
 
 ---
 
@@ -133,7 +170,7 @@ cités sont justes. Ne pars pas chercher un document manquant.
 
 Il n'y a **pas de `CLAUDE.md`** dans ce dépôt.
 
-### Arbitrages du 2026-08-17 — appliqués à `SPEC.md`, à ne pas rouvrir
+### Arbitrages du 2026-08-17 et du 2026-08-19 — appliqués à `SPEC.md`, à ne pas rouvrir
 
 Ces points étaient ouverts ou faux dans la spec initiale. Ils sont désormais tranchés et écrits en
 §10.0. Un agent qui croit devoir les rediscuter se trompe : il doit les appliquer.
@@ -145,6 +182,7 @@ Ces points étaient ouverts ou faux dans la spec initiale. Ils sont désormais t
 | §10.0-H | **`β` est une constante** du crate `domain` (0,15 g/L/h), paramétrable en argument de fonction pour les tests. **Pas de colonne en base, pas de champ d'API.** |
 | §10.0-I | Pas d'intégration interne **fixe à 1 min** ; fenêtre = durée de l'événement **+ 3 h**. Le `?step=` de #17 **sous-échantillonne seulement**, borné à **[1 min, 1 h]**, hors bornes → 400. |
 | §10.0-J | `valid_from` d'une version de paramètres est **fourni par l'utilisateur** (défaut : maintenant), peut être rétroactif, jamais futur. Versions sans chevauchement ni trou ; la plus ancienne a une borne basse ouverte. Les **préférences de saisie ne sont pas versionnées**. |
+| §4 / §5.1 | **Emplacement des paramètres physiologiques — arbitré par l'utilisateur le 2026-08-19.** Poids, taille, sexe et date de naissance vivent **uniquement** dans `profile_settings_version`. `profile` ne porte que l'identité et les préférences de saisie, et **aucune copie courante** : ce serait une seconde source de vérité libre de diverger dès la première modification. Les valeurs courantes se lisent par `profile_settings_at(id, now())`. Motif décisif : §10.0-K impose déjà au moteur d'utiliser la version en vigueur à l'heure d'ingestion — une copie sur `profile` ne serait lue par aucun calcul. L'obligation de §10.0-D reste tenue **hors concurrence**, par les triggers de contrainte différés du schéma ; **sous concurrence elle ne l'est pas** — c'est la classe (d) de `SPEC.md` §10.0-L, et **#43** porte la fermeture réelle. Ce qui n'est pas rouvrable ici, c'est l'**emplacement** des paramètres ; la portée de l'invariant, elle, est celle que §10.0-L énonce. **Ne pas ajouter ces colonnes à `profile`.** |
 | §10.1 | Le tableau des variantes d'absorption a été recalculé : le trapèze pique à **0,227 g/L à 45,7 min**, et non aux valeurs de la rampe linéaire comme l'indiquait la spec initiale. Ce sont ces valeurs qui font foi pour les tests de #5, #16 et #37. |
 
 ⚠ Les corps des issues **#5, #16 et #37** recopient l'ancien coefficient et l'ancien tableau. Tant
@@ -259,30 +297,106 @@ l'*Escalade*.
 
 Section vivante — une ligne à ajouter après chaque mur rencontré.
 
-1. **`rustfmt` / `clippy` absents des images Rust officielles** (`rust:1-bookworm`
+- **1.** **`rustfmt` / `clippy` absents des images Rust officielles** (`rust:1-bookworm`
    *et* `rust:1-slim-bookworm`). Utiliser `alcoloco-rust:dev`, cf. *Environnement*.
-2. **Aucune toolchain hôte.** `cargo`/`node`/`npm`/`psql` sont introuvables et le
+- **2.** **Aucune toolchain hôte.** `cargo`/`node`/`npm`/`psql` sont introuvables et le
    resteront : c'est la configuration normale de cette machine, pas une panne.
-3. **`SPEC_CORRECTED.md` n'existe pas** — lire `SPEC.md` (les §§ cités sont bons).
-4. **Collision de port Postgres entre worktrees** : `docker compose -p alcoloco-<issue>`
-   isole les conteneurs et le volume, **mais pas le port hôte**, publié en dur à
-   `${POSTGRES_PORT:-5432}`. Toujours passer *aussi* `POSTGRES_PORT` — cf. *Environnement*.
-5. **Fichiers appartenant à `root`** : les conteneurs écrivent en `root` sur les
+- **3.** **`SPEC_CORRECTED.md` n'existe pas** — lire `SPEC.md` (les §§ cités sont bons).
+- **4.** **Collision de port Postgres entre agents** : le port hôte est la seule ressource
+   vraiment partagée. Un nom de conteneur distinct ne suffit pas — donner *aussi* un
+   port distinct, y compris entre l'agent d'implémentation et son vérificateur sur la
+   **même** issue. Cf. *Postgres*.
+- **5.** **Fichiers appartenant à `root`** : les conteneurs écrivent en `root` sur les
    volumes montés (`target/`, `node_modules/`). Un `git worktree remove` peut
    alors échouer. Passer `--user "$(id -u):$(id -g)"` au `docker run` quand c'est
    possible ; sinon signaler le `sudo rm -rf` restant, ne pas le lancer soi-même.
-6. **`cargo fmt` reformate tout le workspace**, pas seulement les fichiers
+- **6.** **`cargo fmt` reformate tout le workspace**, pas seulement les fichiers
    touchés. Sur un dépôt déjà formaté c'est sans effet ; au premier passage,
    vérifier que le diff ne déborde pas de l'issue.
-7. **Volume `alcoloco-cargo` appartenant à `root`** : avec `--user "$(id -u):$(id -g)"`,
+- **7.** **Volume `alcoloco-cargo` appartenant à `root`** : avec `--user "$(id -u):$(id -g)"`,
    `cargo` ne peut pas écrire dans le cache partagé tant que le volume appartient à
    `root`. Rencontré par l'agent de #1, qui l'a corrigé une fois pour toutes par un
    `chown -R 1000:1000` du volume. Si l'erreur réapparaît (volume recréé) :
    ```bash
    docker run --rm -v alcoloco-cargo:/c alpine chown -R 1000:1000 /c
    ```
-8. **Gate 5 sans navigateur** : Angular 22 teste avec vitest + jsdom.
+- **8.** **Gate 5 sans navigateur** : Angular 22 teste avec vitest + jsdom.
    `--browsers=ChromeHeadless` n'est plus une option valide — cf. *Gates*.
+- **9.** **`docker compose` est absent de cette machine** — et ce briefing a affirmé le
+   contraire jusqu'au 2026-08-19. `docker-compose.yml` n'est donc pas exécutable en
+   local : Postgres se lance en `docker run`, cf. *Postgres*.
+- **10.** **Les gates Rust ne touchent jamais la base.** Constaté sur #2 : en remplaçant la
+   migration par du SQL invalide, `fmt`, `clippy` et `test --workspace` **restent tous
+   verts**. Aucun SQL n'est couvert par la CI aujourd'hui. Un agent qui écrit du schéma
+   doit donc le sonder lui-même contre un vrai Postgres — les gates verts ne disent
+   **rien** sur son SQL. (Dette suivie : cf. *Escalade*, ajout d'un service Postgres à
+   la CI.)
+- **12.** **Ne jamais laisser un vérificateur hériter du scratchpad de l'auteur.** Rencontré sur #2 :
+   l'agent B a trouvé à son arrivée les arbres de build, les mutations et les sondes de l'agent A,
+   et a lancé ses trois premiers gates dessus avant de s'en apercevoir. Il les a rejoués sur un
+   `git archive` propre — mais c'est exactement le scénario de « confirmation mutuelle » que la
+   vérification est censée exclure. **Consigne à donner à tout agent B** : travaille sur un export
+   propre de la révision (`git archive <sha>`), jamais sur un arbre que tu n'as pas produit.
+- **17.** **Une course concurrente pilotée pas à pas ne teste rien.** Démontré sur #2 : deux
+   `psql` avancés à la main, ou un pilote qui attend la réponse d'une session avant de
+   faire avancer l'autre, laissent des dizaines de millisecondes entre les deux `COMMIT`
+   — largement au-delà de la fenêtre réelle (2–5 ms). Le scénario conclut « ça tient »
+   sans jamais avoir ouvert la fenêtre. Pour éprouver une course au `COMMIT`, **synchroniser
+   les deux sessions sur une horloge commune** (`pg_sleep` vers un instant absolu), puis
+   **balayer le décalage** pour mesurer la largeur de la fenêtre plutôt qu'un point.
+- **18.** **`grep -c '^ERROR'` ne compte aucune erreur `psql`** : les messages sont préfixés
+   `psql:/tmp/a.sql:1192: `. Utiliser `grep -c 'ERROR:'`. A produit un « 0 erreur » faux
+   pendant une passe de l'arbitrage de #2.
+
+- **19.** **Un `cd` vers un worktree survit d'un appel à l'autre.** Commis par l'orchestrateur sur #2 le
+   2026-08-20 : un `cd` fait pour un simple `grep` de contrôle a persisté, et deux entrées de journal
+   écrites en chemin relatif sont parties dans `.claude/worktrees/<agent>/.claude/issue-log/`. Le
+   journal réel a sauté la vérification bloquante qui motivait un arbitrage. **Écrire l'état de
+   l'orchestrateur en chemin absolu, toujours**, et vérifier le `git status` d'un worktree avant de
+   le supposer propre — un `?? .claude/…` inattendu est la signature de cette erreur.
+
+- **16.** **Un rapport d'agent n'est pas un artefact du dépôt.** Commis par l'orchestrateur sur
+   #42 : un chiffre issu du *rapport de fin de tâche* d'un agent a été recopié au journal,
+   puis transmis à deux agents suivants comme « le corps de PR affirme… ». Le corps de PR
+   ne l'a jamais contenu. Avant d'attribuer une affirmation à un artefact (corps de PR,
+   commentaire, fichier), **l'y lire** — `gh api …/pulls/<n> --jq .body`, pas le journal.
+
+- **13.** **`git fetch`/`push` peuvent échouer en `Permission denied (publickey)` alors que
+   l'agent SSH tourne.** Constaté sur #41 le 2026-08-20, puis **résolu le même jour** : la clé
+   n'était pas chargée dans l'agent, et `ssh` retombait sur une invite de passphrase impossible
+   (`ssh_askpass: No such file or directory`). Ce n'était donc **pas** une propriété de
+   l'environnement. Diagnostiquer avant de contourner : `ssh-add -l` doit lister la clé de
+   `~/.ssh/config` (`IdentityAgent ~/.ssh/agent.sock`), et `ssh -T git@github.com` doit répondre
+   `Hi <user>!`. Si oui, SSH marche. Sinon seulement, pousser par HTTPS avec le token `gh`.
+- **14.** **`CARGO_TARGET_DIR` hors dépôt évite le problème des fichiers `root`.** Trouvé par
+   l'agent de #41 : plutôt que de subir les 855 entrées `root` de `target/`, pointer
+   `CARGO_TARGET_DIR` vers le scratchpad. Le worktree reste alors supprimable.
+   ⚠ **Monter aussi le chemin visé** (`-v <scratchpad>:<chemin>`) : la ligne `docker run` de
+   *Environnement* ne monte que `"$PWD"`, donc un `CARGO_TARGET_DIR` non monté est créé
+   **dans** le conteneur et jeté par `--rm` — le worktree reste propre, mais chaque gate
+   recompile tout depuis zéro.
+- **15.** **Une sonde de trigger peut être interceptée avant le trigger.** Sur #41, la sonde
+   de `UPDATE … SET profile_id` construite avec le **même `valid_from`** des deux côtés
+   tombe sur `profile_settings_version_unique_start` — elle passe au vert sans avoir
+   jamais atteint le trigger qu'elle prétend éprouver. Vérifier *quelle* contrainte
+   rejette, pas seulement *qu'il y a* rejet.
+
+- **20.** **Une fonction SQL qui lit une table sans la qualifier est contournable par
+   `pg_temp`.** Trouvé sur #41 après quatre passages de review qui l'avaient manquée :
+   `pg_temp` est cherché **avant** `public`, donc n'importe quel rôle ayant les seuls droits
+   DML — ni `TRUNCATE`, ni propriété, ni superutilisateur — masque la vraie table avec une
+   table temporaire et neutralise la fonction. Deux effets mesurés : un trigger de contrainte
+   rendu inopérant (profil durablement sans version), et `profile_settings_at()` renvoyant des
+   paramètres **fabriqués** dans tout calcul d'alcoolémie. **Toute fonction écrite en base
+   qualifie ses relations et ses types non natifs** (`public.profile`, …). Préférer la
+   qualification à `SET search_path` sur une fonction SQL : `SET` empêche l'*inlining*
+   (mesuré : `Index Scan` → `Function Scan`). Concerne directement #10, #13 et #43.
+
+- **11.** **Un test qui nomme un fichier ne le lit pas forcément.** Deux tests de #2 ont été
+   pris en flagrant délit : l'un disait comparer `docker-compose.yml` sans jamais
+   l'ouvrir, l'autre disait garantir des UUID v7 en testant la crate `uuid` elle-même.
+   La sonde qui tranche est la **mutation** : casse ce que le test prétend garder, et
+   exige de le voir rougir.
 
 ---
 
@@ -294,6 +408,12 @@ Section vivante — une ligne à ajouter après chaque mur rencontré.
   d'échantillonnage et fenêtre des courbes) : points ouverts dans la spec. Le pas
   d'intégration conditionne #16 — si une issue en dépend, demander avant de coder.
 - Toute modification de la CI ou de la politique de dépendances.
+- **Dette ouverte (2026-08-19, constatée sur #2) : aucun SQL n'est couvert en CI.**
+  Les trois gates Rust restent verts avec une migration remplacée par du SQL invalide
+  (prouvé, pas déduit). Fermer ce trou = ajouter un service `postgres` au workflow et
+  un test d'intégration conditionné à `DATABASE_URL` — donc **une modification de la
+  CI**, qui relève de cette section. Mérite sa propre issue ; ne pas la glisser dans
+  une PR de fonctionnalité.
 - Toute modification d'une migration **déjà mergée** (les migrations sont
   append-only une fois sur `main`).
 - Fermeture d'une issue sans PR, ou merge forcé.
