@@ -101,8 +101,12 @@ Points de schéma utiles à connaître avant d'écrire une requête :
   ne sont pas versionnées ;
 - tout profil possède **au moins une version** de paramètres : deux triggers de contrainte différés
   rejettent au `COMMIT` un profil créé sans version, la suppression de sa dernière version et
-  l'`UPDATE` qui déplacerait cette dernière version vers un autre profil. L'ordre d'écriture n'est
-  pas libre pour autant : le profil doit précéder sa première version, la clé étrangère
+  l'`UPDATE` qui déplacerait cette dernière version vers un autre profil ; un troisième trigger,
+  `profile_keeps_its_id`, rend `profile.id` **immuable** et refuse la renumérotation d'un profil
+  **sur-le-champ**. Sans lui, supprimer toutes les versions d'un profil puis renuméroter ce profil
+  dans la même transaction validait sans erreur : la clé étrangère est `NO ACTION` sur `UPDATE` et
+  ne rejette que **tant qu'une version pointe encore** sur l'ancien identifiant. L'ordre d'écriture
+  n'est pas libre pour autant : le profil doit précéder sa première version, la clé étrangère
   `profile_settings_version_profile_id_fkey` n'étant **pas** `DEFERRABLE` — l'ordre inverse est
   refusé **sur-le-champ** (23503), et `SET CONSTRAINTS ALL DEFERRED` n'y change rien ;
 - **portée exacte de cette garantie**, et elle n'est pas absolue — `SPEC.md` §5.1 et §10.0-L en sont
@@ -114,14 +118,17 @@ Points de schéma utiles à connaître avant d'écrire une requête :
   disparaissent) ; **(b)** la désactivation ou la suppression des triggers
   (`SET session_replication_role = replica`, `ALTER TABLE … DISABLE TRIGGER USER`, `DROP TRIGGER`) ;
   **(c)** la vérification étant différée, la transaction **qui écrit** elle-même, qui lit son propre
-  état intermédiaire entre le `DELETE` et le `COMMIT` — mais son `COMMIT` est ensuite refusé ;
+  état intermédiaire entre le `DELETE` et le `COMMIT` — elle ne laisse rien de durable pour autant :
+  ou bien le profil est encore à zéro version au `COMMIT` et le `COMMIT` est refusé, ou bien elle a
+  remis une version et valide sur un état cohérent ;
   **(d)** la **concurrence** : deux transactions simultanées qui suppriment chacune une *autre* des
   versions d'un même profil valident **toutes deux sans erreur**, chacune voyant subsister la
   version que l'autre retire, et le profil reste durablement à zéro version. Les classes (a), (b)
   et (d) laissent un état durablement incohérent, où `profile_settings_at()` ne rend aucune ligne
   pour un profil qui existe toujours, sans rien signaler ;
-- **qui atteint quoi** : (a) exige le privilège `TRUNCATE` et (b) le superutilisateur ou la
-  propriété de la table — un rôle limité au DML n'atteint ni l'une ni l'autre, et toutes deux
+- **qui atteint quoi** : (a) exige le privilège `TRUNCATE` et (b) le superutilisateur, la propriété
+  de la table ou un `GRANT SET ON PARAMETER session_replication_role` (PostgreSQL 15 et suivants)
+  — un rôle limité au DML n'atteint ni l'une ni l'autre, et toutes deux
   relèvent d'une restauration, d'une remise à zéro de fixtures ou d'un import en masse. **(c) et
   (d), si** : ce sont des écritures DML ordinaires, que **n'importe quel** rôle capable d'écrire
   atteint, à commencer par celui de l'application. (d) est ouverte dans le régime nominal, celui du

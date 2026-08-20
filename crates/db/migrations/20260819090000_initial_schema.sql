@@ -151,16 +151,41 @@ COMMENT ON COLUMN profile_settings_version.birth_date IS
 -- transaction (the profile first, its foreign key is immediate), and the check
 -- only fires once both statements have run.
 --
--- Three writes can leave a profile with no version at all, and the two triggers
--- below cover the three: inserting the profile itself, deleting its last
--- version, and moving that last version to another profile with an UPDATE of
--- `profile_id`. `COPY` and `MERGE`, including its update and delete branches,
+-- Four writes can leave a profile with no version at all, and the three
+-- triggers below cover the four: inserting the profile itself, deleting its
+-- last version, moving that last version to another profile with an UPDATE of
+-- `profile_id`, and renumbering the profile itself with an UPDATE of
+-- `profile.id`. `COPY` and `MERGE`, including its update and delete branches,
 -- fire the very same row triggers, so they need no declaration of their own.
--- Two more writes only look like holes: deleting the profile cascades its
--- versions away and the function returns early once the profile itself is gone;
--- renumbering a profile is refused outright by the foreign key, which is
--- NO ACTION on update and so rejects while any version still points at the old
--- id.
+-- One write only looks like a hole: deleting the profile cascades its versions
+-- away and the function returns early once the profile itself is gone.
+--
+-- Renumbering is the one that needs a trigger of its own, and why is worth
+-- writing down. The foreign key does refuse it, but only **while a version
+-- still points at the old id**: it is NO ACTION on update, so once the versions
+-- are gone it has nothing left to object to. A single transaction deleting
+-- every version of a profile and then renumbering that profile committed
+-- without a word — `assert_profile_settings_version_present()` returns early
+-- because the old id names no profile any more, and the deferred check looks
+-- for that same old id at COMMIT. `profile_keeps_its_id` refuses the
+-- renumbering itself, with no qualifier attached.
+--
+-- Which of the two mechanisms actually rejects was measured here rather than
+-- assumed, and it is not the one the division of labour suggests.
+-- `profile_keeps_its_id` is a BEFORE ROW trigger and a foreign key is checked
+-- after the row is written, so the trigger fires first and rejects **both**
+-- branches, on the spot, with SQLSTATE 23000 and `profile ... may not be
+-- renumbered to ...`. The foreign key stands behind it and still covers only
+-- the one branch: with the trigger disabled, renumbering a profile a version
+-- still points at is refused by `profile_settings_version_profile_id_fkey`
+-- with SQLSTATE 23503, while renumbering one whose versions have just been
+-- deleted commits and reopens the hole. The trigger is therefore what closes
+-- the path; the foreign key is a partial second line, and the message a caller
+-- sees is always the trigger's.
+--
+-- An UPDATE that does not name `id` never reaches the trigger, which is
+-- declared `OF id`, and `UPDATE profile SET id = id` passes: it compares
+-- values, not the shape of the SET list.
 --
 -- Scope of the guarantee, stated so that it can be checked rather than
 -- believed. SPEC.md §10.0-L is the source of truth for it and delegates the
@@ -169,10 +194,12 @@ COMMENT ON COLUMN profile_settings_version.birth_date IS
 --
 -- What holds: a transaction **running alone** that would leave an existing
 -- profile without a version does not commit. It holds that way for `INSERT`,
--- `UPDATE`, `DELETE`, `COPY` and `MERGE`, and it is enforced at `COMMIT`. The
--- write order inside such a transaction is not free for all that: the profile
--- must precede its first version. `profile_settings_version_profile_id_fkey`
--- is **not** DEFERRABLE, so the reverse order is refused **on the spot** with
+-- `UPDATE`, `DELETE`, `COPY` and `MERGE`. Two of the three triggers enforce it
+-- at `COMMIT`; the third, `profile_keeps_its_id`, has nothing to wait for and
+-- rejects on the spot. The write order inside such a transaction is not free
+-- for all that: the profile must precede its first version.
+-- `profile_settings_version_profile_id_fkey` is **not** DEFERRABLE, so the
+-- reverse order is refused **on the spot** with
 -- SQLSTATE 23503, not at commit, and `SET CONSTRAINTS ALL DEFERRED` changes
 -- nothing to it — that statement can only defer a constraint declared
 -- deferrable. What defers here is the pair of constraint triggers below, and
@@ -191,10 +218,12 @@ COMMENT ON COLUMN profile_settings_version.birth_date IS
 --       profile_settings_version` is not, since the reference runs the other
 --       way. It takes the TRUNCATE privilege;
 --   (b) anything that switches the triggers off or takes them away:
---       `SET session_replication_role = replica`, which wants superuser and
---       also disables genuine foreign keys, and `ALTER TABLE <table> DISABLE
---       TRIGGER USER` or `DROP TRIGGER`, which want table ownership and leave
---       the foreign keys enforcing — an orphan version is still rejected while
+--       `SET session_replication_role = replica`, which wants superuser or,
+--       since PostgreSQL 15, a `GRANT SET ON PARAMETER
+--       session_replication_role TO <role>`, and which also disables genuine
+--       foreign keys, and `ALTER TABLE <table> DISABLE TRIGGER USER` or `DROP
+--       TRIGGER`, which want table ownership and leave the foreign keys
+--       enforcing — an orphan version is still rejected while
 --       the constraint triggers are off, which makes them the narrower bypass.
 --       Whichever table is unguarded decides which hole opens: `profile` lets
 --       a versionless profile be inserted, `profile_settings_version` lets the
@@ -204,30 +233,46 @@ COMMENT ON COLUMN profile_settings_version.birth_date IS
 --       it is that the writing transaction reads its own intermediate state:
 --       `profile_settings_at()` returns no row there for a profile whose
 --       versions it has just deleted, while the profile itself is still
---       visible. The `COMMIT` is then refused, so nothing durable comes of it;
+--       visible. Nothing durable comes of it: either the profile is still at
+--       zero versions at `COMMIT` and the `COMMIT` is refused, or the
+--       transaction has put a version back and commits on a consistent state;
 --   (d) under concurrency, and this one is not confined to the writing
 --       transaction. Two transactions each deleting a *different* version of
 --       the same profile both commit without error — each still sees the
 --       version the other is removing, so neither trigger finds the profile
 --       empty — and the profile is left durably at zero versions. This is the
 --       nominal regime: it holds at PostgreSQL's default isolation level and
---       at the one the backend driver uses, and it is the isolation level of
---       the *last* committer that decides, only two transactions both
---       committing at SERIALIZABLE being refused (40001). The figures — how
---       systematic it is per isolation pair, and the 2-5 ms width of the
---       window — were measured during the arbitration of #2 and are recorded
---       in SPEC.md §10.0-L; reproduced here as a single case.
+--       at the one the backend driver uses. The only pair measured to be
+--       refused outright is two transactions both committing at SERIALIZABLE
+--       (40001); outside of it what decides is how far the two commit windows
+--       overlap, rather than the isolation level of either committer. Measured
+--       during the arbitration of #2, 20 profiles of 2 versions per pair, on
+--       fresh databases, both COMMITs synchronised on an absolute server
+--       instant: READ COMMITTED x READ COMMITTED violates 20/20 at an offset
+--       of 0 and of 2 ms but 0/20 at 20 ms; REPEATABLE READ x REPEATABLE READ
+--       violates 20/20 even at 100 ms; SERIALIZABLE x SERIALIZABLE 0/20; and
+--       SERIALIZABLE committing first against READ COMMITTED committing last
+--       at 50 ms, 0/20. Those campaigns are not this file's, which reports
+--       them. SPEC.md §10.0-L states the same reservation and phrases the
+--       decision in terms of the isolation level of the last committer; the
+--       figures above are the finer measurement, and #43, which carries the
+--       real fix for this class, aligns that line when it closes.
 --
 -- Classes (a), (b) and (d) leave a durably inconsistent state, in which
 -- `profile_settings_at()` returns no row for a profile that still exists and
--- signals nothing. Class (c) is confined to one transaction, which either
--- commits — and is then refused — or rolls back.
+-- signals nothing. Class (c) leaves none: the empty reading is confined to the
+-- writing transaction. Whether that transaction is refused depends on the state
+-- it reaches at `COMMIT`, not on its having passed through an empty one — one
+-- that deletes every version of a profile and then inserts another commits
+-- normally, durably, on a consistent state. What class (c) costs is a
+-- misleading intermediate read, not a durable hole.
 --
 -- Which role reaches which class, since the answer is not the same for all
--- four. (a) needs the TRUNCATE privilege and (b) needs superuser or ownership
--- of the table: an application role holding only DML grants reaches neither,
--- and both belong to a restore, a fixture reset or a bulk import rather than
--- to the application's ordinary writes. (c) and (d) are the opposite case:
+-- four. (a) needs the TRUNCATE privilege and (b) needs superuser, ownership of
+-- the table, or a `GRANT SET ON PARAMETER session_replication_role`: an
+-- application role holding only DML grants reaches neither, and both belong to
+-- a restore, a fixture reset or a bulk import rather than to the application's
+-- ordinary writes. (c) and (d) are the opposite case:
 -- they are plain DML, so **any** role able to write reaches them, the
 -- application's own role first. Checked on this schema with a role granted
 -- only SELECT, INSERT, UPDATE and DELETE: `TRUNCATE` and `ALTER TABLE ...
@@ -281,6 +326,25 @@ CREATE CONSTRAINT TRIGGER profile_settings_version_keeps_last
     AFTER DELETE OR UPDATE OF profile_id ON profile_settings_version
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION assert_profile_settings_version_present();
+
+CREATE FUNCTION assert_profile_id_unchanged() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.id IS DISTINCT FROM OLD.id THEN
+        RAISE EXCEPTION 'profile % may not be renumbered to %', OLD.id, NEW.id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+COMMENT ON FUNCTION assert_profile_id_unchanged() IS
+    'Keeps profile.id immutable: a renumbering hides the profile from the deferred settings-version check.';
+
+CREATE TRIGGER profile_keeps_its_id
+    BEFORE UPDATE OF id ON profile
+    FOR EACH ROW EXECUTE FUNCTION assert_profile_id_unchanged();
 
 -- ---------------------------------------------------------------------------
 -- Settings applicable at a given instant
