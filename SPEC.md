@@ -41,7 +41,8 @@ extraction ultérieure (voir §9).
 - Affichage de l'alcoolémie instantanée (g/L de sang) et des courbes des participants sur la durée
   de l'événement.
 - Historique des consommations par profil (toutes soirées confondues), modifiable et supprimable.
-- Historique versionné des paramètres physiologiques du profil (poids, taille, sexe, âge).
+- Historique versionné des paramètres physiologiques du profil (poids, taille, sexe, date de
+  naissance).
 - Note de ressenti à la saisie d'une consommation, avec valeur par défaut proposée selon l'alcoolémie.
 
 ### 3.2 Reporté en V2+
@@ -60,10 +61,10 @@ extraction ultérieure (voir §9).
 
 Entités principales (nommage indicatif) :
 
-- **Profile** — identité + paramètres physiologiques courants (poids, taille, sexe, date de
-  naissance) et
-  préférences de saisie (unité par défaut cL/%, durée d'ingestion par défaut, durée d'absorption
-  par défaut).
+- **Profile** — identité et préférences de saisie (unité par défaut cL/%, durée d'ingestion par
+  défaut, durée d'absorption par défaut). Le profil ne porte **aucun paramètre physiologique** :
+  poids, taille, sexe et date de naissance sont portés par sa **version en vigueur** et se lisent à
+  travers elle (§10.0-L).
 - **ProfileSettingsVersion** — snapshot horodaté des paramètres physiologiques d'un profil.
   Toute consommation est rattachée à la version en vigueur à son heure d'ingestion, afin de pouvoir
   rejouer fidèlement les courbes passées même après un changement de poids.
@@ -87,9 +88,21 @@ Relation clé : une consommation appartient **toujours** à l'historique du prof
 
 - **[V1]** Aucune authentification. Au lancement, l'utilisateur choisit un profil parmi une liste
   de profils prédéfinis.
-- **[V1]** Le profil porte les paramètres nécessaires au calcul : **poids, taille, sexe et date de
-  naissance**, tous obligatoires (l'âge et la taille sont exploités par les équations de Watson,
-  §6.2).
+- **[V1]** Les paramètres nécessaires au calcul — **poids, taille, sexe et date de naissance** —
+  ne sont pas portés par le profil lui-même mais par sa **version de paramètres en vigueur**, et se
+  lisent à travers elle (§10.0-L). Ils restent **tous obligatoires** (§10.0-D). L'obligation prend
+  la forme d'un invariant tenu par la base, énoncé par son effet observable : **une transaction
+  s'exécutant seule et qui laisserait un profil existant sans aucune version de paramètres est
+  rejetée à sa validation**. L'ordre des écritures en son sein n'est pas libre : le profil doit
+  précéder sa première version, l'ordre inverse étant refusé **sur-le-champ**, une version ne
+  pouvant référencer un profil qui n'existe pas encore. Cette garantie **ne tient pas sous
+  concurrence** : dans le régime d'isolation par défaut, deux transactions simultanées peuvent
+  laisser un profil sans aucune version sans qu'aucune erreur soit levée. Elle connaît d'autres
+  limites encore ; toutes sont énumérées en §10.0-L, et rien de ce qui précède ne doit être lu comme
+  une garantie absolue. **Aucune fonctionnalité ne peut s'appuyer sur cet invariant en présence
+  d'écritures concurrentes tant que #43 n'est pas fermée.** La taille et l'âge sont exploités par
+  les équations de Watson (§6.2), l'âge étant dérivé de la date de naissance à l'heure d'ingestion
+  (§10.0-K).
 - **[V1]** Le profil porte les préférences de saisie par défaut :
   - unité de quantité par défaut pour les composantes (cL ou %) ;
   - durée d'ingestion par défaut d'une boisson ;
@@ -258,8 +271,9 @@ exprimée en % est d'abord convertie en volume via le volume total de la boisson
 ### 6.2 Volume de diffusion — Watson
 
 **Décision actée** : le coefficient de diffusion est dérivé de l'eau corporelle totale (TBW) estimée
-par les équations de **Watson (1980)**, qui exploitent poids, taille, âge et sexe — la taille et
-l'âge sont donc des données de profil obligatoires.
+par les équations de **Watson (1980)**, qui exploitent poids, taille, âge et sexe — la taille et la
+**date de naissance** sont donc des paramètres obligatoires de la version en vigueur (§10.0-D,
+§10.0-L), l'âge étant dérivé de la date de naissance à l'heure d'ingestion (§10.0-K).
 
 ```
 TBW_homme (L) = 2,447 − 0,09516 × âge + 0,1074 × taille(cm) + 0,3362 × poids(kg)
@@ -412,7 +426,7 @@ d'un module depuis un autre.
 | A | Quantité en % | Le **volume total de la boisson est obligatoire** dès qu'au moins une composante est exprimée en %. Sans lui, la boisson est invalide. |
 | B | Composantes « majoritaires » | Majorité **en volume**, toutes composantes confondues — un soft peut donc figurer dans le nom au même titre qu'un alcool. |
 | C | Coefficient de diffusion | **Watson**, exploitant poids, taille, âge et sexe (§6.2). Repli sur les constantes Widmark si une donnée manque. |
-| D | Paramètres profil obligatoires | **Poids, taille, sexe, date de naissance.** |
+| D | Paramètres profil obligatoires | **Poids, taille, sexe, date de naissance.** Portés par la version en vigueur, jamais par `Profile` (§10.0-L). |
 | E | Note de ressenti par défaut | La suggestion **ne dépasse jamais le niveau 6** : le niveau 7 et au-delà ne sont jamais proposés, l'utilisateur peut les sélectionner lui-même. Barème indicatif : 1 < 0,2 ; 2 : 0,2–0,5 ; 3 : 0,5–0,8 ; 4 : 0,8–1,2 ; 5 : 1,2–1,8 ; 6 : > 1,8 g/L. |
 | F | Profil d'absorption | **Trapèze** (§6.4) retenu comme **défaut d'implémentation**. Arbitrage produit final avant release V1 → **#37**. |
 | G | Superposition | Les débits `R` se somment ; `β` est global au corps et ne s'applique **qu'une fois** (§6.5). |
@@ -420,6 +434,7 @@ d'un module depuis un autre.
 | I | Granularité des courbes | **Pas d'intégration interne fixe à 1 min**, fenêtre = durée de l'événement **+ 3 h** de décroissance. Le `?step=` de l'API (§5.7, #17) ne fait que **sous-échantillonner** la série intégrée, et est **borné à [1 min, 1 h]** — il ne change jamais le pas d'intégration, donc jamais le résultat. |
 | J | Effet d'un changement de paramètres profil | La date d'effet (`valid_from`) est **choisie par l'utilisateur**, pour distinguer une correction de saisie d'une évolution réelle. Voir §5.1. |
 | K | Âge retenu par Watson | Calculé à l'**heure d'ingestion** de chaque boisson, depuis la date de naissance de la version en vigueur. Aucun âge figé en base (§6.2). |
+| L | Emplacement des paramètres physiologiques | Poids, taille, sexe et date de naissance vivent **uniquement** sur `ProfileSettingsVersion` ; `Profile` ne porte que l'identité et les préférences de saisie, et **aucune copie courante** de ces quatre paramètres. Une telle copie serait une **seconde source de vérité**, libre de diverger de la version en vigueur dès la première modification, et qu'aucun calcul ne lirait puisque §10.0-K et §5.6 imposent déjà la version en vigueur **à l'heure d'ingestion**. Contrepartie assumée : l'obligation de §10.0-D n'est plus tenue par le typage mais par un invariant de la base, que cette spécification énonce par son **effet observable** et non par le mécanisme qui le réalise — celui-ci appartient au schéma (#2) et peut évoluer sans que cette ligne change. L'invariant : **une transaction s'exécutant seule et qui laisserait un profil existant sans aucune version de paramètres est rejetée à sa validation** (`COMMIT`) ; il tient sur ses écritures ordinaires — `INSERT`, `UPDATE`, `DELETE`, `COPY`, `MERGE`. L'ordre des écritures en son sein n'est pas libre pour autant : le profil doit précéder sa première version, l'ordre inverse étant refusé **sur-le-champ** et non à la validation, une version ne pouvant référencer un profil qui n'existe pas encore. **Réserve, à ne pas lire comme une garantie absolue** — quatre classes d'opérations, énoncées en classes et non en liste fermée de chemins, une liste fermée redevenant fausse au chemin suivant : l'invariant ne tient pas (a) sur un vidage en bloc de la table des versions (`TRUNCATE`), (b) sur toute opération qui suspend ou retire les contrôles de la base, (c) à l'intérieur de la transaction écrivante avant sa validation, où son propre état intermédiaire lui est visible, ni (d) **sous concurrence** : deux transactions simultanées qui retirent chacune une autre des versions d'un même profil valident **toutes deux sans erreur** — chacune voit subsister la version que l'autre est en train de retirer — et le profil reste durablement à zéro version. Les cas (a), (b) et (d) laissent un état durablement incohérent, dans lequel la lecture des paramètres d'un profil existant ne rend **aucune ligne** et ne signale rien. Les classes (a), (b) et (c) ne s'atteignent pas par les écritures ordinaires de l'application : elles concernent une restauration, une remise à zéro de jeu d'essai, un import en masse, ou la transaction écrivante elle-même. **La classe (d), si** : elle est ouverte dans le régime nominal, celui du niveau d'isolation par défaut de PostgreSQL comme du pilote employé par le backend, et c'est le niveau d'isolation du **dernier committeur** qui décide — seules deux transactions validant l'une et l'autre au niveau sérialisable se voient refuser (`40001`). Mesuré lors de l'arbitrage de #2 (PostgreSQL 16.15, validations synchronisées sur une horloge serveur commune) : violation systématique en `READ COMMITTED` × `READ COMMITTED` (3000 profils sur 3000) comme en `REPEATABLE READ` × `REPEATABLE READ` (1000/1000), aucune en `SERIALIZABLE` × `SERIALIZABLE` (0/1000) ; la fenêtre n'est pas microscopique — elle vaut la durée du traitement de validation de l'autre transaction, **2 à 5 ms** en `READ COMMITTED`, et un décalage des deux validations ne la referme pas en `REPEATABLE READ`. **Conséquence pour qui écrit du code** : tant que **#43** n'est pas fermée, aucune fonctionnalité ne peut s'appuyer sur cet invariant en présence d'écritures concurrentes. #43 porte la fermeture réelle du trou et **bloque #7**. Le schéma de #2 est l'endroit où la portée exacte de chaque classe est détaillée. Voir §4 et §5.1. |
 
 ### 10.1 Modèle d'ingestion et d'absorption — **défaut retenu, arbitrage final avant release V1 (#37)**
 
