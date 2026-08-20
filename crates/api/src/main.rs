@@ -1,53 +1,45 @@
 //! HTTP entry point of alcoLoco.
 //!
-//! At this stage the server only exposes a liveness endpoint: business routes
-//! are added by later issues.
+//! ```text
+//! DATABASE_URL       postgres://alcoloco:alcoloco@localhost:5432/alcoloco
+//! ALCOLOCO_API_ADDR  0.0.0.0:8080
+//! ALCOLOCO_LOG_LEVEL info
+//! ALCOLOCO_ENV       development | production
+//! ```
+//!
+//! Everything the process does lives in the `api` library; this binary only
+//! wires the configuration to the router and serves it.
 
-use std::net::SocketAddr;
+use std::process::ExitCode;
 
-use axum::{Router, routing::get};
-
-/// Default address the server binds to when `ALCOLOCO_API_ADDR` is not set.
-const DEFAULT_ADDR: &str = "0.0.0.0:8080";
-
-/// Liveness endpoint. Returns 200 as long as the process is able to serve.
-async fn health() -> &'static str {
-    "ok"
-}
-
-/// Builds the application router. Kept separate from `main` so that it can be
-/// exercised by tests without binding a socket.
-fn app() -> Router {
-    Router::new().route("/health", get(health))
-}
+use api::{AppState, Config};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = std::env::var("ALCOLOCO_API_ADDR")
-        .unwrap_or_else(|_| DEFAULT_ADDR.to_owned())
-        .parse()?;
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!(
-        "alcoLoco api listening on http://{}",
-        listener.local_addr()?
-    );
-    axum::serve(listener, app()).await?;
-
-    Ok(())
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("api: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = Config::from_env()?;
+    api::init_tracing(&config)?;
 
-    #[tokio::test]
-    async fn health_reports_ok() {
-        assert_eq!(health().await, "ok");
-    }
+    let addr = config.addr;
+    let environment = config.environment;
+    let state = AppState::new(config)?;
 
-    #[test]
-    fn router_builds() {
-        let _ = app();
-    }
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(
+        address = %listener.local_addr()?,
+        environment = %environment,
+        "alcoLoco api listening"
+    );
+
+    axum::serve(listener, api::app(state)).await?;
+    Ok(())
 }
