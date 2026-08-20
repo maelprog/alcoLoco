@@ -7,18 +7,20 @@
 > (2026-08-18) : jobs CI `rust` et `web`, commandes exactes des gates, **pas d'audit de
 > sécurité en CI**.
 
-Milestone **V1** : 30 issues (#1–#29 + #37). Milestone **V2+** (#30–#36) hors file.
-Aucune issue `bug` ouverte — l'ordre est donc numérique, et il se trouve être déjà
-topologiquement valide au regard des « Bloqué par » déclarés dans chaque corps.
+Milestone **V1** : 31 issues (#1–#29, #37 et **#43**). Milestone **V2+** (#30–#36) hors file.
+L'ordre est numérique **à une exception près, délibérée** : **#43 est placée avant #7**, qu'elle
+bloque, pour que la file reste correcte prise en tête. Ne pas la « remettre dans l'ordre ».
+Au-delà de cette exception, l'ordre respecte les « Bloqué par » déclarés dans chaque corps.
 Détail d'une issue en cours : `.claude/issue-log/<N>.md`.
 
 - [x] #1  infra  — Bootstrap du dépôt : workspace Rust, app Angular, Postgres local | PR #39 mergée (`5a9f96f`) | journal: issue-log/archive/1.md
-- [ ] #2  bdd    — Schéma de base initial et outillage de migrations                | dép: #1 | statut: à faire
+- [x] #2  bdd    — Schéma de base initial et outillage de migrations                | PR #42 mergée (`f35a171`) et **PR #41 mergée** le 2026-08-20 (`f525035`, rebase, 7 commits) | journal: issue-log/archive/2.md
 - [ ] #3  back   — Squelette de l'API axum : config, erreurs, healthcheck, OpenAPI   | dép: #1 #2 | statut: à faire
 - [ ] #4  front  — Squelette de l'app Angular : routing, layout, client HTTP         | dép: #1 | statut: à faire
 - [ ] #5  calcul — Arbitrages actés et cas de référence chiffrés                     | statut: à faire
 - [ ] #6  back   — Profils : modèle et API CRUD                                      | dép: #3 | statut: à faire
-- [ ] #7  back   — Versionnage de l'historique des paramètres du profil              | dép: #6 | statut: à faire
+- [ ] #43 bdd    — Fermer le trou de concurrence de l'invariant « un profil a une version » | dép: #2 | bloque #7 | statut: à faire
+- [ ] #7  back   — Versionnage de l'historique des paramètres du profil              | dép: #6 **#43** | statut: à faire (⚠ #43 bloquante : invariant faux sous concurrence — noté aussi en commentaire sur l'issue)
 - [ ] #8  front  — Écran de sélection de profil                                      | dép: #4 #6 | statut: à faire
 - [ ] #9  front  — Écran d'édition du profil et des préférences par défaut           | dép: #8 | statut: à faire
 - [ ] #10 bdd    — Bibliothèque de base : modèle et jeu de données initial           | dép: #2 | statut: à faire
