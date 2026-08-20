@@ -189,8 +189,10 @@ COMMENT ON COLUMN profile_settings_version.birth_date IS
 --
 -- Scope of the guarantee, stated so that it can be checked rather than
 -- believed. SPEC.md §10.0-L is the source of truth for it and delegates the
--- exact reach of each class to this file; the four classes below are its four
--- classes, in the same order.
+-- exact reach of each class to this file; classes (a) to (d) below are its
+-- four classes, in the same order. Class (e) is one more, found here and not
+-- listed there; it is closed, so it costs SPEC.md nothing, but the count no
+-- longer matches on purpose.
 --
 -- What holds: a transaction **running alone** that would leave an existing
 -- profile without a version does not commit. It holds that way for `INSERT`,
@@ -205,10 +207,14 @@ COMMENT ON COLUMN profile_settings_version.birth_date IS
 -- deferrable. What defers here is the pair of constraint triggers below, and
 -- nothing else.
 --
--- The guarantee does **not** hold in the four classes below. They are stated
+-- The guarantee does **not** hold in the five classes below. They are stated
 -- as classes and not as a closed list of paths, a closed list being false
--- again at the next path. Each was reproduced against PostgreSQL 16 on this
--- schema rather than deduced from the manual.
+-- again at the next path — class (e) is the proof of that, found after the
+-- first four were written down as if they covered the ground. Each was
+-- reproduced against PostgreSQL 16 on this schema rather than deduced from
+-- the manual. Four of the five are open; (e) is closed, by this file, and is
+-- kept here because a taxonomy that drops a class once it is closed teaches
+-- the next reader the same blind spot.
 --
 --   (a) `TRUNCATE profile_settings_version` empties the table and leaves the
 --       profiles standing. It walks no row, so no `FOR EACH ROW` trigger runs,
@@ -256,7 +262,31 @@ COMMENT ON COLUMN profile_settings_version.birth_date IS
 --       them. SPEC.md §10.0-L states the same reservation and phrases the
 --       decision in terms of the isolation level of the last committer; the
 --       figures above are the finer measurement, and #43, which carries the
---       real fix for this class, aligns that line when it closes.
+--       real fix for this class, aligns that line when it closes;
+--   (e) `pg_temp` shadowing — **closed by this file**, and open to any role
+--       able to write until it was. `search_path` searches `pg_temp` before
+--       `public`, and the `TEMP` privilege on a database is held by `PUBLIC`
+--       by default, so a role granted nothing beyond SELECT, INSERT, UPDATE
+--       and DELETE can run `CREATE TEMP TABLE profile (id uuid)` and have a
+--       function that reads `profile` unqualified read *that* table. An empty
+--       temporary `profile` makes the early return of
+--       `assert_profile_settings_version_present()` fire on every call, which
+--       turns all three constraint triggers into no-ops at once: deleting
+--       every version of a profile then commits without error and leaves it
+--       durably versionless. Shadowing `profile_settings_version` the same
+--       way feeds a fabricated weight, height, sex and birth date into every
+--       `profile_settings_at()` answer, hence into every computed curve —
+--       this class reaches the values, not only their presence, which none of
+--       the other four do. What closes it is schema qualification: the two
+--       function bodies below name `public.profile` and
+--       `public.profile_settings_version`, and a name written with its schema
+--       consults no `search_path` at all. Qualification rather than a `SET
+--       search_path` clause on the functions, which would close it just as
+--       well: `SET` makes a SQL-language function opaque to the inliner, and
+--       `profile_settings_at()` is on the hot path of every curve query. The
+--       trigger function is qualified too, for one technique in the file
+--       rather than two. Any function added here later reads relations
+--       schema-qualified for the same reason.
 --
 -- Classes (a), (b) and (d) leave a durably inconsistent state, in which
 -- `profile_settings_at()` returns no row for a profile that still exists and
@@ -268,19 +298,30 @@ COMMENT ON COLUMN profile_settings_version.birth_date IS
 -- misleading intermediate read, not a durable hole.
 --
 -- Which role reaches which class, since the answer is not the same for all
--- four. (a) needs the TRUNCATE privilege and (b) needs superuser, ownership of
+-- five. (a) needs the TRUNCATE privilege and (b) needs superuser, ownership of
 -- the table, or a `GRANT SET ON PARAMETER session_replication_role`: an
--- application role holding only DML grants reaches neither, and both belong to
--- a restore, a fixture reset or a bulk import rather than to the application's
--- ordinary writes. (c) and (d) are the opposite case:
--- they are plain DML, so **any** role able to write reaches them, the
--- application's own role first. Checked on this schema with a role granted
--- only SELECT, INSERT, UPDATE and DELETE: `TRUNCATE` and `ALTER TABLE ...
--- DISABLE TRIGGER USER` are both refused, while `BEGIN; DELETE ...; SELECT
--- count(*) FROM profile_settings_at(...)` answers 0 for a profile that still
--- exists, and two concurrent such `DELETE`s on different versions of one
--- profile both commit. The local development role owns these tables and is
--- superuser, so all four are within its reach.
+-- application role holding only DML grants reaches neither of those two, and
+-- both belong to a restore, a fixture reset or a bulk import rather than to
+-- the application's ordinary writes. That is a statement about (a) and (b)
+-- alone, and it must not be read as "DML grants are harmless": (c), (d) and
+-- (e) are the opposite case. (c) and (d) are plain DML, so **any** role able
+-- to write reaches them, the application's own role first. (e) needed no DML
+-- privilege at all beyond the `TEMP` one every role holds by default, and it
+-- was the widest of the five while it was open — a DML-only role reached the
+-- durable hole of (a) and (b) through it, without either of their privileges,
+-- and reached the returned values on top. Schema qualification is what closes
+-- it; no grant does, since none of them can be revoked far enough to matter
+-- while `REVOKE TEMPORARY ON DATABASE ... FROM PUBLIC` stays untypical.
+-- Checked on this schema with a role granted only SELECT, INSERT, UPDATE and
+-- DELETE: `TRUNCATE` and `ALTER TABLE ... DISABLE TRIGGER USER` are both
+-- refused, while `BEGIN; DELETE ...; SELECT count(*) FROM
+-- profile_settings_at(...)` answers 0 for a profile that still exists, two
+-- concurrent such `DELETE`s on different versions of one profile both commit,
+-- and `CREATE TEMP TABLE profile (id uuid)` succeeds for that same role —
+-- after which both shadowing attacks of (e) are refused by the qualified
+-- bodies below, where before the fix both went through. The local development
+-- role owns these tables and is superuser, so the four open classes are all
+-- within its reach.
 --
 -- Consequence for whoever writes #7, #16 or any other reader of a profile's
 -- settings: **this invariant cannot be relied on in the presence of concurrent
@@ -300,14 +341,19 @@ BEGIN
         target_profile := OLD.profile_id;
     END IF;
 
+    -- Both relations are read schema-qualified, and must stay that way: an
+    -- unqualified `profile` resolves through `search_path`, which reaches
+    -- `pg_temp` first, and an empty temporary table of that name makes the
+    -- early return below fire on every call — class (e) above.
+
     -- The profile itself is gone (its versions were cascaded away): nothing to
     -- guarantee any more.
-    IF NOT EXISTS (SELECT 1 FROM profile WHERE id = target_profile) THEN
+    IF NOT EXISTS (SELECT 1 FROM public.profile WHERE id = target_profile) THEN
         RETURN NULL;
     END IF;
 
     IF NOT EXISTS (
-        SELECT 1 FROM profile_settings_version WHERE profile_id = target_profile
+        SELECT 1 FROM public.profile_settings_version WHERE profile_id = target_profile
     ) THEN
         RAISE EXCEPTION 'profile % has no settings version', target_profile
             USING ERRCODE = 'integrity_constraint_violation';
@@ -392,11 +438,16 @@ CREATE TRIGGER profile_keeps_its_id
 -- `LEFT JOIN LATERAL profile_settings_at(p.id, $2) s ON true` when a row of the
 -- enclosing query has to survive an empty result.
 
+-- `profile_settings_version` is read schema-qualified here for the reason
+-- given as class (e) above: unqualified, a temporary table of that name shadows
+-- it and feeds fabricated physiological parameters into every computed curve.
+-- Qualification and not a `SET search_path` clause, deliberately: `SET` would
+-- make this function opaque to the inliner, and it runs once per curve query.
 CREATE FUNCTION profile_settings_at(target_profile uuid, at timestamptz)
-RETURNS SETOF profile_settings_version
+RETURNS SETOF public.profile_settings_version
 LANGUAGE sql STABLE ROWS 1 AS $$
     SELECT v.*
-    FROM profile_settings_version AS v
+    FROM public.profile_settings_version AS v
     WHERE target_profile IS NOT NULL
       AND at IS NOT NULL
       AND v.profile_id = target_profile
@@ -405,7 +456,7 @@ LANGUAGE sql STABLE ROWS 1 AS $$
               max(w.valid_from) FILTER (WHERE w.valid_from <= at),
               min(w.valid_from)
           )
-          FROM profile_settings_version AS w
+          FROM public.profile_settings_version AS w
           WHERE w.profile_id = target_profile
       );
 $$;

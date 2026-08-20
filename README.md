@@ -112,7 +112,7 @@ Points de schéma utiles à connaître avant d'écrire une requête :
 - **portée exacte de cette garantie**, et elle n'est pas absolue — `SPEC.md` §5.1 et §10.0-L en sont
   la source de vérité, ce qui suit n'en est que le résumé. Ce qui tient : une transaction
   **s'exécutant seule** qui laisserait un profil existant sans version ne commite pas, pour
-  `INSERT`, `UPDATE`, `DELETE`, `COPY` et `MERGE`. Quatre classes y échappent, toutes reproduites
+  `INSERT`, `UPDATE`, `DELETE`, `COPY` et `MERGE`. Cinq classes y échappent, toutes reproduites
   sur PostgreSQL 16 : **(a)** `TRUNCATE profile_settings_version`, qui ne parcourt aucune ligne et
   ne déclenche donc aucun trigger `FOR EACH ROW` (les profils restent, leurs versions
   disparaissent) ; **(b)** la désactivation ou la suppression des triggers
@@ -123,15 +123,34 @@ Points de schéma utiles à connaître avant d'écrire une requête :
   remis une version et valide sur un état cohérent ;
   **(d)** la **concurrence** : deux transactions simultanées qui suppriment chacune une *autre* des
   versions d'un même profil valident **toutes deux sans erreur**, chacune voyant subsister la
-  version que l'autre retire, et le profil reste durablement à zéro version. Les classes (a), (b)
-  et (d) laissent un état durablement incohérent, où `profile_settings_at()` ne rend aucune ligne
-  pour un profil qui existe toujours, sans rien signaler ;
+  version que l'autre retire, et le profil reste durablement à zéro version ;
+  **(e)** l'**occultation par `pg_temp`**, **fermée** depuis, et ouverte à tout rôle capable
+  d'écrire tant qu'elle ne l'était pas : le `search_path` consulte `pg_temp` avant `public`, et le
+  privilège `TEMP` sur une base appartient à `PUBLIC` par défaut, si bien qu'un rôle n'ayant reçu
+  que `SELECT`, `INSERT`, `UPDATE` et `DELETE` pouvait créer une table temporaire `profile` vide et
+  faire lire *celle-là* à la fonction de trigger, dont le retour anticipé se déclenchait alors à
+  chaque appel — les trois triggers devenaient inopérants d'un coup et un profil pouvait perdre
+  durablement toutes ses versions ; la même occultation sur `profile_settings_version` injectait un
+  poids, une taille, un sexe et une date de naissance fabriqués dans chaque réponse de
+  `profile_settings_at()`, donc dans chaque courbe. Ce qui la ferme est la **qualification par le
+  schéma** : les corps de fonction écrivent `public.profile` et `public.profile_settings_version`,
+  et un nom qualifié ne consulte aucun `search_path`. Qualification plutôt que clause `SET
+  search_path`, délibérément : `SET` rendrait `profile_settings_at()` opaque à l'inlining, et elle
+  est sur le chemin chaud de chaque requête de courbe. Les classes (a), (b) et (d) laissent un état
+  durablement incohérent, où `profile_settings_at()` ne rend aucune ligne pour un profil qui existe
+  toujours, sans rien signaler, et (e) en laissait un aussi tant qu'elle était ouverte ;
 - **qui atteint quoi** : (a) exige le privilège `TRUNCATE` et (b) le superutilisateur, la propriété
   de la table ou un `GRANT SET ON PARAMETER session_replication_role` (PostgreSQL 15 et suivants)
   — un rôle limité au DML n'atteint ni l'une ni l'autre, et toutes deux
-  relèvent d'une restauration, d'une remise à zéro de fixtures ou d'un import en masse. **(c) et
-  (d), si** : ce sont des écritures DML ordinaires, que **n'importe quel** rôle capable d'écrire
-  atteint, à commencer par celui de l'application. (d) est ouverte dans le régime nominal, celui du
+  relèvent d'une restauration, d'une remise à zéro de fixtures ou d'un import en masse. Cela vaut
+  pour (a) et (b) **seulement**, et ne doit pas se lire « les droits DML sont sans danger ». **(c),
+  (d) et (e), si** : (c) et (d) sont des écritures DML ordinaires, que **n'importe quel** rôle
+  capable d'écrire atteint, à commencer par celui de l'application ; (e) n'exigeait même pas cela,
+  le privilège `TEMP` que tout rôle détient par défaut suffisait, et c'était la plus large des cinq
+  tant qu'elle est restée ouverte — un rôle limité au DML atteignait par elle le trou durable de
+  (a) et (b) sans posséder aucun de leurs privilèges, et les **valeurs rendues** par-dessus. Aucune
+  révocation ne la ferme en pratique, seule la qualification par le schéma la ferme, et elle est en
+  place. (d) est ouverte dans le régime nominal, celui du
   niveau d'isolation par défaut de PostgreSQL comme du pilote employé par le backend ; seules deux
   transactions validant l'une et l'autre en `SERIALIZABLE` sont refusées (`40001`). **Conséquence :
   aucune fonctionnalité — #7, #16 ou une autre — ne peut s'appuyer sur cet invariant en présence
