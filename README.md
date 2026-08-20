@@ -101,23 +101,47 @@ Points de schéma utiles à connaître avant d'écrire une requête :
   ne sont pas versionnées ;
 - tout profil possède **au moins une version** de paramètres : deux triggers de contrainte différés
   rejettent au `COMMIT` un profil créé sans version, la suppression de sa dernière version et
-  l'`UPDATE` qui déplacerait cette dernière version vers un autre profil ;
-- **portée exacte de cette garantie**, à connaître avant d'écrire une restauration, une remise à
-  zéro de fixtures ou un import en masse : elle vaut pour `INSERT`, `UPDATE`, `DELETE`, `COPY` et
-  `MERGE`, et elle est vérifiée au `COMMIT` — une transaction qui laisserait un profil sans version
-  ne commite pas. Trois chemins y échappent, tous trois reproduits sur PostgreSQL 16 :
-  `TRUNCATE profile_settings_version`, qui ne parcourt aucune ligne et ne déclenche donc aucun
-  trigger `FOR EACH ROW` (les profils restent, leurs versions disparaissent) ; la désactivation ou
-  la suppression des triggers (`SET session_replication_role = replica`, `ALTER TABLE … DISABLE
-  TRIGGER USER`, `DROP TRIGGER`) ; et, la vérification étant différée, la transaction **qui écrit**
-  elle-même, qui lit son propre état intermédiaire entre le `DELETE` et le `COMMIT`. Dans les deux
-  premiers cas, `profile_settings_at()` ne rend ensuite aucune ligne pour un profil qui existe
-  toujours. Aucun des trois n'est atteignable par un rôle limité au DML ;
+  l'`UPDATE` qui déplacerait cette dernière version vers un autre profil. L'ordre d'écriture n'est
+  pas libre pour autant : le profil doit précéder sa première version, la clé étrangère
+  `profile_settings_version_profile_id_fkey` n'étant **pas** `DEFERRABLE` — l'ordre inverse est
+  refusé **sur-le-champ** (23503), et `SET CONSTRAINTS ALL DEFERRED` n'y change rien ;
+- **portée exacte de cette garantie**, et elle n'est pas absolue — `SPEC.md` §5.1 et §10.0-L en sont
+  la source de vérité, ce qui suit n'en est que le résumé. Ce qui tient : une transaction
+  **s'exécutant seule** qui laisserait un profil existant sans version ne commite pas, pour
+  `INSERT`, `UPDATE`, `DELETE`, `COPY` et `MERGE`. Quatre classes y échappent, toutes reproduites
+  sur PostgreSQL 16 : **(a)** `TRUNCATE profile_settings_version`, qui ne parcourt aucune ligne et
+  ne déclenche donc aucun trigger `FOR EACH ROW` (les profils restent, leurs versions
+  disparaissent) ; **(b)** la désactivation ou la suppression des triggers
+  (`SET session_replication_role = replica`, `ALTER TABLE … DISABLE TRIGGER USER`, `DROP TRIGGER`) ;
+  **(c)** la vérification étant différée, la transaction **qui écrit** elle-même, qui lit son propre
+  état intermédiaire entre le `DELETE` et le `COMMIT` — mais son `COMMIT` est ensuite refusé ;
+  **(d)** la **concurrence** : deux transactions simultanées qui suppriment chacune une *autre* des
+  versions d'un même profil valident **toutes deux sans erreur**, chacune voyant subsister la
+  version que l'autre retire, et le profil reste durablement à zéro version. Les classes (a), (b)
+  et (d) laissent un état durablement incohérent, où `profile_settings_at()` ne rend aucune ligne
+  pour un profil qui existe toujours, sans rien signaler ;
+- **qui atteint quoi** : (a) exige le privilège `TRUNCATE` et (b) le superutilisateur ou la
+  propriété de la table — un rôle limité au DML n'atteint ni l'une ni l'autre, et toutes deux
+  relèvent d'une restauration, d'une remise à zéro de fixtures ou d'un import en masse. **(c) et
+  (d), si** : ce sont des écritures DML ordinaires, que **n'importe quel** rôle capable d'écrire
+  atteint, à commencer par celui de l'application. (d) est ouverte dans le régime nominal, celui du
+  niveau d'isolation par défaut de PostgreSQL comme du pilote employé par le backend ; seules deux
+  transactions validant l'une et l'autre en `SERIALIZABLE` sont refusées (`40001`). **Conséquence :
+  aucune fonctionnalité — #7, #16 ou une autre — ne peut s'appuyer sur cet invariant en présence
+  d'écritures concurrentes tant que l'issue #43 n'est pas fermée** ; #43 porte la fermeture réelle
+  et bloque #7 ;
 - `profile_settings_at(profile_id, instant)` rend la version en vigueur à un instant donné, avec
   repli sur la plus ancienne (borne basse ouverte). Elle rend **zéro ou une ligne** (`RETURNS SETOF`)
-  et **aucune ligne** pour un profil inconnu ou un instant NULL, jamais un repli silencieux : à
-  écrire `SELECT * FROM profile_settings_at($1, $2)` ou `LEFT JOIN LATERAL`, et non
-  `SELECT (profile_settings_at($1, $2)).*` ;
+  et **aucune ligne** pour un profil inconnu ou un instant NULL, jamais un repli silencieux. La
+  contrepartie du `SETOF` a trois volets : la forme scalaire
+  `(profile_settings_at($1, $2)).weight_kg` rend zéro ligne au lieu d'un NULL ; elle est de plus
+  **illégale** dans `WHERE`, dans une condition `JOIN … ON`, dans `CASE` et en argument d'agrégat,
+  refusée dès l'analyse, qu'une version applicable existe ou non ; et en liste de sélection, un
+  résultat vide fait disparaître **la ligne entière** de la requête englobante — `SELECT p.id,
+  (profile_settings_at(p.id, NULL)).weight_kg FROM profile p` ne rend aucune ligne pour un profil
+  valide qui possède bien une version. D'où la forme à écrire :
+  `SELECT * FROM profile_settings_at($1, $2)`, ou `LEFT JOIN LATERAL … ON true` lorsque la ligne de
+  la requête englobante doit survivre à un résultat vide ;
 - une version ne stocke que sa borne basse : la borne haute est le `valid_from` suivant, ce qui rend
   chevauchements et trous **non représentables** ;
 - les durées sont des entiers de secondes (`*_duration_seconds`), les volumes des millilitres

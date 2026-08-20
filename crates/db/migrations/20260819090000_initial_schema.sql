@@ -163,43 +163,86 @@ COMMENT ON COLUMN profile_settings_version.birth_date IS
 -- id.
 --
 -- Scope of the guarantee, stated so that it can be checked rather than
--- believed. It holds for `INSERT`, `UPDATE`, `DELETE`, `COPY` and `MERGE`, and
--- it is enforced at `COMMIT`: a transaction that would leave a profile without
--- a version does not commit. It does **not** hold in the three cases below,
--- each of them reproduced against PostgreSQL 16 on this schema rather than
--- deduced from the manual.
+-- believed. SPEC.md §10.0-L is the source of truth for it and delegates the
+-- exact reach of each class to this file; the four classes below are its four
+-- classes, in the same order.
 --
---   * `TRUNCATE profile_settings_version` empties the table and leaves the
---     profiles standing. It walks no row, so no `FOR EACH ROW` trigger runs,
---     and this schema declares no `AFTER TRUNCATE` trigger. PostgreSQL refuses
---     a truncation only when a foreign key in *another* table points at the
---     truncated one: `TRUNCATE profile` is indeed refused, `TRUNCATE
---     profile_settings_version` is not, since the reference runs the other way.
---     It takes the TRUNCATE privilege, which a role holding only DML grants
---     does not have;
---   * anything that switches the triggers off or takes them away:
---     `SET session_replication_role = replica`, which wants superuser and also
---     disables genuine foreign keys, and `ALTER TABLE <table> DISABLE TRIGGER
---     USER` or `DROP TRIGGER`, which want table ownership and leave the foreign
---     keys enforcing — an orphan version is still rejected while the constraint
---     triggers are off, which makes them the narrower bypass. Whichever table
---     is unguarded decides which hole opens: `profile` lets a versionless
---     profile be inserted, `profile_settings_version` lets the last version be
---     deleted;
---   * inside the writing transaction, between the statement and the `COMMIT`.
---     `DEFERRABLE INITIALLY DEFERRED` is exactly what lets a profile and its
---     first version be inserted in either order, and the price of it is that
---     the writing transaction can read its own intermediate state:
---     `profile_settings_at()` answers NULL there for a profile whose versions
---     it has just deleted. `SET CONSTRAINTS ALL DEFERRED` changes nothing to
---     the check itself, which still runs at `COMMIT`.
+-- What holds: a transaction **running alone** that would leave an existing
+-- profile without a version does not commit. It holds that way for `INSERT`,
+-- `UPDATE`, `DELETE`, `COPY` and `MERGE`, and it is enforced at `COMMIT`. The
+-- write order inside such a transaction is not free for all that: the profile
+-- must precede its first version. `profile_settings_version_profile_id_fkey`
+-- is **not** DEFERRABLE, so the reverse order is refused **on the spot** with
+-- SQLSTATE 23503, not at commit, and `SET CONSTRAINTS ALL DEFERRED` changes
+-- nothing to it — that statement can only defer a constraint declared
+-- deferrable. What defers here is the pair of constraint triggers below, and
+-- nothing else.
 --
--- In each of the first two cases `profile_settings_at()` then returns no row
--- for a profile that still exists, and says nothing about it. None of the three
--- arises from the application's ordinary writes, which are DML; they are worth
--- knowing to whoever writes a restore, a fixture reset or a bulk import. The local development role owns these tables and is superuser, so all
--- three are within its reach; an application role holding only DML grants
--- reaches none of them.
+-- The guarantee does **not** hold in the four classes below. They are stated
+-- as classes and not as a closed list of paths, a closed list being false
+-- again at the next path. Each was reproduced against PostgreSQL 16 on this
+-- schema rather than deduced from the manual.
+--
+--   (a) `TRUNCATE profile_settings_version` empties the table and leaves the
+--       profiles standing. It walks no row, so no `FOR EACH ROW` trigger runs,
+--       and this schema declares no `AFTER TRUNCATE` trigger. PostgreSQL
+--       refuses a truncation only when a foreign key in *another* table points
+--       at the truncated one: `TRUNCATE profile` is indeed refused, `TRUNCATE
+--       profile_settings_version` is not, since the reference runs the other
+--       way. It takes the TRUNCATE privilege;
+--   (b) anything that switches the triggers off or takes them away:
+--       `SET session_replication_role = replica`, which wants superuser and
+--       also disables genuine foreign keys, and `ALTER TABLE <table> DISABLE
+--       TRIGGER USER` or `DROP TRIGGER`, which want table ownership and leave
+--       the foreign keys enforcing — an orphan version is still rejected while
+--       the constraint triggers are off, which makes them the narrower bypass.
+--       Whichever table is unguarded decides which hole opens: `profile` lets
+--       a versionless profile be inserted, `profile_settings_version` lets the
+--       last version be deleted;
+--   (c) inside the writing transaction, between the statement and the
+--       `COMMIT`. The check is deferred to commit, and the price of deferring
+--       it is that the writing transaction reads its own intermediate state:
+--       `profile_settings_at()` returns no row there for a profile whose
+--       versions it has just deleted, while the profile itself is still
+--       visible. The `COMMIT` is then refused, so nothing durable comes of it;
+--   (d) under concurrency, and this one is not confined to the writing
+--       transaction. Two transactions each deleting a *different* version of
+--       the same profile both commit without error — each still sees the
+--       version the other is removing, so neither trigger finds the profile
+--       empty — and the profile is left durably at zero versions. This is the
+--       nominal regime: it holds at PostgreSQL's default isolation level and
+--       at the one the backend driver uses, and it is the isolation level of
+--       the *last* committer that decides, only two transactions both
+--       committing at SERIALIZABLE being refused (40001). The figures — how
+--       systematic it is per isolation pair, and the 2-5 ms width of the
+--       window — were measured during the arbitration of #2 and are recorded
+--       in SPEC.md §10.0-L; reproduced here as a single case.
+--
+-- Classes (a), (b) and (d) leave a durably inconsistent state, in which
+-- `profile_settings_at()` returns no row for a profile that still exists and
+-- signals nothing. Class (c) is confined to one transaction, which either
+-- commits — and is then refused — or rolls back.
+--
+-- Which role reaches which class, since the answer is not the same for all
+-- four. (a) needs the TRUNCATE privilege and (b) needs superuser or ownership
+-- of the table: an application role holding only DML grants reaches neither,
+-- and both belong to a restore, a fixture reset or a bulk import rather than
+-- to the application's ordinary writes. (c) and (d) are the opposite case:
+-- they are plain DML, so **any** role able to write reaches them, the
+-- application's own role first. Checked on this schema with a role granted
+-- only SELECT, INSERT, UPDATE and DELETE: `TRUNCATE` and `ALTER TABLE ...
+-- DISABLE TRIGGER USER` are both refused, while `BEGIN; DELETE ...; SELECT
+-- count(*) FROM profile_settings_at(...)` answers 0 for a profile that still
+-- exists, and two concurrent such `DELETE`s on different versions of one
+-- profile both commit. The local development role owns these tables and is
+-- superuser, so all four are within its reach.
+--
+-- Consequence for whoever writes #7, #16 or any other reader of a profile's
+-- settings: **this invariant cannot be relied on in the presence of concurrent
+-- writes** for as long as #43 is open. Treat `profile_settings_at()` as
+-- returning zero or one row and handle the empty case; do not infer that a
+-- version exists from the fact that the profile does. #43 carries the real fix
+-- and blocks #7.
 
 CREATE FUNCTION assert_profile_settings_version_present() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -263,8 +306,27 @@ CREATE CONSTRAINT TRIGGER profile_settings_version_keeps_last
 -- one row in both positions; at most one row can ever come out, since the inner
 -- query pins a single `valid_from` and `UNIQUE (profile_id, valid_from)` makes
 -- it unique. The price of `SETOF` is that the function is set-returning in the
--- select list too, so `SELECT (profile_settings_at(...)).weight_kg` yields zero
--- rows rather than one NULL when there is no applicable version.
+-- select list too, and that price has three parts, not one. The known one:
+-- `SELECT (profile_settings_at(...)).weight_kg` yields zero rows rather than
+-- one NULL when there is no applicable version. Two more come with it, both
+-- checked against PostgreSQL 16 on this schema:
+--
+--   * that scalar spelling is not merely row-less, it is **illegal** in
+--     `WHERE`, in a `JOIN ... ON` condition, in `CASE`, and as the argument of
+--     an aggregate. PostgreSQL refuses the query outright ("set-returning
+--     functions are not allowed in WHERE", and its three siblings), and it
+--     refuses at parse time — so the refusal does not depend on whether an
+--     applicable version exists;
+--   * in the select list, where the spelling *is* accepted, an empty result
+--     removes **the whole row** of the enclosing query rather than just that
+--     column. `SELECT p.id, (profile_settings_at(p.id, NULL)).weight_kg FROM
+--     profile p` returns no row at all for a valid profile that does own a
+--     version, because a NULL instant yields no row; the `p.id` the caller
+--     expected to see goes with it.
+--
+-- Hence the calling form: `SELECT * FROM profile_settings_at($1, $2)`, or
+-- `LEFT JOIN LATERAL profile_settings_at(p.id, $2) s ON true` when a row of the
+-- enclosing query has to survive an empty result.
 
 CREATE FUNCTION profile_settings_at(target_profile uuid, at timestamptz)
 RETURNS SETOF profile_settings_version
