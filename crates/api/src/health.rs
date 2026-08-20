@@ -73,6 +73,12 @@ impl HealthResponse {
 /// not" indistinguishable to whoever is probing — which is the one distinction
 /// the endpoint is for. That is also why the body is not a problem document:
 /// nothing failed, the answer *is* the state.
+///
+/// **Operators**: when the database is unreachable, the answer costs the full
+/// probe timeout — 2 s — because that is how long the probe waits before calling
+/// it down. A liveness check configured to give up sooner will record a timeout
+/// instead of reading `"database": "down"`, and will therefore report the wrong
+/// cause. Allow at least 3 s, or read the body rather than the latency.
 #[utoipa::path(
     get,
     path = "/health",
@@ -113,6 +119,15 @@ async fn probe(pool: &sqlx::PgPool) -> DatabaseStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_probe_timeout_is_the_one_the_operator_note_quotes() {
+        // The handler documentation, which is published in the OpenAPI document,
+        // tells operators to allow at least 3 s. That number is only right while
+        // the timeout stays at 2 s, so raising the constant has to go through
+        // here and take the prose with it.
+        assert_eq!(PROBE_TIMEOUT, Duration::from_secs(2));
+    }
 
     #[test]
     fn an_unreachable_database_degrades_the_overall_status() {

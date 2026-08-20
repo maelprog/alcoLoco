@@ -35,9 +35,22 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
 )]
 pub struct ApiDoc;
 
+/// The document, as served.
+///
+/// `utoipa` fills `info.license` from the Cargo manifest, and this crate carries
+/// no `license` field, so the derive leaves `{"name": ""}` behind. OpenAPI 3.1
+/// makes `license.name` required, and an empty name is not a name: the object is
+/// dropped rather than filled with a licence the project has not chosen.
+#[must_use]
+pub fn spec() -> utoipa::openapi::OpenApi {
+    let mut spec = ApiDoc::openapi();
+    spec.info.license = None;
+    spec
+}
+
 /// Serves the OpenAPI document.
 pub async fn document() -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
+    Json(spec())
 }
 
 #[cfg(test)]
@@ -45,7 +58,18 @@ mod tests {
     use super::*;
 
     fn rendered() -> serde_json::Value {
-        serde_json::to_value(ApiDoc::openapi()).expect("the document must serialise")
+        serde_json::to_value(spec()).expect("the document must serialise")
+    }
+
+    #[test]
+    fn the_document_makes_no_empty_claim_about_a_licence() {
+        // `{"name": ""}` is what utoipa leaves when the manifest names no
+        // licence, and OpenAPI 3.1 requires a name on the object it appears in.
+        let document = rendered();
+        assert!(
+            document["info"]["license"].is_null(),
+            "an empty licence object reached the document: {document}"
+        );
     }
 
     #[test]

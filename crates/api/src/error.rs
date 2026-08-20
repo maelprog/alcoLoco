@@ -118,8 +118,9 @@ impl ApiError {
             Self::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
             Self::Conflict(_) => StatusCode::CONFLICT,
             // 400 rather than 422: the project already answers 400 to an
-            // out-of-range query parameter (SPEC.md §10.0-I), and one status for
-            // "you sent something invalid" is easier to hold than two.
+            // out-of-range query parameter (SPEC.md §10.3, `?step=` outside
+            // the bounds §10.0-I fixes), and one status for "you sent something
+            // invalid" is easier to hold than two.
             Self::Validation(_) => StatusCode::BAD_REQUEST,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -235,7 +236,13 @@ mod tests {
     }
 
     #[test]
-    fn every_problem_carries_exactly_the_rfc_7807_members() {
+    fn the_listed_problem_kinds_carry_exactly_the_rfc_7807_members() {
+        // The list is written out by hand — Rust offers no way to enumerate the
+        // variants of an enum — so a seventh kind added tomorrow would not be
+        // covered here. The name says "listed" rather than "every" for that
+        // reason. The property itself is structural: every kind renders through
+        // the same `ProblemDetails`, whose members are fixed by its definition,
+        // so a new kind cannot change the shape without changing that struct.
         let expected = vec![
             "detail".to_owned(),
             "errors".to_owned(),

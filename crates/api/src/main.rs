@@ -9,6 +9,11 @@
 //!
 //! Everything the process does lives in the `api` library; this binary only
 //! wires the configuration to the router and serves it.
+//!
+//! `GET /health` always answers `200` and reports the state of the database in
+//! its body. When the database is unreachable that answer costs the full probe
+//! timeout, 2 s: a liveness check that gives up sooner records a timeout instead
+//! of reading `"database": "down"`. Allow at least 3 s.
 
 use std::process::ExitCode;
 

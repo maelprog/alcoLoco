@@ -5,6 +5,21 @@
 //! zone is the front-end's job (SPEC.md §7). Naming the type here rather than
 //! spelling `DateTime<Utc>` in every payload is what makes that rule checkable —
 //! a payload reaching for a zoned or naive type would have to bypass this alias.
+//!
+//! # Adding a timestamp to a payload
+//!
+//! `utoipa` recognises `chrono` types **by the name written in the struct** and
+//! cannot see through this alias, so a `#[derive(ToSchema)]` field typed
+//! [`Timestamp`] fails to compile with `the trait bound
+//! chrono::DateTime<Utc>: ToSchema is not satisfied`. Enabling utoipa's `chrono`
+//! feature does *not* lift it: that feature only teaches the derive macro to
+//! recognise the spelled-out `chrono` names, which the alias hides. Spell the
+//! schema out on the field instead — see `health::HealthResponse::checked_at`:
+//!
+//! ```text
+//! #[schema(value_type = String, format = DateTime, example = "2026-08-20T21:04:05Z")]
+//! pub occurred_at: Timestamp,
+//! ```
 
 /// Every instant exchanged by the API.
 pub type Timestamp = chrono::DateTime<chrono::Utc>;
@@ -21,8 +36,14 @@ mod tests {
 
     #[test]
     fn a_timestamp_serialises_as_iso_8601_utc_with_a_z_suffix() {
-        // Guards the choice of type behind the alias: a local or offset-carrying
-        // type would render `+02:00` (or `+00:00`) instead of `Z` and fail here.
+        // Guards the choice of type behind the alias: a type carrying a non-zero
+        // offset renders `+02:00` instead of `Z` and fails here.
+        //
+        // What this does *not* catch, measured: `DateTime<FixedOffset>` built
+        // from UTC still renders `Z`, so swapping the alias for it leaves the
+        // suite green. That substitution is harmless on the wire — the payload
+        // is identical — and the risk worth guarding is a local or zoned time
+        // reaching a client, which is a non-zero offset.
         let rendered = serde_json::to_string(&now()).expect("must serialise");
         let text = rendered.trim_matches('"');
         assert!(text.ends_with('Z'), "{rendered} is not UTC-with-Z");
