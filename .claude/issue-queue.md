@@ -16,7 +16,7 @@ Détail d'une issue en cours : `.claude/issue-log/<N>.md`.
 - [x] #1  infra  — Bootstrap du dépôt : workspace Rust, app Angular, Postgres local | PR #39 mergée (`5a9f96f`) | journal: issue-log/archive/1.md
 - [x] #2  bdd    — Schéma de base initial et outillage de migrations                | PR #42 mergée (`f35a171`) et **PR #41 mergée** le 2026-08-20 (`f525035`, rebase, 7 commits) | journal: issue-log/archive/2.md
 - [x] #3  back   — Squelette de l'API axum : config, erreurs, healthcheck, OpenAPI   | PR #45 mergée le 2026-08-20 (squash `56c6f56`) | 3 gates verts (4-5 n/a), 1 aller-retour | journal: issue-log/archive/3.md
-- [ ] #4  front  — Squelette de l'app Angular : routing, layout, client HTTP         | dép: #1 | statut: à faire
+- [~] #4  front  — Squelette de l'app Angular : routing, layout, client HTTP         | branche: feat/4-angular-app-skeleton | statut: implémentation en cours (agent A)
 - [ ] #5  calcul — Arbitrages actés et cas de référence chiffrés                     | statut: à faire
 - [ ] #6  back   — Profils : modèle et API CRUD                                      | dép: #3 | statut: à faire
 - [ ] #43 bdd    — Fermer le trou de concurrence de l'invariant « un profil a une version » | dép: #2 | bloque #7 | statut: à faire
