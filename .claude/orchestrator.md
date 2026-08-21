@@ -146,6 +146,20 @@ Les gates 4 et 5 ne s'appliquent qu'aux issues touchant `web/`, les gates 1 à 3
 qu'à celles touchant du Rust. Une issue purement backend ne lance pas les gates
 front — mais elle le **dit** dans la PR, elle ne les passe pas sous silence.
 
+⚠ **Tests conditionnés à une base — `ALCOLOCO_REQUIRE_DB=1`.** Posé par #3. Les tests qui ont
+besoin de Postgres (`crates/api/tests/database.rs`) se **sautent silencieusement** sans
+`DATABASE_URL` : `libtest` capture la sortie d'un test qui passe, donc un run avec base et un run
+sans base rendent la **même** ligne `2 passed`. Le gate 3 ne dit donc rien sur eux. La commande qui
+répond « cette suite mord-elle encore ? » est :
+
+```bash
+ALCOLOCO_REQUIRE_DB=1 DATABASE_URL=postgres://…  <recette conteneur>  cargo test --workspace
+```
+
+— la variable transforme chaque saut en **échec**. **À lancer sur toute PR qui touche un test
+adossé à la base**, et à rapporter comme les autres. Elle n'est posée ni par le gate 3 ni par la CI :
+elle ne vaut que si quelqu'un la lance.
+
 **Un gate non exécuté n'est jamais « probablement vert ».** Rapporte la commande
 lancée et sa sortie, ou déclare le gate non applicable avec son motif.
 
@@ -213,6 +227,13 @@ suivantes les réutilisent sans les rediscuter.
   de la liste des composantes. **Départage en cas d'égalité de volume : l'ordre d'ajout** (la
   composante saisie en premier gagne) — sans quoi le critère d'acceptation de #13 n'est pas
   déterministe.
+- **Langue des chaînes d'API** — tranché par l'orchestrateur le 2026-08-20, sur constat du vérificateur
+  de #45 (`title`/`detail` en anglais, `info.description` en français) : les chaînes qui traversent
+  l'API (`title`, `detail`, messages de validation) sont en **anglais**, comme le reste du code. Le
+  **front porte le texte affiché à l'utilisateur** — c'est lui qui traduit et met en forme. Le `type`
+  RFC 7807 reste l'identifiant stable sur lequel le front s'appuie, jamais le `title`. Ne pas
+  rediscuter en #6, #11, #14, #15, #17 ni #18.
+
 - **`volume_total` d'une boisson** : obligatoire si l'unité est `%`, **dérivé** de la somme des
   composantes si l'unité est `cL` — jamais saisi deux fois, jamais stocké en contradiction.
 
@@ -223,11 +244,23 @@ spec exige qu'il soit « isolé du reste du backend (module dédié, testable
 unitairement) », et §10.1 impose que le profil d'absorption soit derrière une
 **abstraction remplaçable** (`AbsorptionProfile` dans le crate `domain`).
 
-Seul modèle existant à ce jour : les deux tests unitaires de
-`crates/domain/src/lib.rs` (module `#[cfg(test)] mod tests`, comparaison de flottants
-par `assert!((x - attendu).abs() < 1e-9)`). Les modèles suivants viendront de #3
-(tests d'intégration API) et #5 / #16 (cas de référence du moteur).
-`TODO` : citer des fichiers réels une fois #3 et #16 mergées.
+Modèles existants, à recopier plutôt qu'à réinventer (#3 mergée le 2026-08-20) :
+
+- **Logique pure** : `crates/domain/src/lib.rs`, module `#[cfg(test)] mod tests`, comparaison de
+  flottants par `assert!((x - attendu).abs() < 1e-9)`.
+- **API en processus** : `crates/api/tests/http.rs` — traverse le vrai routeur et le vrai
+  `IntoResponse`, pas une copie des routes.
+- **Adossé à la base** : `crates/api/tests/database.rs` — **c'est le patron** pour #6, #11, #14,
+  #15, #17 et #18. Il se conditionne à `DATABASE_URL` et se saute **silencieusement** en son
+  absence ; son commutateur `ALCOLOCO_REQUIRE_DB=1` (cf. *Gates*) est ce qui rend le saut
+  falsifiable. Recopier les deux, pas seulement le premier.
+
+Les cas de référence du moteur viendront de #5 / #16.
+
+⚠ **Un doc-comment n'est lié à aucune constante.** Mesuré sur #3 : élever `PROBE_TIMEOUT` rend un
+test rouge, mais changer *seulement* la prose qui la cite laisse les 54 tests verts. Toute valeur
+chiffrée écrite dans une description d'endpoint — donc publiée dans le document OpenAPI — dérive en
+silence.
 
 ⚠ **#1 a déjà posé un morceau du périmètre de #16** : `crates/domain` porte
 `ETHANOL_DENSITY_G_PER_ML` (0,789) et `ingested_alcohol_grams(volume_ml, abv_percent)`,
@@ -392,6 +425,24 @@ Section vivante — une ligne à ajouter après chaque mur rencontré.
    qualification à `SET search_path` sur une fonction SQL : `SET` empêche l'*inlining*
    (mesuré : `Index Scan` → `Function Scan`). Concerne directement #10, #13 et #43.
 
+- **21.** **Un `CARGO_TARGET_DIR` partagé fait mesurer une sonde de mutation sur le mauvais binaire.**
+   Rencontré par le vérificateur de #45 : cache partagé + montage au **même chemin** (`/w`) + `cp -a`
+   qui préserve les mtimes ⇒ `cargo` réutilise le binaire de test de l'arbre **précédent**, et la
+   mutation semble avoir un effet qu'elle n'a pas (ou l'inverse). Isoler `CARGO_TARGET_DIR` **par
+   arbre** pour toute sonde de mutation, et `touch` les fichiers mutés. La commodité du cache partagé
+   s'arrête là où commence la mesure.
+
+- **22.** **`gh pr edit` échoue sur ce dépôt** : `GraphQL: Projects (classic) is being deprecated …
+   (repository.pullRequest.projectCards)` — même famille d'erreur que `gh issue view` sans `--json`.
+   Constaté sur #4 le 2026-08-21. Pour corriger un corps de PR, passer par l'API REST :
+   `gh api -X PATCH repos/maelprog/alcoLoco/pulls/<n> -F body=@<fichier>`.
+
+- **23.** **Une mesure ne vaut que datée du dernier changement de code.** Sur #4, le corps de PR
+   annonçait 260,85 kB de bundle : mesure **réelle**, mais prise 7 minutes avant le dernier commit,
+   et publiée comme celle de la tête de branche. Le vrai chiffre était 266,67 kB — écart dans le sens
+   **optimiste**. Ni le lint, ni les tests, ni la CI ne regardent la taille du bundle : rien ne
+   pouvait l'attraper. **Rebâtir après le dernier changement, ou dater la mesure.**
+
 - **11.** **Un test qui nomme un fichier ne le lit pas forcément.** Deux tests de #2 ont été
    pris en flagrant délit : l'un disait comparer `docker-compose.yml` sans jamais
    l'ouvrir, l'autre disait garantir des UUID v7 en testant la crate `uuid` elle-même.
@@ -414,6 +465,10 @@ Section vivante — une ligne à ajouter après chaque mur rencontré.
   un test d'intégration conditionné à `DATABASE_URL` — donc **une modification de la
   CI**, qui relève de cette section. Mérite sa propre issue ; ne pas la glisser dans
   une PR de fonctionnalité.
+  **Élargi par #3 (2026-08-20)** : les tests adossés à la base existent désormais et se sautent
+  silencieusement en CI. Le commutateur `ALCOLOCO_REQUIRE_DB=1` les rend falsifiables, mais **rien
+  ne le lance automatiquement**. La même issue devrait poser les deux : le service Postgres, et la
+  variable dans le job `rust`.
 - Toute modification d'une migration **déjà mergée** (les migrations sont
   append-only une fois sur `main`).
 - Fermeture d'une issue sans PR, ou merge forcé.
