@@ -432,6 +432,17 @@ Section vivante — une ligne à ajouter après chaque mur rencontré.
    arbre** pour toute sonde de mutation, et `touch` les fichiers mutés. La commodité du cache partagé
    s'arrête là où commence la mesure.
 
+- **22.** **`gh pr edit` échoue sur ce dépôt** : `GraphQL: Projects (classic) is being deprecated …
+   (repository.pullRequest.projectCards)` — même famille d'erreur que `gh issue view` sans `--json`.
+   Constaté sur #4 le 2026-08-21. Pour corriger un corps de PR, passer par l'API REST :
+   `gh api -X PATCH repos/maelprog/alcoLoco/pulls/<n> -F body=@<fichier>`.
+
+- **23.** **Une mesure ne vaut que datée du dernier changement de code.** Sur #4, le corps de PR
+   annonçait 260,85 kB de bundle : mesure **réelle**, mais prise 7 minutes avant le dernier commit,
+   et publiée comme celle de la tête de branche. Le vrai chiffre était 266,67 kB — écart dans le sens
+   **optimiste**. Ni le lint, ni les tests, ni la CI ne regardent la taille du bundle : rien ne
+   pouvait l'attraper. **Rebâtir après le dernier changement, ou dater la mesure.**
+
 - **11.** **Un test qui nomme un fichier ne le lit pas forcément.** Deux tests de #2 ont été
    pris en flagrant délit : l'un disait comparer `docker-compose.yml` sans jamais
    l'ouvrir, l'autre disait garantir des UUID v7 en testant la crate `uuid` elle-même.
