@@ -84,7 +84,10 @@ pub fn watson_total_body_water_litres(
     height_cm: f64,
     age_years: f64,
 ) -> f64 {
-    todo!("#5")
+    match sex {
+        Sex::Male => 2.447 - 0.09516 * age_years + 0.1074 * height_cm + 0.3362 * weight_kg,
+        Sex::Female => -2.097 + 0.1069 * height_cm + 0.2466 * weight_kg,
+    }
 }
 
 /// Total body water, in litres, implied by the historical Widmark ratios
@@ -95,7 +98,11 @@ pub fn watson_total_body_water_litres(
 /// back exactly Widmark's `C₀ = A / (r × M)`.
 #[must_use]
 pub fn widmark_total_body_water_litres(sex: Sex, weight_kg: f64) -> f64 {
-    todo!("#5")
+    let r = match sex {
+        Sex::Male => WIDMARK_R_MALE,
+        Sex::Female => WIDMARK_R_FEMALE,
+    };
+    r * weight_kg * BLOOD_WATER_FRACTION
 }
 
 /// Total body water, in litres, for a set of profile parameters.
@@ -112,7 +119,12 @@ pub fn total_body_water_litres(
     height_cm: Option<f64>,
     age_years: Option<f64>,
 ) -> f64 {
-    todo!("#5")
+    match (height_cm, age_years) {
+        (Some(height_cm), Some(age_years)) => {
+            watson_total_body_water_litres(sex, weight_kg, height_cm, age_years)
+        }
+        _ => widmark_total_body_water_litres(sex, weight_kg),
+    }
 }
 
 /// Blood alcohol concentration, in grams per litre, produced by `alcohol_grams`
@@ -122,7 +134,7 @@ pub fn total_body_water_litres(
 /// what makes the `C₀` of several simultaneous drinks the sum of theirs.
 #[must_use]
 pub fn initial_bac_g_per_l(alcohol_grams: f64, total_body_water_litres: f64) -> f64 {
-    todo!("#5")
+    BLOOD_WATER_FRACTION * alcohol_grams / total_body_water_litres
 }
 
 /// Time, in hours, needed to eliminate `bac_g_per_l` at
@@ -139,7 +151,7 @@ pub fn initial_bac_g_per_l(alcohol_grams: f64, total_body_water_litres: f64) -> 
 /// to the body, never once per drink.
 #[must_use]
 pub fn hours_until_sober(bac_g_per_l: f64, elimination_rate_g_per_l_per_h: f64) -> f64 {
-    todo!("#5")
+    bac_g_per_l / elimination_rate_g_per_l_per_h
 }
 
 /// Rate `R(τ)`, in grams per hour, at which the alcohol of one drink appears in
@@ -178,7 +190,26 @@ pub fn absorption_rate_g_per_h(
     absorption_hours: f64,
     elapsed_hours: f64,
 ) -> f64 {
-    todo!("#5")
+    let (a, b, tau) = (ingestion_hours, absorption_hours, elapsed_hours);
+    if a == 0.0 && b == 0.0 {
+        // Dirac impulse: the whole dose appears at once. See the note above.
+        return if tau == 0.0 { f64::INFINITY } else { 0.0 };
+    }
+    let (shortest, longest) = (a.min(b), a.max(b));
+    if tau < 0.0 || tau >= a + b {
+        // Nothing before the first sip, nothing left after the last fraction.
+        0.0
+    } else if tau < shortest {
+        // Rise. `shortest` is zero when one duration is, so this branch is
+        // never taken in that case and `a × b = 0` is never divided by.
+        alcohol_grams * tau / (a * b)
+    } else if tau < longest {
+        alcohol_grams / longest
+    } else {
+        // Fall. Likewise unreachable when a duration is zero, since `longest`
+        // is then `a + b`.
+        alcohol_grams * (a + b - tau) / (a * b)
+    }
 }
 
 /// Alcohol mass, in grams, absorbed since `t₀` — the exact primitive of
@@ -199,7 +230,29 @@ pub fn absorbed_alcohol_grams(
     absorption_hours: f64,
     elapsed_hours: f64,
 ) -> f64 {
-    todo!("#5")
+    let (a, b, tau) = (ingestion_hours, absorption_hours, elapsed_hours);
+    if tau < 0.0 {
+        return 0.0;
+    }
+    if a == 0.0 && b == 0.0 {
+        // The impulse of the pure Widmark degeneracy is at τ = 0.
+        return alcohol_grams;
+    }
+    let (shortest, longest) = (a.min(b), a.max(b));
+    if tau >= a + b {
+        alcohol_grams
+    } else if tau < shortest {
+        // Area of the rising triangle.
+        alcohol_grams * tau * tau / (2.0 * a * b)
+    } else if tau < longest {
+        // Whole rise — `A × m² / (2ab) = A × m / (2M)`, since `ab = m × M` —
+        // plus the plateau run so far.
+        alcohol_grams * shortest / (2.0 * longest) + alcohol_grams * (tau - shortest) / longest
+    } else {
+        // Everything but the triangle still to come.
+        let left = a + b - tau;
+        alcohol_grams - alcohol_grams * left * left / (2.0 * a * b)
+    }
 }
 
 #[cfg(test)]
@@ -539,8 +592,8 @@ mod tests {
             (REF_INGESTION_HOURS, REF_ABSORPTION_HOURS), // trapezoid
             (0.0, REF_INGESTION_HOURS + REF_ABSORPTION_HOURS), // linear ramp
             (REF_INGESTION_HOURS + REF_ABSORPTION_HOURS, 0.0), // ramp, other way
-            (0.0, 0.0),                                 // pure Widmark
-            (0.25, 0.25),                               // isosceles triangle
+            (0.0, 0.0),                                  // pure Widmark
+            (0.25, 0.25),                                // isosceles triangle
         ] {
             let absorbed = absorbed_alcohol_grams(grams, a, b, a + b);
             assert!(
@@ -636,9 +689,8 @@ mod tests {
     fn the_trapezoidal_rate_follows_its_three_branches() {
         // A = 19.725 g, a = 1/3 h, b = 1/2 h, so a × b = 1/6 and A / M = 39.45 g/h.
         let grams = ref_alcohol_grams();
-        let r = |tau| {
-            absorption_rate_g_per_h(grams, REF_INGESTION_HOURS, REF_ABSORPTION_HOURS, tau)
-        };
+        let r =
+            |tau| absorption_rate_g_per_h(grams, REF_INGESTION_HOURS, REF_ABSORPTION_HOURS, tau);
         // The rise is linear: A × τ / (a × b) = 118.35 × τ.
         assert!((r(0.0) - 0.0).abs() < DERIVED, "at τ = 0: {}", r(0.0));
         assert!(
@@ -810,12 +862,8 @@ mod tests {
             - rate_at_peak * REF_INGESTION_HOURS * REF_ABSORPTION_HOURS / grams;
 
         // The instant is the one where the rate of appearance meets β.
-        let rate = absorption_rate_g_per_h(
-            grams,
-            REF_INGESTION_HOURS,
-            REF_ABSORPTION_HOURS,
-            peak_hours,
-        );
+        let rate =
+            absorption_rate_g_per_h(grams, REF_INGESTION_HOURS, REF_ABSORPTION_HOURS, peak_hours);
         assert!(
             (kappa * rate - ELIMINATION_RATE_G_PER_L_PER_H).abs() < 1e-12,
             "κ × R = {} g/L/h at the claimed peak",
@@ -844,8 +892,16 @@ mod tests {
         );
         // And it really is a maximum.
         for offset in [1e-3, 1e-2, 0.1] {
-            let before = ref_bac_at(REF_INGESTION_HOURS, REF_ABSORPTION_HOURS, peak_hours - offset);
-            let after = ref_bac_at(REF_INGESTION_HOURS, REF_ABSORPTION_HOURS, peak_hours + offset);
+            let before = ref_bac_at(
+                REF_INGESTION_HOURS,
+                REF_ABSORPTION_HOURS,
+                peak_hours - offset,
+            );
+            let after = ref_bac_at(
+                REF_INGESTION_HOURS,
+                REF_ABSORPTION_HOURS,
+                peak_hours + offset,
+            );
             assert!(before < peak, "higher {offset} h before the peak: {before}");
             assert!(after < peak, "higher {offset} h after the peak: {after}");
         }
@@ -864,7 +920,11 @@ mod tests {
         );
         // And at the two corners of the trapezoid, τ = m = 20 min and
         // τ = M = 30 min.
-        let at_m = ref_bac_at(REF_INGESTION_HOURS, REF_ABSORPTION_HOURS, REF_INGESTION_HOURS);
+        let at_m = ref_bac_at(
+            REF_INGESTION_HOURS,
+            REF_ABSORPTION_HOURS,
+            REF_INGESTION_HOURS,
+        );
         assert!(
             (at_m - 0.065_657_504_768_639_2).abs() < DERIVED,
             "end of the rise: {at_m} g/L"
