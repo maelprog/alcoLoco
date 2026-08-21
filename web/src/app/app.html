@@ -1,3 +1,25 @@
-<h1>{{ title() }}</h1>
+<header class="shell__header">
+  <h1>{{ title() }}</h1>
 
-<router-outlet />
+  <nav class="shell__nav" aria-label="Navigation principale">
+    @for (link of navLinks; track link.path) {
+      <a [routerLink]="link.path" routerLinkActive="is-active">{{ link.label }}</a>
+    }
+  </nav>
+
+  <p class="shell__profile">
+    @if (profile(); as current) {
+      Profil courant&nbsp;: {{ current.display_name }}
+    } @else {
+      Aucun profil sélectionné
+    }
+  </p>
+</header>
+
+<main class="shell__page">
+  <router-outlet />
+</main>
+
+@if (devMode) {
+  <app-health-indicator />
+}
