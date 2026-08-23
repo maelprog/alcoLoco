@@ -1,17 +1,44 @@
 //! Bounds a written profile has to satisfy, and the reading of a request.
 //!
-//! Four of the five bounds below are **the ones the schema already enforces**,
-//! restated here so that a bad value comes back as a 400 naming the field rather
-//! than as a 500 carrying a constraint name. Restating them is only safe while
-//! the two agree, so [`tests`] rebuilds each `CHECK` clause from the constant and
-//! looks for it in the migration SQL: moving either side alone fails.
+//! Four of the five bounds below are **the ones the schema enforces**, restated
+//! here so that a bad value comes back as a 400 naming the field rather than as
+//! a 500 carrying a constraint name. Restating them is only safe while the two
+//! agree, so the schema is asked directly: the database-backed test
+//! `the_schema_enforces_exactly_the_bounds_the_api_restates` writes the value
+//! *at* each bound and the value immediately inside it, and requires the first
+//! to be refused and the second to be accepted. That pins the two together in
+//! both directions on the live catalogue. A second, cheaper test reads the
+//! migration SQL, but it can only say a clause is *written* somewhere — with
+//! several migrations it cannot say which one is in force.
 //!
-//! The fifth, [`MAX_AGE_YEARS`], has no counterpart in the schema. It is not a
-//! plausibility nicety: the male Watson equation of SPEC.md §6.2 subtracts a term
-//! proportional to the age, so a birth date far enough in the past drives the
-//! estimated total body water to zero and then negative, and the division by it
-//! turns every curve of that profile into nonsense. Rejecting the birth date is
-//! how that never reaches the engine.
+//! The fifth, [`MAX_AGE_YEARS`], has no counterpart in the schema and is a plain
+//! plausibility bound. It used to be justified here by the male Watson equation
+//! of SPEC.md §6.2, and that justification was **wrong**; the paragraph below
+//! says what was measured instead, because #16 will read these lines.
+//!
+//! # What the bounds do and do not buy for the Watson equation
+//!
+//! The male equation of SPEC.md §6.2 subtracts `0.09516 × age`, so for a small
+//! enough body it reaches a non-positive total body water at a finite age.
+//! `initial_bac_g_per_l` then divides by that value and hands back a negative
+//! concentration; `crates/domain` puts no guard on the sign. Closing it there is
+//! issue #16, not this one.
+//!
+//! What this module can do is refuse bodies that are not bodies. Measured
+//! against `crates/domain` itself, the age at which the equation crosses zero,
+//! at the worst corner each set of bounds accepts:
+//!
+//! ```text
+//! floor accepted            worst-corner crossing
+//! weight > 0,  height > 0        25.72 years      (before this bound existed)
+//! weight > 2,  height > 40       77.93 years      (what the schema enforces now)
+//! ```
+//!
+//! 77.93 years is **below** [`MAX_AGE_YEARS`], by 52.07 years. So the floors
+//! narrow the reachable window — a 0.5 kg, 1 cm profile is now refused — but
+//! they do **not** put the degeneracy out of reach, and nothing here does.
+//! [`MAX_AGE_YEARS`] is therefore justified by human lifespan alone, and by
+//! nothing borrowed from Watson.
 //!
 //! Every message is built with `format!` from the constant it quotes. A message
 //! spelling a number out would drift the moment the bound moved, and no test
@@ -25,13 +52,19 @@ use crate::timestamp::Timestamp;
 use super::model::{ProfileRequest, ProfileSettings, QuantityUnit, SettingsRequest, Sex};
 
 /// Exclusive lower bound on `weight_kg`, as the migration's `CHECK` spells it.
-pub const WEIGHT_KG_MIN_EXCLUSIVE: f64 = 0.0;
+///
+/// Under the lightest verified human. It is not a bound that makes the Watson
+/// equation of SPEC.md §6.2 well behaved — see the module documentation for the
+/// measured crossing it leaves reachable.
+pub const WEIGHT_KG_MIN_EXCLUSIVE: f64 = 2.0;
 
 /// Exclusive upper bound on `weight_kg`, as the migration's `CHECK` spells it.
 pub const WEIGHT_KG_MAX_EXCLUSIVE: f64 = 1000.0;
 
 /// Exclusive lower bound on `height_cm`, as the migration's `CHECK` spells it.
-pub const HEIGHT_CM_MIN_EXCLUSIVE: f64 = 0.0;
+///
+/// Under the shortest verified human. Same caveat as [`WEIGHT_KG_MIN_EXCLUSIVE`].
+pub const HEIGHT_CM_MIN_EXCLUSIVE: f64 = 40.0;
 
 /// Exclusive upper bound on `height_cm`, as the migration's `CHECK` spells it.
 pub const HEIGHT_CM_MAX_EXCLUSIVE: f64 = 300.0;
@@ -50,9 +83,14 @@ pub const ABSORPTION_DURATION_MIN_EXCLUSIVE_SECONDS: i32 = 0;
 
 /// Largest age a birth date may imply, in whole years.
 ///
-/// Chosen by this issue, not read from the specification: it sits above every
-/// verified human lifespan while staying far below the age at which the male
-/// Watson equation of SPEC.md §6.2 yields a non-positive total body water.
+/// A plausibility bound and nothing more: it sits above every verified human
+/// lifespan — the oldest, Jeanne Calment, reached 122 — so it refuses only dates
+/// no person could carry.
+///
+/// It is **not** what keeps the Watson equation of SPEC.md §6.2 out of trouble,
+/// and an earlier version of this comment claimed it was. The module
+/// documentation carries the measurement: with the floors this module enforces,
+/// the equation still crosses zero at 77.93 years, well inside this bound.
 pub const MAX_AGE_YEARS: u32 = 130;
 
 /// A write that satisfied every bound.
@@ -294,11 +332,20 @@ mod tests {
     }
 
     #[test]
-    fn every_restated_bound_is_the_one_the_schema_enforces() {
-        // The four clauses are rebuilt from the constants, so this fails if the
-        // API loosens a bound (the database would then answer 500 instead of
-        // 400) and it also fails if the schema moves one alone. The migration is
-        // read from `db::MIGRATOR`, which embeds the SQL at compile time.
+    fn every_restated_bound_is_written_as_a_check_in_the_migrations() {
+        // The four clauses are rebuilt from the constants, so moving a constant
+        // without writing the matching migration fails here. It runs without a
+        // database, which is the whole of its value.
+        //
+        // What it cannot say, stated so nobody reads more into it: **which**
+        // clause is in force. Migrations accumulate, and the initial one still
+        // carries `weight_kg > 0 AND weight_kg < 1000` even though the migration
+        // of #6 has since added a stricter constraint beside it — so lowering
+        // `WEIGHT_KG_MIN_EXCLUSIVE` back to 0 would find that older text and
+        // pass, while the database went on refusing 1 kg. The test that settles
+        // it asks the live catalogue instead:
+        // `the_schema_enforces_exactly_the_bounds_the_api_restates`, in
+        // `crates/api/tests/database.rs`.
         for clause in [
             format!(
                 "weight_kg > {WEIGHT_KG_MIN_EXCLUSIVE} AND weight_kg < {WEIGHT_KG_MAX_EXCLUSIVE}"
@@ -508,9 +555,12 @@ mod tests {
 
     #[test]
     fn an_age_beyond_the_bound_is_rejected() {
-        // Not a plausibility check: past this point the male Watson equation of
-        // SPEC.md §6.2 heads for a non-positive total body water, and the
-        // division by it would poison every curve of the profile.
+        // A plausibility check, and only that: it refuses a birth date no living
+        // person could carry. It is *not* what keeps the male Watson equation of
+        // SPEC.md §6.2 away from a non-positive total body water — measured, the
+        // equation still crosses zero at 77.93 years at the worst corner the
+        // bounds of this module accept, which is 52.07 years inside this one.
+        // See the module documentation.
         //
         // Both dates are derived from the constant, so moving it moves the test
         // with it instead of leaving two hand-written years behind.

@@ -30,6 +30,10 @@
 use std::collections::BTreeSet;
 
 use api::config::{DATABASE_URL_ENV, ENVIRONMENT_ENV};
+use api::profile::validation::{
+    ABSORPTION_DURATION_MIN_EXCLUSIVE_SECONDS, HEIGHT_CM_MAX_EXCLUSIVE, HEIGHT_CM_MIN_EXCLUSIVE,
+    INGESTION_DURATION_MIN_SECONDS, WEIGHT_KG_MAX_EXCLUSIVE, WEIGHT_KG_MIN_EXCLUSIVE,
+};
 use api::{AppState, Config};
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -723,4 +727,235 @@ async fn the_settings_served_are_the_version_in_force_and_not_the_oldest() {
         "the version in force now is the latest one, not the oldest: {}",
         answer.body
     );
+}
+
+/// Writes one settings version straight to the database, bypassing the API, and
+/// says whether the schema accepted it.
+///
+/// Used to ask the live catalogue where a bound actually sits, rather than
+/// looking for a clause in the migration text — which cannot say which of
+/// several accumulated clauses is the one in force.
+async fn schema_accepts_version(
+    pool: &sqlx::PgPool,
+    profile: Uuid,
+    weight_kg: f64,
+    height_cm: f64,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO public.profile_settings_version (
+             id, profile_id, valid_from, weight_kg, height_cm, sex, birth_date
+         ) VALUES ($1, $2, now() - ($3 || ' seconds')::interval, $4, $5, 'female'::public.sex,
+                   '1994-05-12'::date)",
+    )
+    .bind(api::new_id())
+    .bind(profile)
+    // A distinct `valid_from` per attempt, so the unique constraint on the pair
+    // never stands in for the bound under test.
+    .bind(fastrand_seconds())
+    .bind(weight_kg)
+    .bind(height_cm)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// A different whole number of seconds on each call, from the process clock.
+fn fastrand_seconds() -> String {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static NEXT: AtomicI64 = AtomicI64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed).to_string()
+}
+
+/// Writes one profile row straight to the database and says whether the schema
+/// accepted it.
+async fn schema_accepts_profile(
+    pool: &sqlx::PgPool,
+    display_name: &str,
+    ingestion_seconds: i32,
+    absorption_seconds: i32,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO public.profile (
+             id, display_name, default_quantity_unit,
+             default_ingestion_duration_seconds, default_absorption_duration_seconds
+         ) VALUES ($1, $2, 'cl'::public.quantity_unit, $3, $4)",
+    )
+    .bind(api::new_id())
+    .bind(display_name)
+    .bind(ingestion_seconds)
+    .bind(absorption_seconds)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+#[tokio::test]
+async fn the_schema_enforces_exactly_the_bounds_the_api_restates() {
+    // The API restates the schema's bounds so that a bad value comes back as a
+    // 400 naming the field instead of a 500 carrying a constraint name. That is
+    // only true while the two agree, and this is where they are pinned together.
+    //
+    // Each bound is probed twice, on the live catalogue and not on the migration
+    // text: the value *at* the bound must be refused, and the value immediately
+    // inside it accepted. Refused-at pins the schema from being looser than the
+    // constant; accepted-just-inside pins it from being stricter — which is the
+    // direction that produces a 500, because the API would have let the value
+    // through. Together they say the two numbers are the same number.
+    //
+    // `next_up` / `next_down` are used rather than an arbitrary epsilon: the
+    // probe then sits at the closest `f64` there is to the bound, so no gap
+    // between the two sides can hide in the interval.
+    let name = "the_schema_enforces_exactly_the_bounds_the_api_restates";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let pool = &state.pool;
+
+    let (owner, _) = create_profile(&state, &a_sound_payload("Bornes")).await;
+
+    let inside_weight = |w: f64| (w, HEIGHT_CM_MIN_EXCLUSIVE.next_up());
+    let inside_height = |h: f64| (WEIGHT_KG_MIN_EXCLUSIVE.next_up(), h);
+
+    for (label, (weight, height), accepted) in [
+        (
+            "weight at its lower bound",
+            inside_weight(WEIGHT_KG_MIN_EXCLUSIVE),
+            false,
+        ),
+        (
+            "weight just inside its lower bound",
+            inside_weight(WEIGHT_KG_MIN_EXCLUSIVE.next_up()),
+            true,
+        ),
+        (
+            "weight at its upper bound",
+            inside_weight(WEIGHT_KG_MAX_EXCLUSIVE),
+            false,
+        ),
+        (
+            "weight just inside its upper bound",
+            inside_weight(WEIGHT_KG_MAX_EXCLUSIVE.next_down()),
+            true,
+        ),
+        (
+            "height at its lower bound",
+            inside_height(HEIGHT_CM_MIN_EXCLUSIVE),
+            false,
+        ),
+        (
+            "height just inside its lower bound",
+            inside_height(HEIGHT_CM_MIN_EXCLUSIVE.next_up()),
+            true,
+        ),
+        (
+            "height at its upper bound",
+            inside_height(HEIGHT_CM_MAX_EXCLUSIVE),
+            false,
+        ),
+        (
+            "height just inside its upper bound",
+            inside_height(HEIGHT_CM_MAX_EXCLUSIVE.next_down()),
+            true,
+        ),
+    ] {
+        let outcome = schema_accepts_version(pool, owner, weight, height).await;
+        assert_eq!(
+            outcome.is_ok(),
+            accepted,
+            "{label} ({weight} kg, {height} cm): the schema and the API disagree on where \
+             the bound sits — {outcome:?}"
+        );
+    }
+
+    // The two duration bounds, on the profile itself.
+    for (label, ingestion, absorption, accepted) in [
+        (
+            "ingestion at its lower bound",
+            INGESTION_DURATION_MIN_SECONDS,
+            1800,
+            true,
+        ),
+        (
+            "ingestion below its lower bound",
+            INGESTION_DURATION_MIN_SECONDS - 1,
+            1800,
+            false,
+        ),
+        (
+            "absorption at its exclusive lower bound",
+            1200,
+            ABSORPTION_DURATION_MIN_EXCLUSIVE_SECONDS,
+            false,
+        ),
+        (
+            "absorption just above it",
+            1200,
+            ABSORPTION_DURATION_MIN_EXCLUSIVE_SECONDS + 1,
+            true,
+        ),
+    ] {
+        let outcome = schema_accepts_profile(pool, "Bornes durées", ingestion, absorption).await;
+        // A profile written without a version breaks the deferred trigger of the
+        // schema, which fires at COMMIT — but sqlx runs each of these outside a
+        // transaction of its own, so the statement commits alone and the trigger
+        // rejects it. Only the CHECK violations are of interest here, so the
+        // trigger's own message is read as an acceptance of the durations.
+        let refused_by_the_check = outcome
+            .as_ref()
+            .err()
+            .is_some_and(|message| message.contains("duration_seconds"));
+        assert_eq!(
+            !refused_by_the_check, accepted,
+            "{label} ({ingestion} s, {absorption} s): the schema and the API disagree — \
+             {outcome:?}"
+        );
+    }
+
+    // And the one clause the API restates without a constant of its own: a blank
+    // display name. `validation.rs` trims and refuses it; the schema has to as
+    // well, or the API's answer would be a 500.
+    let blank = schema_accepts_profile(pool, "   ", 1200, 1800).await;
+    assert!(
+        blank
+            .as_ref()
+            .err()
+            .is_some_and(|message| message.contains("display_name")),
+        "the schema accepts a blank display name: {blank:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_body_too_small_to_be_a_person_is_refused() {
+    // The exact request that used to be accepted with a 201: 0.5 kg and 1 cm.
+    // Fed to the male Watson equation of SPEC.md §6.2 it yields a negative total
+    // body water, and `initial_bac_g_per_l` then divides by it — measured at
+    // -41.97 g/L for a single 25 cL beer at 5 %.
+    //
+    // The bounds of the migration of #6 refuse it. They do **not** make the
+    // degeneracy unreachable: at the worst corner they still accept, the
+    // equation crosses zero at 77.93 years, inside the 130 the API allows as an
+    // age. Closing that takes a guard on the sign inside `crates/domain`, which
+    // is issue #16 — see the module documentation of `profile::validation`.
+    let name = "a_body_too_small_to_be_a_person_is_refused";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+
+    let mut payload = a_sound_payload("Trop petit");
+    payload["settings"]["weight_kg"] = Value::from(0.5);
+    payload["settings"]["height_cm"] = Value::from(1.0);
+    payload["settings"]["sex"] = Value::from("male");
+
+    let answer = send(state, "POST", "/profiles", Some(payload)).await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.media_type, "application/problem+json");
+    let offending: Vec<&str> = answer.body["errors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no errors[] in {}", answer.body))
+        .iter()
+        .filter_map(|error| error["field"].as_str())
+        .collect();
+    assert_eq!(offending, vec!["settings.weight_kg", "settings.height_cm"]);
 }
