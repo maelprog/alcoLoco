@@ -85,17 +85,18 @@ describe('userMessage', () => {
     expect(message).toBe('Le serveur a rencontré une erreur. Réessayez dans un instant.');
   });
 
-  it('gives every problem kind the API mints its own French sentence', () => {
-    const kinds = [
-      ProblemType.badRequest,
-      ProblemType.notFound,
-      ProblemType.methodNotAllowed,
-      ProblemType.conflict,
-      ProblemType.validationFailed,
-      ProblemType.internalError,
-    ];
+  it('gives every kind declared in ProblemType its own French sentence', () => {
+    // Read from `ProblemType` rather than listed by hand, so a seventh
+    // identifier added there has to bring a sentence with it. What this cannot
+    // see — and its previous name wrongly promised it could — is whether
+    // `ProblemType` still matches what the API mints: those are two files, and
+    // only something reading both can compare them. That is
+    // `crates/api/tests/front_contract.rs`, which fails the Rust gate when they
+    // drift; the two tests are halves of one guarantee.
+    const kinds = Object.values(ProblemType).filter((type) => type !== ProblemType.unknown);
     const messages = kinds.map((type) => userMessage(new ApiError(problem({ type }))));
 
+    expect(kinds.length).toBeGreaterThan(1);
     expect(new Set(messages).size).toBe(kinds.length);
     expect(messages).not.toContain('Une erreur inattendue est survenue.');
   });
