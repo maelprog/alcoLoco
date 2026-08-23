@@ -10,6 +10,14 @@
 //! deliberately does not take up that pattern: it is the first code of the
 //! project to write values a client sent.
 //!
+//! That rule is enforced on **this file**, not on a list of statements someone
+//! remembered to keep up to date: the tests read the source at compile time,
+//! recover every string constant it declares, and require every call to an sqlx
+//! statement constructor to be handed the *name* of one. A statement assembled
+//! at run time is therefore refused by its shape, whoever adds it. The two
+//! sibling files of the module declare no statement at all, and a test holds
+//! them to it — which is what makes a file-scoped guard cover the feature.
+//!
 //! **Relations and types are schema qualified.** `pg_temp` is searched before
 //! `public`, so an unqualified `profile` can be shadowed by a temporary table
 //! (class (e) of the migration of #2). Qualifying costs nothing and closes it.
@@ -340,16 +348,138 @@ pub async fn update(pool: &PgPool, id: Uuid, profile: &ValidProfile) -> Result<U
 mod tests {
     use super::*;
 
-    /// Every statement this module runs.
-    const STATEMENTS: [&str; 7] = [
-        SELECT_PAGE,
-        SELECT_ONE,
-        INSERT_PROFILE,
-        INSERT_VERSION,
-        UPDATE_PROFILE,
-        LOCK_PROFILE,
-        SELECT_SETTINGS_AT,
-    ];
+    /// This file, read at compile time.
+    ///
+    /// Every guard below works from it rather than from a list of statements
+    /// transcribed by hand. A transcribed list only ever guards what someone
+    /// remembered to add to it: the first review of this module shipped one, and
+    /// a function appended below it — building its SQL by interpolation and
+    /// naming an unqualified relation — passed all three guards without a word.
+    /// The same reasoning already applies to `tests/front_contract.rs`, which
+    /// reads the `slug` match arms instead of listing them.
+    const SOURCE: &str = include_str!("store.rs");
+
+    /// The value of every `const … : &str = "…";` this file declares.
+    ///
+    /// The statements are exactly those constants, and
+    /// [`every_statement_of_this_module_is_a_named_constant`] is what keeps that
+    /// true. Non-SQL constants are swept in as well; they satisfy the guards
+    /// vacuously, and an allowlist would be one more thing to forget.
+    fn declared_string_constants() -> Vec<String> {
+        // Assembled rather than written out: spelled as a literal, the marker
+        // would occur in this very file and the reader would find itself.
+        let marker = format!(": &str = {}", '"');
+        SOURCE
+            .split(marker.as_str())
+            .skip(1)
+            .map(|after| {
+                after
+                    .split_once('"')
+                    .unwrap_or_else(|| panic!("unterminated string constant in {}", file!()))
+                    .0
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The text each call to an sqlx statement constructor passes first.
+    ///
+    /// `prefix` is the path up to the constructor family, e.g. the sqlx query
+    /// builders or the raw-SQL entry point. Occurrences that are not calls — the
+    /// word appearing in a comment, say — are skipped, and the guard that reads
+    /// this insists on finding some.
+    fn first_arguments_of(prefix: &str) -> Vec<String> {
+        let mut arguments = Vec::new();
+        let mut from = 0;
+        while let Some(at) = SOURCE[from..].find(prefix) {
+            let after_prefix = from + at + prefix.len();
+            from = after_prefix;
+            // The rest of the function name: `_scalar`, `_as`, or nothing.
+            let rest = SOURCE[after_prefix..]
+                .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+            // An optional turbofish, whose own parentheses must not be mistaken
+            // for the call's: `query_as::<_, (i64,)>(…)`.
+            let rest = match rest.strip_prefix("::<") {
+                None => rest,
+                Some(generics) => match generics.find(">(") {
+                    None => continue,
+                    Some(end) => &generics[end + 1..],
+                },
+            };
+            let Some(inside) = rest.strip_prefix('(') else {
+                continue;
+            };
+            let mut depth = 0_i32;
+            let mut argument = String::new();
+            for character in inside.chars() {
+                match character {
+                    '(' | '[' => depth += 1,
+                    ')' | ']' if depth == 0 => break,
+                    ')' | ']' => depth -= 1,
+                    ',' if depth == 0 => break,
+                    _ => {}
+                }
+                argument.push(character);
+            }
+            arguments.push(argument.trim().to_owned());
+        }
+        arguments
+    }
+
+    /// The two sqlx entry points that take SQL, spelled in pieces so that naming
+    /// them here does not look like a call to [`first_arguments_of`].
+    fn sql_constructor_prefixes() -> [String; 2] {
+        let sqlx = "sqlx";
+        [format!("{sqlx}::query"), format!("{sqlx}::raw_sql")]
+    }
+
+    #[test]
+    fn every_statement_of_this_module_is_a_named_constant() {
+        // The guard the other two rest on, and the one that closes the hole a
+        // transcribed list left open: whatever a statement says, it cannot be
+        // assembled from a value at run time, because the constructor is only
+        // ever handed the name of a constant. `format!("… {id} …")`, a `String`
+        // built above the call, a borrowed local — none of them is an upper-case
+        // identifier, so none of them gets past here.
+        let mut seen = 0;
+        for prefix in sql_constructor_prefixes() {
+            for argument in first_arguments_of(&prefix) {
+                seen += 1;
+                assert!(
+                    !argument.is_empty()
+                        && argument
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                        && argument.starts_with(|c: char| c.is_ascii_uppercase()),
+                    "a statement is built rather than named: `{argument}`"
+                );
+            }
+        }
+        assert!(
+            seen >= 5,
+            "only {seen} statement constructor call(s) found; the reader has lost \
+             the shape of this file and is guarding nothing"
+        );
+    }
+
+    #[test]
+    fn no_sql_of_the_profile_module_lives_outside_this_file() {
+        // What makes the file-scoped guards above cover the whole feature: the
+        // handlers, the payload types and the validation touch no database at
+        // all, so every statement a profile write runs is one of the constants
+        // read here.
+        for (name, source) in [
+            ("mod.rs", include_str!("mod.rs")),
+            ("model.rs", include_str!("model.rs")),
+            ("validation.rs", include_str!("validation.rs")),
+        ] {
+            let sqlx = "sqlx";
+            assert!(
+                !source.contains(&format!("{sqlx}::")),
+                "`{name}` reaches for the database; the guards of store.rs do not read it"
+            );
+        }
+    }
 
     /// The names `keyword` introduces, `keyword` being given with its trailing
     /// space and matched on an upper-cased copy of the statement.
@@ -381,9 +511,9 @@ mod tests {
         // `profile_settings_at()` into a source of fabricated parameters. Only
         // names in relation position are looked at: a column called `sex` is not
         // one, and neither is the `profile` inside `profile_id`.
-        for statement in STATEMENTS {
+        for statement in declared_string_constants() {
             for keyword in ["FROM ", "JOIN ", "LATERAL ", "INTO ", "UPDATE "] {
-                for name in names_after(statement, keyword) {
+                for name in names_after(&statement, keyword) {
                     assert!(
                         name.starts_with("public."),
                         "`{name}` follows `{}` unqualified in: {statement}",
@@ -400,8 +530,8 @@ mod tests {
         // shadowable by a temporary type. Built-in types are not: `pg_catalog`
         // comes first whatever `search_path` says.
         const BUILT_IN: [&str; 2] = ["uuid", "text"];
-        for statement in STATEMENTS {
-            for name in names_after(statement, "::") {
+        for statement in declared_string_constants() {
+            for name in names_after(&statement, "::") {
                 assert!(
                     name.starts_with("public.") || BUILT_IN.contains(&name.as_str()),
                     "the cast to `{name}` is unqualified in: {statement}"
@@ -411,15 +541,35 @@ mod tests {
     }
 
     #[test]
-    fn no_statement_of_this_module_is_built_from_a_value() {
-        // The pattern the journal of #6 asks this issue not to take up from the
-        // seed of #2. Every statement is a literal and every value is bound, so
-        // each one has to carry at least one placeholder or none at all — never
-        // an interpolation marker left behind by a `format!`.
-        for statement in STATEMENTS {
+    fn no_statement_of_this_module_carries_an_interpolation_marker() {
+        // Belt to the brace of `every_statement_of_this_module_is_a_named
+        // _constant`: a constant that had been through a `format!` before
+        // reaching the constructor would still show its braces here.
+        for statement in declared_string_constants() {
             assert!(
                 !statement.contains('{') && !statement.contains('}'),
                 "a formatting placeholder survived into: {statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reader_finds_the_constants_this_file_declares() {
+        // Guards the readers themselves. Every guard above iterates over
+        // `declared_string_constants()`, so a parser that stopped recognising
+        // the shape of a constant would return an empty list and leave three
+        // tests passing over nothing.
+        let declared = declared_string_constants();
+        assert!(
+            declared.len() >= 7,
+            "only {} constant(s) found in {}: the reader is guarding nothing",
+            declared.len(),
+            file!()
+        );
+        for expected in [SELECT_PAGE, SELECT_ONE, INSERT_PROFILE, UPDATE_PROFILE] {
+            assert!(
+                declared.iter().any(|found| found == expected),
+                "a known statement was not recovered by the reader: {expected}"
             );
         }
     }
