@@ -927,35 +927,73 @@ async fn the_schema_enforces_exactly_the_bounds_the_api_restates() {
 }
 
 #[tokio::test]
-async fn a_body_too_small_to_be_a_person_is_refused() {
-    // The exact request that used to be accepted with a 201: 0.5 kg and 1 cm.
-    // Fed to the male Watson equation of SPEC.md §6.2 it yields a negative total
-    // body water, and `initial_bac_g_per_l` then divides by it — measured at
-    // -41.97 g/L for a single 25 cL beer at 5 %.
+async fn an_unusually_small_body_is_accepted_and_the_engine_is_left_unguarded() {
+    // This test records a **deliberate hole**, so that #16 finds it stated
+    // rather than has to rediscover it. Read the module documentation of
+    // `profile::validation` with it.
     //
-    // The bounds of the migration of #6 refuse it. They do **not** make the
-    // degeneracy unreachable: at the worst corner they still accept, the
-    // equation crosses zero at 77.93 years, inside the 130 the API allows as an
-    // age. Closing that takes a guard on the sign inside `crates/domain`, which
-    // is issue #16 — see the module documentation of `profile::validation`.
-    let name = "a_body_too_small_to_be_a_person_is_refused";
+    // Weight and height are bounded away from zero and nothing more, which is a
+    // product decision taken by the user on 2026-08-23: accept as many real
+    // bodies as possible — someone with dwarfism among them — rather than impose
+    // an anthropometric floor. A floor tuned until the Watson equation stopped
+    // misbehaving would describe an equation, not a person.
+    //
+    // The cost is measured and is not zero. The male equation of SPEC.md §6.2
+    // reaches a non-positive total body water at 25.715 years for a body at the
+    // worst corner this accepts, and `initial_bac_g_per_l` then divides by it:
+    // a body of 0.5 kg and 1 cm at 30.6 years gives a total body water of
+    // -0.1894 L and, for a single 25 cL beer at 5 %, -41.97 g/L. Those numbers
+    // come from `crates/domain` itself.
+    //
+    // So the request below is accepted, on purpose, and nothing in this crate
+    // will stop the curve that follows. The guard that does is `TBW > 0` inside
+    // `crates/domain` — issue #16. **When #16 lands, this test is the one to
+    // revisit**: what changes is what the engine does with the profile, not
+    // whether the profile may exist.
+    let name = "an_unusually_small_body_is_accepted_and_the_engine_is_left_unguarded";
     let Some(state) = migrated(name).await else {
         return;
     };
 
-    let mut payload = a_sound_payload("Trop petit");
+    let mut payload = a_sound_payload("Très petit gabarit");
     payload["settings"]["weight_kg"] = Value::from(0.5);
     payload["settings"]["height_cm"] = Value::from(1.0);
     payload["settings"]["sex"] = Value::from("male");
 
     let answer = send(state, "POST", "/profiles", Some(payload)).await;
-    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
-    assert_eq!(answer.media_type, "application/problem+json");
-    let offending: Vec<&str> = answer.body["errors"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no errors[] in {}", answer.body))
-        .iter()
-        .filter_map(|error| error["field"].as_str())
-        .collect();
-    assert_eq!(offending, vec!["settings.weight_kg", "settings.height_cm"]);
+    assert_eq!(
+        answer.status,
+        StatusCode::CREATED,
+        "no anthropometric floor may turn a real body away: {}",
+        answer.body
+    );
+    assert_eq!(answer.body["settings"]["weight_kg"], 0.5);
+    assert_eq!(answer.body["settings"]["height_cm"], 1.0);
+}
+
+#[tokio::test]
+async fn a_non_positive_weight_or_height_is_still_refused() {
+    // The one thing the floors do say. Zero and below are not small bodies, they
+    // are not bodies: the Watson equation of SPEC.md §6.2 is linear in both, and
+    // a negative weight would flip the sign of the estimate outright.
+    let name = "a_non_positive_weight_or_height_is_still_refused";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+
+    for (weight, height) in [(0.0, 168.0), (-1.0, 168.0), (62.0, 0.0), (62.0, -1.0)] {
+        let mut payload = a_sound_payload("Non positif");
+        payload["settings"]["weight_kg"] = Value::from(weight);
+        payload["settings"]["height_cm"] = Value::from(height);
+
+        let answer = send(state.clone(), "POST", "/profiles", Some(payload)).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_REQUEST,
+            "({weight} kg, {height} cm) reached the database: {}",
+            answer.body
+        );
+        assert_eq!(answer.media_type, "application/problem+json");
+        assert_eq!(answer.body["type"], "/problems/validation_failed");
+    }
 }
