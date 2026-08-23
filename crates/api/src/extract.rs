@@ -31,6 +31,28 @@ where
     }
 }
 
+/// Path-parameter extractor rejecting with a problem document.
+///
+/// `GET /profiles/not-a-uuid` is a malformed request, not a missing resource:
+/// answering 404 would tell a client the identifier could have existed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Path<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for Path<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        axum::extract::Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Path(value)| Self(value))
+            .map_err(|rejection| ApiError::bad_request(rejection.body_text()))
+    }
+}
+
 /// JSON body extractor rejecting with a problem document.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Json<T>(pub T);
@@ -72,6 +94,7 @@ mod tests {
         Router::new()
             .route("/q", get(|Query(_): Query<Wanted>| async { "ok" }))
             .route("/j", post(|Json(_): Json<Wanted>| async { "ok" }))
+            .route("/p/{id}", get(|Path(_): Path<uuid::Uuid>| async { "ok" }))
     }
 
     async fn media_type_of(request: Request<Body>) -> (StatusCode, String) {
@@ -107,6 +130,19 @@ mod tests {
             .uri("/j")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"weight_kg":"heavy"}"#))
+            .expect("must build");
+        let (status, media_type) = media_type_of(request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(media_type, PROBLEM_JSON);
+    }
+
+    #[tokio::test]
+    async fn a_path_parameter_that_does_not_fit_is_rejected_as_a_problem() {
+        // 400 and not 404: the identifier is unusable, which is a different
+        // thing from naming a resource that does not exist.
+        let request = Request::builder()
+            .uri("/p/not-a-uuid")
+            .body(Body::empty())
             .expect("must build");
         let (status, media_type) = media_type_of(request).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
