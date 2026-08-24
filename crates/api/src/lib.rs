@@ -21,7 +21,6 @@ use axum::Router;
 use axum::http::{Method, Uri};
 use axum::routing::get;
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
 
 pub mod config;
 pub mod error;
@@ -67,7 +66,7 @@ impl AppState {
     ///
     /// Fails only when the connection string cannot be parsed.
     pub fn new(config: Config) -> Result<Self, sqlx::Error> {
-        let pool = PgPoolOptions::new()
+        let pool = db::pool_options()
             .max_connections(MAX_CONNECTIONS)
             .acquire_timeout(ACQUIRE_TIMEOUT)
             .connect_lazy(&config.database_url)?;

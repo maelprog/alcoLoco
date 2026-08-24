@@ -997,3 +997,77 @@ async fn a_non_positive_weight_or_height_is_still_refused() {
         assert_eq!(answer.body["type"], "/problems/validation_failed");
     }
 }
+
+/// Every statement of the profile module keeps working while a temporary table
+/// shadows the types those statements cast to.
+///
+/// This is class (e) of #41 at its root, and the only test of this file about
+/// *name resolution* rather than about behaviour. Unless it is named in the
+/// `search_path`, `pg_temp` is searched **before** `pg_catalog` for relations
+/// and for types, so a session owning a temporary table called `uuid` or `text`
+/// re-points the unqualified casts of the module at that table's row type.
+/// Measured on `postgres:16-alpine`, the image of `docker-compose.yml`:
+///
+/// ```text
+/// SELECT 'x'::text;                      -- x
+/// CREATE TEMP TABLE text (a int);
+/// SELECT 'x'::text;                      -- ERROR: malformed record literal: "x"
+///
+/// CREATE TEMP TABLE uuid (a int);
+/// SELECT gen_random_uuid() > NULL::uuid; -- ERROR: operator does not exist:
+///                                        --        pg_catalog.uuid > uuid
+/// ```
+///
+/// [`db::pool_options`] names `pg_temp` last on every connection it opens, and
+/// this test is what holds it to that. Take the `after_connect` out of
+/// `crates/db/src/lib.rs` and this test fails on the second error above; that is
+/// how it was checked, and it is the only reason to trust it.
+///
+/// The pool is deliberately **one** connection. A temporary table belongs to the
+/// session that created it, so the requests below have to run on that same
+/// connection for the shadowing to reach them at all.
+#[tokio::test]
+async fn a_temporary_table_does_not_shadow_the_types_the_statements_cast_to() {
+    let test = "a_temporary_table_does_not_shadow_the_types_the_statements_cast_to";
+    let Some(url) = database_url(test) else {
+        return;
+    };
+
+    let pool = db::pool_options()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("the pool must open");
+    db::migrate(&pool).await.expect("the migrations must apply");
+
+    // After the migrations, so that the schema itself is built against the real
+    // types; these two shadow only the session this pool holds.
+    sqlx::raw_sql("CREATE TEMP TABLE uuid (a int); CREATE TEMP TABLE text (a int);")
+        .execute(&pool)
+        .await
+        .expect("the shadowing tables must be created");
+
+    let state = AppState {
+        pool,
+        config: state(&url).config,
+    };
+
+    // The four endpoints, every one of them on the shadowed connection.
+    let (id, _) = create_profile(&state, &a_sound_payload("Ombre")).await;
+
+    let (status, body) = body_of(state.clone(), &format!("/profiles/{id}")).await;
+    assert_eq!(status, StatusCode::OK, "the read was refused: {body}");
+
+    let (status, body) = body_of(state.clone(), "/profiles?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "the listing was refused: {body}");
+
+    let mut payload = a_sound_payload("Ombre corrigée");
+    payload["settings"]["weight_kg"] = Value::from(63.5);
+    let answer = send(state, "PUT", &format!("/profiles/{id}"), Some(payload)).await;
+    assert_eq!(
+        answer.status,
+        StatusCode::OK,
+        "the update was refused: {}",
+        answer.body
+    );
+}

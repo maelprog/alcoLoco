@@ -26,8 +26,18 @@
 //! declares, so that a fourth file cannot join the module unnoticed.
 //!
 //! **Relations and types are schema qualified.** `pg_temp` is searched before
-//! `public`, so an unqualified `profile` can be shadowed by a temporary table
-//! (class (e) of the migration of #2). Qualifying costs nothing and closes it.
+//! `public` — and, for types, before `pg_catalog` too — so an unqualified
+//! `profile`, or an unqualified `::uuid`, can be shadowed by a temporary table
+//! (class (e) of the migration of #2).
+//!
+//! What closes that class is **not** the guard in this file. It is
+//! [`db::SEARCH_PATH`], which names `pg_temp` last on every connection the
+//! project opens: named, the temporary schema is searched where it is written,
+//! and the question is settled for every statement this project runs — those
+//! spelled in ways no text guard can read, and those not written yet. The rule
+//! is kept here as a convention and as a second line of defence should that
+//! setting ever go missing, and the guard below reads it; it is no longer what
+//! stands between a temporary table and a mis-resolved name.
 //!
 //! **The settings come from `profile_settings_at`, never from a column of
 //! `profile`.** There is no current copy to read: SPEC.md §10.0-L puts the four
@@ -62,7 +72,7 @@ const UNIQUE_VERSION_START: &str = "profile_settings_version_unique_start";
 const SELECT_PAGE: &str = "
     SELECT p.id,
            p.display_name,
-           p.default_quantity_unit::text AS default_quantity_unit,
+           p.default_quantity_unit::pg_catalog.text AS default_quantity_unit,
            p.default_ingestion_duration_seconds,
            p.default_absorption_duration_seconds,
            p.created_at,
@@ -70,11 +80,11 @@ const SELECT_PAGE: &str = "
            s.valid_from,
            s.weight_kg,
            s.height_cm,
-           s.sex::text AS sex,
+           s.sex::pg_catalog.text AS sex,
            s.birth_date
     FROM public.profile AS p
     LEFT JOIN LATERAL public.profile_settings_at(p.id, now()) AS s ON true
-    WHERE $1::uuid IS NULL OR p.id > $1::uuid
+    WHERE $1::pg_catalog.uuid IS NULL OR p.id > $1::pg_catalog.uuid
     ORDER BY p.id
     LIMIT $2
 ";
@@ -83,7 +93,7 @@ const SELECT_PAGE: &str = "
 const SELECT_ONE: &str = "
     SELECT p.id,
            p.display_name,
-           p.default_quantity_unit::text AS default_quantity_unit,
+           p.default_quantity_unit::pg_catalog.text AS default_quantity_unit,
            p.default_ingestion_duration_seconds,
            p.default_absorption_duration_seconds,
            p.created_at,
@@ -91,7 +101,7 @@ const SELECT_ONE: &str = "
            s.valid_from,
            s.weight_kg,
            s.height_cm,
-           s.sex::text AS sex,
+           s.sex::pg_catalog.text AS sex,
            s.birth_date
     FROM public.profile AS p
     LEFT JOIN LATERAL public.profile_settings_at(p.id, now()) AS s ON true
@@ -131,7 +141,7 @@ const LOCK_PROFILE: &str = "SELECT 1 FROM public.profile WHERE id = $1 FOR UPDAT
 /// The parameters in force at a given instant, for the comparison that decides
 /// whether an update has to post a version at all (SPEC.md §10.0-J).
 const SELECT_SETTINGS_AT: &str = "
-    SELECT valid_from, weight_kg, height_cm, sex::text AS sex, birth_date
+    SELECT valid_from, weight_kg, height_cm, sex::pg_catalog.text AS sex, birth_date
     FROM public.profile_settings_at($1, $2)
 ";
 
@@ -406,17 +416,31 @@ mod tests {
     //!
     //! **The name stands where the keyword list cannot reach it.**
     //!
-    //! - `SELECT profile_settings_at($1, $2)` — a function called unqualified.
-    //!   `pg_temp` shadows a function exactly as it shadows a table, so this is
-    //!   the hole of #41 in a position where **no keyword stands at all**. The
-    //!   trouble is not a word missing from the list; it is that in this
-    //!   position the list has nothing to match on, and no word added to it
-    //!   ever will.
+    //! - `SELECT profile_settings_at($1, $2)` — a function called unqualified,
+    //!   in a position where **no keyword stands at all**. The trouble is not a
+    //!   word missing from the list; it is that here the list has nothing to
+    //!   match on, and no word added to it ever will. The entry stays because
+    //!   the reader genuinely cannot see that name — but the reason once given
+    //!   for it was wrong. `pg_temp` does **not** shadow a function the way it
+    //!   shadows a table: measured on #6 with a `pg_temp.profile_settings_at`
+    //!   in place and `pg_temp` named first, the unqualified call still
+    //!   resolved to `public`. The temporary schema is searched for relations
+    //!   and types, never for functions or operators. Declaring too much is the
+    //!   prudent direction; the motive given for it was not.
     //! - a keyword that is simply not in the list. `TRUNCATE` and `USING` were
     //!   two of them until #6 put them in, which is the argument and not the
     //!   remedy: the next one is not knowable from here.
     //! - a name written as a quoted identifier — `FROM "profile"` — is not read
     //!   as a name at all, so nothing asks whether it is qualified.
+    //! - a cast written in either of the two further spellings PostgreSQL
+    //!   accepts, neither of them read here. The prefix form,
+    //!   `INSERT … VALUES (quantity_unit 'cl')`, is a cast to a type of this
+    //!   schema and **is** shadowable — measured on #6, a temporary table named
+    //!   `unit` turned `unit 'cl'` into `malformed record literal` — and it
+    //!   leaves every guard green. The function-call form, `int4('42')`, is
+    //!   accepted too and reads as an ordinary call. Between them and the
+    //!   entry above, the reader sees two of at least four ways to spell a
+    //!   cast.
     //!
     //! Closing any of these was weighed and declined, three times over, on #6.
     //! Each is one more spelling to recognise on a set that has no last member,
@@ -443,7 +467,7 @@ mod tests {
     //!   written `ARRAY[…]` — see
     //!   [`no_statement_of_this_module_carries_an_interpolation_marker`];
     //! - a cast to a built-in type absent from the hand-written list in
-    //!   [`no_cast_of_this_module_can_be_shadowed_by_a_temporary_type`], which
+    //!   [`every_cast_to_a_type_this_schema_owns_is_schema_qualified`], which
     //!   is partial too and says there what to do when it fires;
     //! - a qualified path and a subscript at the call site — both in
     //!   [`every_statement_of_this_module_is_a_named_constant`];
@@ -540,6 +564,15 @@ mod tests {
         // first shape this reader was written in read a list of statements as
         // no statement at all.
         let mut declared_at_depth: Option<u32> = None;
+        // How many items are open *inside* the one being read. An initialiser
+        // may hold a block, and a block may hold items of its own: the literal
+        // of `const PURGE: &str = { const INNER: &str = "…"; crate::OTHER };`
+        // belongs to `INNER`, not to `PURGE`. Reading it as `PURGE`'s value
+        // reported a statement guarded that had never been read — measured on
+        // #6, thirteen guards green while the statement lived in `lib.rs`.
+        // Only the bounded scan counts them; the whole-source sweep *wants*
+        // every declaration it meets, nested ones included.
+        let mut nested_items = 0_u32;
         let mut depth = 0_u32;
         let mut at = 0;
         while at < source.len() {
@@ -552,13 +585,17 @@ mod tests {
                 // `&'static str` is not the keyword `static`.
                 at += length;
             } else if let Some((literal, length)) = string_literal(rest) {
-                if declared_at_depth.is_some() {
+                if declared_at_depth.is_some() && nested_items == 0 {
                     literals.push(literal);
                 }
                 at += length;
             } else if let Some(length) = word_length(rest) {
                 if matches!(&rest[..length], "const" | "static") {
-                    declared_at_depth = Some(depth);
+                    if scan == Scan::FirstDeclarationOnly && declared_at_depth.is_some() {
+                        nested_items += 1;
+                    } else {
+                        declared_at_depth = Some(depth);
+                    }
                 }
                 at += length;
             } else {
@@ -568,6 +605,8 @@ mod tests {
                     // Braces are left out of the count on purpose: a `const fn`
                     // body ends no item with a `;`, so counting them would hold
                     // the declaration open over the rest of the file.
+                    // A nested item's `;` closes that item and nothing more.
+                    b';' if nested_items > 0 => nested_items -= 1,
                     b';' if declared_at_depth.is_some_and(|opened| depth <= opened) => {
                         declared_at_depth = None;
                         if scan == Scan::FirstDeclarationOnly {
@@ -1125,9 +1164,14 @@ mod tests {
         names
     }
 
-    /// The type each cast of `statement` names, in both spellings PostgreSQL
-    /// accepts: `value::type`, whatever whitespace surrounds the colons, and
-    /// the standard `CAST(value AS type)`, which carries no colons at all.
+    /// The type each cast of `statement` names, in the two spellings this
+    /// reader knows: `value::type`, whatever whitespace surrounds the colons,
+    /// and the standard `CAST(value AS type)`, which carries no colons at all.
+    ///
+    /// PostgreSQL accepts at least two more, both measured on #6 and neither
+    /// read here — the prefix form `quantity_unit 'cl'`, which is shadowable,
+    /// and the function call `int4('42')`. They are listed with the other blind
+    /// spots at the head of this module.
     ///
     /// Only the `AS` of a `CAST` is read; the one that names a column or a
     /// table alias introduces no type.
@@ -1173,12 +1217,19 @@ mod tests {
         None
     }
 
-    /// Whether `name` is qualified by the schema this migration owns.
+    /// Whether `name` says which schema it lives in, rather than leaving that
+    /// to `search_path`.
+    ///
+    /// Two schemas count: `public`, which this project's migrations own, and
+    /// `pg_catalog`, which is PostgreSQL's own. A name qualified by either
+    /// resolves to one place whatever `search_path` holds, and that — not the
+    /// spelling — is what both guards below are after.
     ///
     /// Case-folded, because PostgreSQL folds an unquoted name too: `PUBLIC.t`
     /// and `public.t` are the same relation.
-    fn is_schema_qualified(name: &str) -> bool {
-        name.to_ascii_lowercase().starts_with("public.")
+    fn names_its_schema(name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        name.starts_with("public.") || name.starts_with("pg_catalog.")
     }
 
     #[test]
@@ -1188,6 +1239,12 @@ mod tests {
         // `profile_settings_at()` into a source of fabricated parameters. Only
         // names in relation position are looked at: a column called `sex` is not
         // one, and neither is the `profile` inside `profile_id`.
+        //
+        // `db::SEARCH_PATH` is what actually closes the class, by naming
+        // `pg_temp` last on every connection. This keeps the convention and
+        // would catch a statement written before that setting takes effect; it
+        // is not the guarantee, and the head of this module says which reads
+        // this file cannot make.
         for statement in declared_string_constants() {
             // Written out because SQL offers no closed grammar to derive them
             // from, which is why this list is partial and stays partial:
@@ -1199,7 +1256,7 @@ mod tests {
             ] {
                 for name in names_after(&statement, keyword) {
                     assert!(
-                        is_schema_qualified(&name),
+                        names_its_schema(&name),
                         "`{name}` follows `{keyword}` unqualified in: {statement}"
                     );
                 }
@@ -1208,63 +1265,69 @@ mod tests {
     }
 
     #[test]
-    fn no_cast_of_this_module_can_be_shadowed_by_a_temporary_type() {
-        // A cast resolves through `search_path` too, so `$3::quantity_unit` is
-        // shadowable by a temporary type. A built-in is not: `pg_catalog` comes
-        // first whatever `search_path` says.
+    fn every_cast_to_a_type_this_schema_owns_is_schema_qualified() {
+        // A cast resolves through `search_path`, so `$3::quantity_unit` can be
+        // shadowed by a temporary type.
         //
-        // The name of this test used to read the other way round — "every cast
-        // to a type this schema owns is schema qualified" — while what it
-        // does is refuse every cast to a type this schema does *not* own and
-        // nobody has listed.
+        // This guard used to add that a built-in could not be, "because
+        // `pg_catalog` comes first whatever `search_path` says". **That was
+        // false**, and a whole list rested on it: PostgreSQL searches the
+        // temporary schema *first* — ahead of `pg_catalog` — for relations and
+        // for types, unless `pg_temp` is named in the `search_path`. Measured on
+        // `postgres:16-alpine` by creating one temporary table per name and
+        // asking which namespace the cast then resolved to, fifteen of the
+        // twenty-eight names this list held were shadowable: `bool bytea date
+        // float4 float8 int2 int4 int8 json jsonb name oid text timestamptz
+        // uuid`. They are gone from it, and the statements above now write
+        // `pg_catalog.text` and `pg_catalog.uuid` where they used to leave the
+        // schema out.
         //
-        // That list is written by hand and is **partial**: the catalogue of
-        // built-in types is PostgreSQL's, not something this module can derive,
-        // and #6 widened it rather than completing it. It fails closed, so it
-        // hides nothing — what it does is turn down a legitimate cast to a type
-        // no one has named yet. When that happens the fix is to add the type
-        // here, or to qualify the cast; never to loosen the check, which is the
-        // whole of what this guard is.
+        // What is left is the thirteen names PostgreSQL's **grammar** knows:
+        // `integer`, `varchar` and the rest are parsed as type keywords and
+        // never looked up through a namespace, and the same measurement found
+        // every one of them still resolving to `pg_catalog` with a temporary
+        // table of that name in place. The list is written by hand and stays
+        // **partial** — the grammar is PostgreSQL's, not something this module
+        // can derive — but the line it draws is a real one now.
+        //
+        // It fails closed. When it refuses a legitimate cast the fix is to
+        // qualify that cast; a name belongs in the list only if the grammar
+        // parses it as a type keyword.
+        //
+        // And none of this is what keeps the database safe any more.
+        // `db::SEARCH_PATH` names `pg_temp` last on every connection this
+        // project opens, which settles the question for every statement it
+        // runs — including the ones no text guard can read. What lives on here
+        // is the convention, and a second line of defence if that setting ever
+        // goes missing.
         const BUILT_IN: &[&str] = &[
             "bigint",
-            "bool",
             "boolean",
-            "bytea",
             "char",
-            "date",
             "decimal",
-            "float4",
-            "float8",
             "int",
-            "int2",
-            "int4",
-            "int8",
             "integer",
             "interval",
-            "json",
-            "jsonb",
-            "name",
             "numeric",
-            "oid",
             "real",
             "smallint",
-            "text",
             "time",
             "timestamp",
-            "timestamptz",
-            "uuid",
             "varchar",
         ];
         for statement in declared_string_constants() {
             for name in cast_target_names(&statement) {
                 assert!(
-                    is_schema_qualified(&name)
+                    names_its_schema(&name)
                         || BUILT_IN
                             .iter()
                             .any(|built_in| name.eq_ignore_ascii_case(built_in)),
-                    "the cast to `{name}` is unqualified in: {statement}\n\
-                     if `{name}` is a built-in type, add it to `BUILT_IN` above; if it \
-                     belongs to this schema, write `public.{name}`"
+                    "the cast to `{name}` names no schema in: {statement}\n\
+                     write `public.{name}` for a type of this schema, or \
+                     `pg_catalog.{name}` for a built-in. Add a name to `BUILT_IN` above \
+                     only if PostgreSQL's grammar parses it as a type keyword — a name \
+                     the catalogue merely holds is shadowable, which is how that list \
+                     came to be wrong."
                 );
             }
         }
@@ -1512,10 +1575,13 @@ mod tests {
         // the shape of a constant would leave them passing over nothing.
         //
         // What it required used to be absolute where it had to be relative: a
-        // floor of seven while the file declares eleven, and four statements
-        // named by hand out of the seven it runs — one more list to forget to
-        // keep up. Measured on #6: a reader dropping four of the eleven
-        // literals it recovers left this test green. What is required now is
+        // floor of seven literals, and four statements named by hand out of the
+        // seven this module runs — one more list to forget to keep up. Measured
+        // on #6: a reader dropping the last four literals it recovers left this
+        // test green. No count of what the file declares is written here, on
+        // purpose: the one that was here went stale the moment a list inside
+        // this very file grew, which is the same argument the refusals at the
+        // head of this module are no longer counted by. What is required now is
         // derived from the file itself — every constant a constructor is
         // handed here is one the reader recovered — so it grows with the file
         // and cannot be outrun by it.
