@@ -359,27 +359,190 @@ mod tests {
     /// reads the `slug` match arms instead of listing them.
     const SOURCE: &str = include_str!("store.rs");
 
-    /// The value of every `const … : &str = "…";` this file declares.
+    /// The value of every string constant this file declares.
     ///
     /// The statements are exactly those constants, and
     /// [`every_statement_of_this_module_is_a_named_constant`] is what keeps that
     /// true. Non-SQL constants are swept in as well; they satisfy the guards
     /// vacuously, and an allowlist would be one more thing to forget.
     fn declared_string_constants() -> Vec<String> {
-        // Assembled rather than written out: spelled as a literal, the marker
-        // would occur in this very file and the reader would find itself.
-        let marker = format!(": &str = {}", '"');
-        SOURCE
-            .split(marker.as_str())
-            .skip(1)
-            .map(|after| {
-                after
-                    .split_once('"')
-                    .unwrap_or_else(|| panic!("unterminated string constant in {}", file!()))
-                    .0
-                    .to_owned()
-            })
-            .collect()
+        string_literals_of_declarations(SOURCE)
+    }
+
+    /// Every string literal a `const` or a `static` of `source` introduces,
+    /// whatever its declaration is spelled like.
+    ///
+    /// The reader this replaced looked for one spelling of a declaration — the
+    /// bytes `: &str = "` — and so guarded the shapes someone had thought of
+    /// rather than the ones the file holds: a statement written `r#"…"#`, the
+    /// natural shape for SQL of several lines, entered no list at all, and the
+    /// guards below iterated straight past it. So did `&'static str`, a value
+    /// rustfmt wrapped to the next line, and punctuation written without spaces
+    /// around it. Adding those spellings to a list of spellings would move the
+    /// hole one notch up, so there is no list here: the source is walked token
+    /// by token — comments, character literals and lifetimes told apart from the
+    /// strings they resemble — and every literal between a `const` or `static`
+    /// keyword and the `;` that closes its item is taken, whatever the declared
+    /// type says. [`the_reader_recognises_every_form_a_declaration_can_take`]
+    /// holds it to that.
+    ///
+    /// A `const fn` sweeps the literals of its first statement in as well. That
+    /// errs towards guarding too much, which is the harmless direction, and
+    /// this module declares none.
+    ///
+    /// What no declaration form reaches, measured the same way: a statement
+    /// glued together by `concat!` is read as its pieces, and a relation name
+    /// split across two of them follows no keyword in either. That leaves the
+    /// injection guard standing — the constructor is still handed a name, and
+    /// no value from a request can enter a `concat!` of literals — and only
+    /// [`every_name_in_relation_position_is_schema_qualified`] blind.
+    fn string_literals_of_declarations(source: &str) -> Vec<String> {
+        let mut literals = Vec::new();
+        // The bracket depth the open declaration started at, if one is open.
+        // Depth is what tells the `;` that ends an item from the one inside
+        // `[&str; 3]`, which used to end it three statements too early: the
+        // first shape this reader was written in read a list of statements as
+        // no statement at all.
+        let mut declared_at_depth: Option<u32> = None;
+        let mut depth = 0_u32;
+        let mut at = 0;
+        while at < source.len() {
+            let rest = &source[at..];
+            if let Some(length) = comment_length(rest) {
+                at += length;
+            } else if let Some(length) = character_or_lifetime_length(rest) {
+                // Both open with a quote and neither opens a string: `'"'` is a
+                // quote that starts nothing, and the `'static` of
+                // `&'static str` is not the keyword `static`.
+                at += length;
+            } else if let Some((literal, length)) = string_literal(rest) {
+                if declared_at_depth.is_some() {
+                    literals.push(literal);
+                }
+                at += length;
+            } else if let Some(length) = word_length(rest) {
+                if matches!(&rest[..length], "const" | "static") {
+                    declared_at_depth = Some(depth);
+                }
+                at += length;
+            } else {
+                match rest.as_bytes()[0] {
+                    b'(' | b'[' => depth += 1,
+                    b')' | b']' => depth = depth.saturating_sub(1),
+                    // Braces are left out of the count on purpose: a `const fn`
+                    // body ends no item with a `;`, so counting them would hold
+                    // the declaration open over the rest of the file.
+                    b';' if declared_at_depth.is_some_and(|opened| depth <= opened) => {
+                        declared_at_depth = None;
+                    }
+                    _ => {}
+                }
+                at += 1;
+            }
+        }
+        literals
+    }
+
+    /// The length of the comment `rest` opens, if it opens one.
+    ///
+    /// Taken whole: a comment may hold anything, an unbalanced quote included.
+    fn comment_length(rest: &str) -> Option<usize> {
+        if rest.starts_with("//") {
+            return Some(rest.find('\n').map_or(rest.len(), |end| end + 1));
+        }
+        if !rest.starts_with("/*") {
+            return None;
+        }
+        let bytes = rest.as_bytes();
+        let mut depth = 0_u32;
+        let mut at = 0;
+        while at + 1 < bytes.len() {
+            match &bytes[at..at + 2] {
+                b"/*" => {
+                    depth += 1;
+                    at += 2;
+                }
+                b"*/" => {
+                    depth -= 1;
+                    at += 2;
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                }
+                _ => at += 1,
+            }
+        }
+        Some(rest.len())
+    }
+
+    /// The length of the character literal or lifetime `rest` opens.
+    ///
+    /// A lifetime is a quote and a name with no closing quote after it, which is
+    /// what tells `'static` from `'s'`.
+    fn character_or_lifetime_length(rest: &str) -> Option<usize> {
+        let after_quote = rest.strip_prefix('\'')?;
+        let name = after_quote.len()
+            - after_quote
+                .trim_start_matches(|c: char| c.is_alphanumeric() || c == '_')
+                .len();
+        if name > 0
+            && !after_quote.starts_with(|c: char| c.is_ascii_digit())
+            && !after_quote[name..].starts_with('\'')
+        {
+            return Some(1 + name);
+        }
+        let bytes = rest.as_bytes();
+        let mut at = 1;
+        while at < bytes.len() {
+            match bytes[at] {
+                // Escape sequences are ASCII, so this lands on a boundary.
+                b'\\' => at += 2,
+                b'\'' => return Some(at + 1),
+                _ => at += 1,
+            }
+        }
+        Some(rest.len())
+    }
+
+    /// The content of the string literal `rest` opens, and its length.
+    ///
+    /// Ordinary, byte and raw spellings alike; the content of a raw string is
+    /// its bytes as written, which is what SQL of several lines is made of.
+    fn string_literal(rest: &str) -> Option<(String, usize)> {
+        let body = rest.strip_prefix('b').unwrap_or(rest);
+        let marker = rest.len() - body.len();
+        let Some(raw) = body.strip_prefix('r') else {
+            let inside = body.strip_prefix('"')?;
+            let bytes = inside.as_bytes();
+            let mut at = 0;
+            while at < bytes.len() {
+                match bytes[at] {
+                    b'\\' => at += 2,
+                    b'"' => return Some((inside[..at].to_owned(), marker + 1 + at + 1)),
+                    _ => at += 1,
+                }
+            }
+            panic!("unterminated string literal in {}", file!())
+        };
+        let hashes = raw.len() - raw.trim_start_matches('#').len();
+        let inside = raw[hashes..].strip_prefix('"')?;
+        let closing = format!("{}{}", '"', "#".repeat(hashes));
+        let end = inside
+            .find(closing.as_str())
+            .unwrap_or_else(|| panic!("unterminated raw string literal in {}", file!()));
+        Some((
+            inside[..end].to_owned(),
+            marker + 1 + hashes + 1 + end + closing.len(),
+        ))
+    }
+
+    /// The length of the word `rest` opens, if it opens one.
+    fn word_length(rest: &str) -> Option<usize> {
+        let length = rest.len()
+            - rest
+                .trim_start_matches(|c: char| c.is_alphanumeric() || c == '_')
+                .len();
+        (length > 0).then_some(length)
     }
 
     /// The text each call to an sqlx statement constructor passes first.
@@ -549,6 +712,100 @@ mod tests {
             assert!(
                 !statement.contains('{') && !statement.contains('}'),
                 "a formatting placeholder survived into: {statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reader_recognises_every_form_a_declaration_can_take() {
+        // What the guards below are worth is what the reader is worth: a form
+        // it cannot see is a statement no guard ever reads. Each source here
+        // declares the same statement in a shape that got past the
+        // spelling-matched reader this replaced — measured, not supposed: a
+        // constant written `r#"…"#` and naming an unqualified relation left
+        // `every_name_in_relation_position_is_schema_qualified` green.
+        for (form, source) in [
+            ("the shape this file uses", r#"const A: &str = "SELECT 1";"#),
+            ("a raw string", r##"const A: &str = r#"SELECT 1"#;"##),
+            (
+                "a raw string with no hash",
+                r#"const A: &str = r"SELECT 1";"#,
+            ),
+            (
+                "a raw string with two hashes",
+                r###"const A: &str = r##"SELECT 1"##;"###,
+            ),
+            (
+                "a spelled-out lifetime",
+                r#"const A: &'static str = "SELECT 1";"#,
+            ),
+            (
+                "no space around the punctuation",
+                r#"const A:&str="SELECT 1";"#,
+            ),
+            (
+                "a value wrapped to the next line",
+                "const A: &str =\n    \"SELECT 1\";",
+            ),
+            (
+                "a type alias",
+                r#"type Sql = &'static str; const A: Sql = "SELECT 1";"#,
+            ),
+            ("a static", r#"static A: &str = "SELECT 1";"#),
+            (
+                "an array, whose type carries a semicolon of its own",
+                r#"const A: [&str; 1] = ["SELECT 1"];"#,
+            ),
+            (
+                "a public constant of a submodule",
+                r#"mod inner { pub const A: &str = "SELECT 1"; }"#,
+            ),
+            (
+                "a declaration behind a character literal that is a quote",
+                r#"fn f() { let q = '"'; } const A: &str = "SELECT 1";"#,
+            ),
+            (
+                "a declaration behind a block comment",
+                r#"/* const A: &str = "not this one"; */ const A: &str = "SELECT 1";"#,
+            ),
+        ] {
+            assert_eq!(
+                string_literals_of_declarations(source),
+                vec!["SELECT 1".to_owned()],
+                "the reader does not recover a statement declared with {form}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reader_takes_nothing_a_declaration_did_not_introduce() {
+        // The other half of the same claim. A reader that simply swept up every
+        // literal of the file would drag the guards over strings that are no
+        // statement at all — the fixtures just above among them — and the
+        // failures it invented would be answered by weakening the guards.
+        for (shape, source) in [
+            (
+                "a local binding",
+                r#"fn f() { let a = "SELECT 1 FROM profile"; }"#,
+            ),
+            (
+                "a commented-out declaration",
+                r#"// const A: &str = "SELECT 1 FROM profile";"#,
+            ),
+            (
+                "an argument of a call",
+                r#"fn f() { g("SELECT 1 FROM profile"); }"#,
+            ),
+            (
+                "a literal after the declaration ended",
+                r#"const A: &str = ""; fn f() { let b = "SELECT 1 FROM profile"; }"#,
+            ),
+        ] {
+            assert!(
+                string_literals_of_declarations(source)
+                    .iter()
+                    .all(String::is_empty),
+                "the reader takes {shape} for a declared constant"
             );
         }
     }
