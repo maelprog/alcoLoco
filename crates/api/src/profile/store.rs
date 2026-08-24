@@ -19,9 +19,10 @@
 //! recognise are written down one by one at the top of the test module: reading
 //! Rust exactly would take a Rust lexer, and reading SQL exactly an SQL parser,
 //! neither of which belongs in a test module. A guard that names its blind
-//! spots is worth more than one that promises they do not exist. The two
+//! spots is worth more than one that promises they do not exist. The three
 //! sibling files of the module declare no statement at all, and a test holds
-//! them to it — which is what makes a file-scoped guard cover the feature.
+//! them to it — against the modules `mod.rs` itself declares, so that a fourth
+//! file cannot join the module without that test saying so.
 //!
 //! **Relations and types are schema qualified.** `pg_temp` is searched before
 //! `public`, so an unqualified `profile` can be shadowed by a temporary table
@@ -358,12 +359,38 @@ mod tests {
     //! relation or type position is schema qualified. Deciding either exactly
     //! would take a Rust lexer and an SQL parser. What is here instead is a
     //! reader held to the shapes it claims, by tests of its own — so these
-    //! guards make a mistake **visible**, they do not make it **impossible**,
-    //! and the difference is this list.
+    //! guards make a mistake **visible**, they do not make it **impossible**.
     //!
-    //! Four ways to reach sqlx without the reader seeing a call at all. Each
-    //! was written into this file, compiled and run on #6; each left all guards
-    //! green, and none of them is refused:
+    //! **The list below is partial, and cannot be otherwise.** Three of the
+    //! sets it touches are open: the grammar of SQL, the ways a Rust
+    //! expression can reach a function, and the ways SQL text can enter this
+    //! file. A closed set is derived here rather than listed — whitespace is
+    //! Unicode's, escapes are Rust's grammar, the shapes of a declaration are
+    //! walked as tokens instead of matched as spellings, and the files of the
+    //! module are read off `mod.rs` — and those questions are settled, no list
+    //! of them surviving anywhere below. An open set admits no such move:
+    //! whatever is enumerated, the next issue may write the item that was not.
+    //! What follows is what is **known** to get past, never what can.
+    //!
+    //! **The SQL never reaches the reader.** These are the worst of them,
+    //! because the guards do not merely miss a shape — they read a different
+    //! text and pass:
+    //!
+    //! - `const Q: &str = include_str!("count_by_unit.sql");` — the statement
+    //!   lives in a neighbouring file and the literal the reader recovers is
+    //!   the *path*. Measured on #6: a `.sql` file naming an unqualified
+    //!   relation **and** an unqualified cast left every guard green, the guard
+    //!   on named constants included, since the argument genuinely is the name
+    //!   of an upper-case constant. Nothing of the SQL is in the text the
+    //!   guards read, which makes it worse than anything else on this page; and
+    //!   it is the ordinary way to keep a long statement readable, so it is the
+    //!   one a later issue is likeliest to reach for without a second thought.
+    //! - `concat!("… FROM ", "public.profile")` — the pieces are at least still
+    //!   here, but a name split across two of them follows no keyword in
+    //!   either.
+    //!
+    //! **The call is not seen as a call.** Each was written into this file,
+    //! compiled and run on #6; each left every guard green:
     //!
     //! - `use sqlx::query;` and then `query(&format!("…"))` — the reader looks
     //!   for the path, so an import that drops it hides the call;
@@ -374,30 +401,41 @@ mod tests {
     //! - `use sqlx::Executor;` and then `pool.execute(statement)` — a method on
     //!   the pool, with no sqlx path at the call site whatsoever.
     //!
-    //! Two more get past with the call in plain sight:
+    //! **The name stands where the keyword list cannot reach it.**
     //!
-    //! - `concat!("… FROM ", "public.profile")` reaches the reader as its
-    //!   pieces, so a relation name split across two of them follows no keyword
-    //!   in either;
+    //! - `SELECT profile_settings_at($1, $2)` — a function called unqualified.
+    //!   `pg_temp` shadows a function exactly as it shadows a table, so this is
+    //!   the hole of #41 in a position where **no keyword stands at all**. The
+    //!   trouble is not a word missing from the list; it is that in this
+    //!   position the list has nothing to match on, and no word added to it
+    //!   ever will.
+    //! - a keyword that is simply not in the list. `TRUNCATE` and `USING` were
+    //!   two of them until #6 put them in, which is the argument and not the
+    //!   remedy: the next one is not knowable from here.
     //! - a name written as a quoted identifier — `FROM "profile"` — is not read
-    //!   as a name, so nothing checks that it is qualified.
+    //!   as a name at all, so nothing asks whether it is qualified.
     //!
-    //! Closing those was weighed and declined on #6. Each is one more spelling
-    //! to recognise, and this module has already spent four turns moving the
-    //! same hole one notch at a time: a hand-copied list, then the spelling of
+    //! Closing any of these was weighed and declined, three times over, on #6.
+    //! Each is one more spelling to recognise on a set that has no last member,
+    //! and this module has already spent four turns moving the same hole one
+    //! notch at a time: a hand-copied list of statements, then the spelling of
     //! a declaration, then the spelling of a call and the width of a space.
-    //! What the guards do buy is worth stating as plainly: every statement this
-    //! file declares is read in every shape a declaration can be written in,
-    //! every keyword is matched whatever whitespace follows it, and the shape a
-    //! hurried change actually takes — `sqlx::query(&format!(…))` — turns them
-    //! red.
     //!
-    //! Two refusals below are deliberate rather than exact: they turn down
-    //! legitimate SQL and legitimate Rust that this module does not use, on the
-    //! grounds that admitting them would take a parser. Both say so where they
-    //! are made — see [`no_statement_of_this_module_carries_an_interpolation_marker`]
-    //! on braces, and [`every_statement_of_this_module_is_a_named_constant`] on
-    //! qualified paths.
+    //! What the guards do buy, stated no larger than it is: every statement
+    //! this file declares **as a `const` or `static` item** is read whatever
+    //! that item is spelled like; every keyword **the list carries** is matched
+    //! whatever whitespace follows it and in either case; no file **of this
+    //! module** escapes the reader, the files read being checked against the
+    //! modules `mod.rs` declares; and the shape a hurried change actually takes
+    //! — `sqlx::query(&format!(…))` — turns them red.
+    //!
+    //! Three refusals below are deliberate rather than exact: they turn down
+    //! legitimate SQL and legitimate Rust that this module does not use,
+    //! because admitting them would take the parser this module has not got.
+    //! Each says so where it is made — see
+    //! [`no_statement_of_this_module_carries_an_interpolation_marker`] on
+    //! braces, and [`every_statement_of_this_module_is_a_named_constant`] on
+    //! qualified paths and on subscripts.
 
     use super::*;
 
@@ -436,16 +474,21 @@ mod tests {
     /// by token — comments, character literals and lifetimes told apart from the
     /// strings they resemble — and every literal between a `const` or `static`
     /// keyword and the `;` that closes its item is taken, whatever the declared
-    /// type says. [`the_reader_recognises_every_form_a_declaration_can_take`]
+    /// type says. [`the_reader_recognises_a_declaration_however_it_is_spelled`]
     /// holds it to that.
     ///
     /// A `const fn` sweeps the literals of its first statement in as well. That
     /// errs towards guarding too much, which is the harmless direction, and
     /// this module declares none.
     ///
-    /// What no declaration form reaches — `concat!` among it — is listed with
-    /// the other blind spots at the top of this module, where a reader looking
-    /// for what these guards are worth will find all of them together.
+    /// What is read is the source as **written**: an item a macro expands into
+    /// is not in it, so a constant a macro declares is not read here at all.
+    /// That is one of the open sets the head of this module describes, not an
+    /// oversight to be patched by naming macros.
+    ///
+    /// What no declaration form reaches — `include_str!` and `concat!` among
+    /// it — is listed with the other known blind spots at the top of this
+    /// module. That list is partial by construction, and says so there.
     fn string_literals_of_declarations(source: &str) -> Vec<String> {
         let mut literals = Vec::new();
         // The bracket depth the open declaration started at, if one is open.
@@ -747,6 +790,60 @@ mod tests {
         [format!("{sqlx}::query"), format!("{sqlx}::raw_sql")]
     }
 
+    /// How many times `prefix` opens what reads as a call in this file's code.
+    ///
+    /// Counted by the plainest means there is, and deliberately not by
+    /// [`first_arguments_of`]: the point is that two readings of the same file
+    /// agree on how many calls it makes, which a floor written as a number
+    /// cannot say.
+    fn call_shaped_occurrences_of(prefix: &str) -> usize {
+        let code = code_of(SOURCE);
+        code.match_indices(prefix)
+            .filter(|(at, _)| {
+                let after = code[at + prefix.len()..]
+                    .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+                after.starts_with('(') || after.starts_with("::<")
+            })
+            .count()
+    }
+
+    /// The constant names this file hands to a statement constructor.
+    fn statement_constant_names() -> Vec<String> {
+        let mut names: Vec<String> = sql_constructor_prefixes()
+            .iter()
+            .flat_map(|prefix| first_arguments_of(prefix))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The value the declaration of `name` introduces, or `None` when this file
+    /// declares no such constant.
+    ///
+    /// Located on [`code_of`] this file, so a mention in prose is not a
+    /// declaration, and read from the source at the same offset — blanking
+    /// leaves the code exactly where it stood, which
+    /// [`the_reader_of_calls_looks_at_code_and_not_at_prose`] holds it to.
+    fn value_declared_for(name: &str) -> Option<String> {
+        let code = code_of(SOURCE);
+        for keyword in ["const", "static"] {
+            let needle = format!("{keyword} {name}");
+            let mut from = 0;
+            while let Some(at) = code[from..].find(&needle) {
+                let start = from + at;
+                let after = &code[start + needle.len()..];
+                if !after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+                    return string_literals_of_declarations(&SOURCE[start..])
+                        .into_iter()
+                        .next();
+                }
+                from = start + needle.len();
+            }
+        }
+        None
+    }
+
     #[test]
     fn every_statement_of_this_module_is_a_named_constant() {
         // The guard the other two rest on: a call the reader sees is handed
@@ -757,16 +854,19 @@ mod tests {
         // at the top of this module: this makes the mistake visible, it does
         // not make it impossible.
         //
-        // A qualified path such as `Q::SQL` is refused as well, deliberately
-        // and not by oversight: the reader reads this file, so a statement
-        // named through a path could be declared somewhere no guard of this
-        // module would ever inspect it, and the file-scoped guarantee would
-        // quietly stop covering the feature. A constant this module runs is
-        // declared in this module.
-        let mut seen = 0;
+        // Two refusals here are deliberate rather than exact, and neither is
+        // an oversight. A qualified path such as `Q::SQL` is turned down
+        // because the reader reads *this* file: a statement named through a
+        // path could be declared somewhere no guard of this module would ever
+        // inspect, and the file-scoped guarantee would quietly stop covering
+        // the feature. A subscript — `sqlx::query(STATEMENTS[0])` — is turned
+        // down by the same rule, brackets being neither upper case nor an
+        // underscore: a module that wanted a table of statements would have to
+        // give each of them a name, which is what the guards below read. Both
+        // cost a rewrite, not a fix.
         for prefix in sql_constructor_prefixes() {
-            for argument in first_arguments_of(&prefix) {
-                seen += 1;
+            let arguments = first_arguments_of(&prefix);
+            for argument in &arguments {
                 assert!(
                     !argument.is_empty()
                         && argument
@@ -776,29 +876,100 @@ mod tests {
                     "a statement is built rather than named: `{argument}`"
                 );
             }
+            // Relative to the file, not to a number remembered once. The floor
+            // this replaced read `seen >= 5` while the file makes seven calls,
+            // so it tolerated the silent loss of two of them; what is required
+            // now is that the two readings of the same file agree.
+            let shown = call_shaped_occurrences_of(&prefix);
+            assert_eq!(
+                arguments.len(),
+                shown,
+                "the reader of calls found {} call(s) of `{prefix}` where this file shows {shown}",
+                arguments.len()
+            );
         }
-        assert!(
-            seen >= 5,
-            "only {seen} statement constructor call(s) found; the reader has lost \
-             the shape of this file and is guarding nothing"
-        );
+    }
+
+    /// The modules `source` declares as files of their own.
+    ///
+    /// `mod name;` is a file; `mod name { … }` is not, its code being in
+    /// `source` already. Read on [`code_of`] `source`, so the words of a
+    /// comment declare nothing.
+    fn file_modules_declared_by(source: &str) -> Vec<String> {
+        let code = code_of(source);
+        let mut modules = Vec::new();
+        let mut previous = String::new();
+        let mut at = 0;
+        while at < code.len() {
+            let rest = &code[at..];
+            if let Some(length) = word_length(rest) {
+                let word = &rest[..length];
+                if previous == "mod" && code[at + length..].trim_start().starts_with(';') {
+                    modules.push(word.to_owned());
+                }
+                previous = word.to_owned();
+                at += length;
+            } else {
+                // Whitespace separates the two words; anything else parts them.
+                if !rest.starts_with(char::is_whitespace) {
+                    previous.clear();
+                }
+                at += rest.chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        modules
     }
 
     #[test]
     fn no_sql_of_the_profile_module_lives_outside_this_file() {
-        // What makes the file-scoped guards above cover the whole feature: the
+        // What lets a guard scoped to one file speak for the feature: the
         // handlers, the payload types and the validation touch no database at
-        // all, so every statement a profile write runs is one of the constants
-        // read here.
-        for (name, source) in [
+        // all, so a statement a profile write runs is declared here or nowhere
+        // — as far as the guards above see a statement at all, which is the
+        // reservation written at the head of this module and not repealed
+        // here.
+        //
+        // The files read here used to be three paths written out by hand, and
+        // a fourth file added to the module was simply not read — measured on
+        // #6: a `dao.rs` carrying `sqlx::query(&format!(…))`, the very shape
+        // this module says turns the guards red, left every one of them green.
+        // They are now required to be *exactly* the modules `mod.rs` declares.
+        // A file joins the crate only by being declared, so the compiler and
+        // this assertion between them leave no file of the module unread —
+        // and, unlike the lists further up, this one is over a closed set: what
+        // `mod.rs` declares is written in `mod.rs`.
+        let sources = [
             ("mod.rs", include_str!("mod.rs")),
             ("model.rs", include_str!("model.rs")),
+            ("store.rs", SOURCE),
             ("validation.rs", include_str!("validation.rs")),
-        ] {
+        ];
+
+        let mut read: Vec<String> = sources.iter().map(|(name, _)| (*name).to_owned()).collect();
+        read.sort();
+        let mut declared: Vec<String> = file_modules_declared_by(include_str!("mod.rs"))
+            .iter()
+            .map(|module| format!("{module}.rs"))
+            .collect();
+        declared.push("mod.rs".to_owned());
+        declared.sort();
+        assert_eq!(
+            read, declared,
+            "the files this test reads are no longer the files `mod.rs` declares"
+        );
+
+        for (name, source) in sources {
             let sqlx = "sqlx";
             assert!(
-                !source.contains(&format!("{sqlx}::")),
+                name == "store.rs" || !source.contains(&format!("{sqlx}::")),
                 "`{name}` reaches for the database; the guards of store.rs do not read it"
+            );
+            // A sibling declaring a file module of its own would put code one
+            // level further out, where nothing here reads it. `mod.rs` is the
+            // one that may, and its declarations are the list checked above.
+            assert!(
+                name == "mod.rs" || file_modules_declared_by(source).is_empty(),
+                "`{name}` declares a file module of its own, which no guard here reads"
             );
         }
     }
@@ -951,7 +1122,14 @@ mod tests {
         // names in relation position are looked at: a column called `sex` is not
         // one, and neither is the `profile` inside `profile_id`.
         for statement in declared_string_constants() {
-            for keyword in ["FROM", "JOIN", "LATERAL", "INTO", "UPDATE"] {
+            // Written out because SQL offers no closed grammar to derive them
+            // from, which is why this list is partial and stays partial:
+            // `TRUNCATE` and `USING` were missing until #6 added them, and that
+            // is the argument rather than the remedy. It reaches no name in
+            // function position at all — see the head of this module.
+            for keyword in [
+                "FROM", "JOIN", "LATERAL", "INTO", "UPDATE", "TRUNCATE", "USING",
+            ] {
                 for name in names_after(&statement, keyword) {
                     assert!(
                         is_schema_qualified(&name),
@@ -1116,10 +1294,14 @@ mod tests {
         }
         // And it does still read the code around them.
         assert!(code_of(&format!("// {call}\n{call}")).contains(&format!("{sqlx}::query")));
+        // Blanking keeps the code at its own offsets, which is what lets a
+        // declaration be located on the masked copy and then read from the
+        // source at the same place.
+        assert_eq!(code_of(SOURCE).len(), SOURCE.len());
     }
 
     #[test]
-    fn the_reader_recognises_every_form_a_declaration_can_take() {
+    fn the_reader_recognises_a_declaration_however_it_is_spelled() {
         // What the guards below are worth is what the reader is worth: a form
         // it cannot see is a statement no guard ever reads. Each source here
         // declares the same statement in a shape that got past the
@@ -1215,20 +1397,34 @@ mod tests {
     #[test]
     fn the_reader_finds_the_constants_this_file_declares() {
         // Guards the readers themselves. Every guard above iterates over
-        // `declared_string_constants()`, so a parser that stopped recognising
-        // the shape of a constant would return an empty list and leave three
-        // tests passing over nothing.
+        // `declared_string_constants()`, so a reader that stopped recognising
+        // the shape of a constant would leave them passing over nothing.
+        //
+        // What it required used to be absolute where it had to be relative: a
+        // floor of seven while the file declares eleven, and four statements
+        // named by hand out of the seven it runs — one more list to forget to
+        // keep up. Measured on #6: a reader dropping four of the eleven
+        // literals it recovers left this test green. What is required now is
+        // derived from the file itself — every constant a constructor is
+        // handed here is one the reader recovered — so it grows with the file
+        // and cannot be outrun by it.
         let declared = declared_string_constants();
+        let named = statement_constant_names();
         assert!(
-            declared.len() >= 7,
-            "only {} constant(s) found in {}: the reader is guarding nothing",
-            declared.len(),
+            !named.is_empty(),
+            "no statement constructor call found in {}: this test guards nothing",
             file!()
         );
-        for expected in [SELECT_PAGE, SELECT_ONE, INSERT_PROFILE, UPDATE_PROFILE] {
+        for name in named {
+            let value = value_declared_for(&name).unwrap_or_else(|| {
+                panic!(
+                    "`{name}` is handed to a constructor but declared nowhere in {}",
+                    file!()
+                )
+            });
             assert!(
-                declared.iter().any(|found| found == expected),
-                "a known statement was not recovered by the reader: {expected}"
+                declared.contains(&value),
+                "the reader did not recover the statement `{name}` names: {value}"
             );
         }
     }
