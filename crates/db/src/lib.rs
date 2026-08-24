@@ -33,24 +33,65 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// SELECT 'x'::text;                  -- ERROR: malformed record literal: "x"
 /// ```
 ///
-/// and, on the statements of the profile module, `CREATE TEMP TABLE uuid (a
-/// int)` turns `p.id > $1::uuid` into `ERROR: operator does not exist:
-/// pg_catalog.uuid > uuid`. Both measured on `postgres:16-alpine`, the image of
-/// `docker-compose.yml`.
+/// and, when the profile module still wrote `$1::uuid` unqualified, a temporary
+/// table named `uuid` turned its comparison into `ERROR: operator does not
+/// exist: pg_catalog.uuid > uuid`. Those statements name `pg_catalog` now, so
+/// that particular spelling is gone from the module; both errors were measured
+/// on `postgres:16-alpine`, the image of `docker-compose.yml`.
 ///
-/// Naming `pg_temp` moves it to the position written here, and that closes
-/// class (e) of #41 at the root: not for the statements someone remembered to
-/// qualify, nor for the shapes a text guard can recognise, but for **every**
-/// statement this project runs, now and later, whatever it is spelled like.
-/// The qualification guards of `crates/api/src/profile/store.rs` keep a
-/// convention worth keeping; they are no longer what stands between a temporary
-/// table and a mis-resolved name.
+/// Naming `pg_temp` moves it to the position written here, which settles the
+/// resolution for every statement **the two pools built from
+/// [`pool_options`]** run — not only the statements someone remembered to
+/// qualify, and not only the shapes a text guard can recognise. The
+/// qualification guards of `crates/api/src/profile/store.rs` keep a convention
+/// worth keeping; they are no longer what stands between a temporary table and
+/// a mis-resolved name.
+///
+/// **What this does not reach**, so that the next reader does not take it for
+/// more than it is:
+///
+/// - a session that runs `DISCARD ALL` gets the default back — measured:
+///   `SHOW search_path` returns `"$user", public` straight after it. Nothing in
+///   this repository issues one, but a connection pooler in transaction mode
+///   does;
+/// - any client that is not one of these two pools — `psql`, an operations
+///   script, a future crate opening its own pool. For those,
+///   `crates/db/migrations/20260819090000_initial_schema.sql` still holds a live
+///   class (e) hole of its own: the deferred trigger
+///   `assert_profile_settings_version_present()` declares `target_profile uuid`
+///   unqualified. It is left alone on purpose — migrations are immutable here,
+///   and that line belongs to **#41**.
+///
+/// Closing the class *by construction* would take `ALTER DATABASE … SET
+/// search_path`, which no session can undo and no client can miss. That is
+/// #41's to decide; a session setting is what this issue can honestly do.
+///
+/// One thing this order **moves** rather than removes. PostgreSQL puts
+/// `pg_catalog` implicitly first when it is not named; naming it second puts it
+/// after `public`, so a type of `public` now shadows a built-in of the same
+/// name. Measured:
+///
+/// ```text
+/// SET search_path = public, pg_catalog, pg_temp;
+/// CREATE DOMAIN public.text AS pg_catalog.int4;
+/// SELECT pg_typeof(NULL::text);   -- public   (pg_catalog under the default)
+/// ```
+///
+/// That is a strictly better place for the risk to sit: shadowing now takes DDL
+/// on `public`, where before it took a temporary table any session may create
+/// with no privilege at all. And `public` has to come first regardless, or the
+/// migrations would create their objects somewhere else.
 pub const SEARCH_PATH: &str = "public, pg_catalog, pg_temp";
 
 /// Pool options carrying what every connection of this project needs.
 ///
-/// Both pools are built from here — this crate's [`connect`] and the API's
-/// state — so that a connection cannot exist without its [`SEARCH_PATH`].
+/// The project's two pools are built from here — this crate's [`connect`] and
+/// the API's state — and a test covers each. Nothing in the language prevents a
+/// third being built elsewhere with `PgPoolOptions::new()`, and no guard would
+/// notice: what holds this is the two tests and this sentence, not the
+/// structure. `AppState::new` cannot simply call [`connect`] instead, because
+/// its pool is deliberately lazy — the server must come up and answer
+/// `GET /health` with the database down.
 #[must_use]
 pub fn pool_options() -> PgPoolOptions {
     PgPoolOptions::new().after_connect(|connection, _metadata| {

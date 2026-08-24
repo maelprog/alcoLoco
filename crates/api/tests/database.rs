@@ -998,34 +998,131 @@ async fn a_non_positive_weight_or_height_is_still_refused() {
     }
 }
 
-/// Every statement of the profile module keeps working while a temporary table
-/// shadows the types those statements cast to.
+/// Every connection of the pool the API runs on names `pg_temp` last.
 ///
-/// This is class (e) of #41 at its root, and the only test of this file about
-/// *name resolution* rather than about behaviour. Unless it is named in the
-/// `search_path`, `pg_temp` is searched **before** `pg_catalog` for relations
-/// and for types, so a session owning a temporary table called `uuid` or `text`
-/// re-points the unqualified casts of the module at that table's row type.
-/// Measured on `postgres:16-alpine`, the image of `docker-compose.yml`:
+/// **This is the test that holds [`db::pool_options`]**, and it asks the
+/// connection what it carries rather than watching for a consequence. Two
+/// assertions, in this order:
 ///
-/// ```text
-/// SELECT 'x'::text;                      -- x
-/// CREATE TEMP TABLE text (a int);
-/// SELECT 'x'::text;                      -- ERROR: malformed record literal: "x"
+/// 1. `SHOW search_path` on a connection of that pool equals [`db::SEARCH_PATH`];
+/// 2. with a temporary table named `text` and another named `uuid` in place on
+///    that same session, `pg_typeof(NULL::text)` and `pg_typeof(NULL::uuid)`
+///    still resolve inside `pg_catalog`.
 ///
-/// CREATE TEMP TABLE uuid (a int);
-/// SELECT gen_random_uuid() > NULL::uuid; -- ERROR: operator does not exist:
-///                                        --        pg_catalog.uuid > uuid
-/// ```
+/// The second is the property the setting exists for, asked of PostgreSQL's own
+/// catalogue: it goes through no migration, no trigger and no statement of this
+/// project, so nothing anyone corrects elsewhere can disarm it. That matters
+/// here — the end-to-end test below used to be what held this correction, and it
+/// bit for a reason its own comment got wrong.
 ///
-/// [`db::pool_options`] names `pg_temp` last on every connection it opens, and
-/// this test is what holds it to that. Take the `after_connect` out of
-/// `crates/db/src/lib.rs` and this test fails on the second error above; that is
-/// how it was checked, and it is the only reason to trust it.
+/// The pool comes from [`AppState::new`], which is the pool the server runs on,
+/// and one connection is taken and held for the whole test: a temporary table
+/// belongs to the session that created it, so a second connection would test
+/// nothing and pass regardless. That the two tables really are on this session
+/// is asserted rather than assumed.
 ///
-/// The pool is deliberately **one** connection. A temporary table belongs to the
-/// session that created it, so the requests below have to run on that same
-/// connection for the shadowing to reach them at all.
+/// Taking the `after_connect` out of `crates/db/src/lib.rs` fails assertion 1
+/// with `"$user", public`; putting `PgPoolOptions::new()` back in
+/// `crates/api/src/lib.rs` fails the same assertion. Both were run.
+#[tokio::test]
+async fn the_pool_the_api_builds_names_pg_temp_last_on_every_connection() {
+    let test = "the_pool_the_api_builds_names_pg_temp_last_on_every_connection";
+    let Some(url) = database_url(test) else {
+        return;
+    };
+
+    // Through `AppState::new` on purpose: that constructor is the one this test
+    // is here to cover.
+    let state = state(&url);
+    let mut connection = state
+        .pool
+        .acquire()
+        .await
+        .expect("the pool must hand out a connection");
+
+    let (search_path,): (String,) = sqlx::query_as("SHOW search_path")
+        .fetch_one(&mut *connection)
+        .await
+        .expect("`SHOW search_path` must answer");
+    assert_eq!(
+        search_path,
+        db::SEARCH_PATH,
+        "a connection of the pool `AppState::new` builds does not carry the \
+         project's search_path"
+    );
+
+    sqlx::raw_sql("CREATE TEMP TABLE text (a int); CREATE TEMP TABLE uuid (a int);")
+        .execute(&mut *connection)
+        .await
+        .expect("the shadowing tables must be created");
+
+    // Without this, everything below would pass on a session that never saw the
+    // tables — the way a second connection would.
+    let (shadowing,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pg_class
+         WHERE relname IN ('text', 'uuid') AND relnamespace = pg_my_temp_schema()",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .expect("the temporary schema must be readable");
+    assert_eq!(
+        shadowing, 2,
+        "the shadowing tables are not on the connection this test then queries"
+    );
+
+    for (name, query) in [
+        (
+            "text",
+            "SELECT n.nspname FROM pg_type AS t
+             JOIN pg_namespace AS n ON n.oid = t.typnamespace
+             WHERE t.oid = pg_typeof(NULL::text)",
+        ),
+        (
+            "uuid",
+            "SELECT n.nspname FROM pg_type AS t
+             JOIN pg_namespace AS n ON n.oid = t.typnamespace
+             WHERE t.oid = pg_typeof(NULL::uuid)",
+        ),
+    ] {
+        let (namespace,): (String,) = sqlx::query_as(query)
+            .fetch_one(&mut *connection)
+            .await
+            .expect("the catalogue must answer");
+        assert_eq!(
+            namespace, "pg_catalog",
+            "`::{name}` resolves into `{namespace}`: a temporary table shadows a \
+             built-in type on this connection"
+        );
+    }
+}
+
+/// The four endpoints answer on a connection that owns shadowing temporary
+/// tables.
+///
+/// Kept for its own sake — it exercises the real router, the real statements and
+/// the real triggers under the condition this issue is about — but it is **not**
+/// what holds the `search_path` correction; the test above is. The comment here
+/// used to claim otherwise, and was wrong twice over:
+///
+/// - it announced failing on `operator does not exist: pg_catalog.uuid > uuid`,
+///   which can no longer happen: the statements of the module write
+///   `$1::pg_catalog.uuid` now, so this correction immunised the very thing the
+///   test named;
+/// - what it actually bites on, measured on #6 by reading the server log, is
+///   `crates/db/migrations/20260819090000_initial_schema.sql`, whose deferred
+///   trigger declares `target_profile uuid` unqualified. Without the
+///   `after_connect` the failure is `malformed record literal` raised at
+///   `COMMIT`, inside `assert_profile_settings_version_present()`, and the
+///   module's own `INSERT`s have already succeeded by then.
+///
+/// That unqualified `DECLARE` is a live class (e) hole and it belongs to
+/// **#41**, not to this issue; it is left alone deliberately. But it means this
+/// test would go green again the day #41 qualifies that line, which is exactly
+/// why it may not be the thing this correction rests on.
+///
+/// The pool is built by [`db::pool_options`] with **one** connection, which is
+/// what puts the requests on the session owning the temporary tables — and what
+/// covers the other of the project's two pool constructions.
 #[tokio::test]
 async fn a_temporary_table_does_not_shadow_the_types_the_statements_cast_to() {
     let test = "a_temporary_table_does_not_shadow_the_types_the_statements_cast_to";

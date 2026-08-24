@@ -36,8 +36,12 @@
 //! and the question is settled for every statement this project runs — those
 //! spelled in ways no text guard can read, and those not written yet. The rule
 //! is kept here as a convention and as a second line of defence should that
-//! setting ever go missing, and the guard below reads it; it is no longer what
-//! stands between a temporary table and a mis-resolved name.
+//! setting ever go missing. No guard in this file reads `db::SEARCH_PATH` —
+//! none could, these tests reading text and not a live connection; what holds
+//! the setting is `the_pool_the_api_builds_names_pg_temp_last_on_every_connection`
+//! in `crates/api/tests/database.rs`, which asks a real connection. The rule
+//! below is no longer what stands between a temporary table and a mis-resolved
+//! name.
 //!
 //! **The settings come from `profile_settings_at`, never from a column of
 //! `profile`.** There is no current copy to read: SPEC.md §10.0-L puts the four
