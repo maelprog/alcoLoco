@@ -10,11 +10,16 @@
 //! deliberately does not take up that pattern: it is the first code of the
 //! project to write values a client sent.
 //!
-//! That rule is enforced on **this file**, not on a list of statements someone
-//! remembered to keep up to date: the tests read the source at compile time,
-//! recover every string constant it declares, and require every call to an sqlx
-//! statement constructor to be handed the *name* of one. A statement assembled
-//! at run time is therefore refused by its shape, whoever adds it. The two
+//! That rule is held by this file rather than by a list someone remembers to
+//! keep up to date: the tests read the source at compile time, recover every
+//! string constant it declares, and require every call written `sqlx::query(…)`
+//! or `sqlx::raw_sql(…)` to be handed the *name* of one. What that buys is
+//! **visibility, not impossibility**. A statement assembled at run time is
+//! caught in the shapes the guards recognise, and the shapes they do not
+//! recognise are written down one by one at the top of the test module: reading
+//! Rust exactly would take a Rust lexer, and reading SQL exactly an SQL parser,
+//! neither of which belongs in a test module. A guard that names its blind
+//! spots is worth more than one that promises they do not exist. The two
 //! sibling files of the module declare no statement at all, and a test holds
 //! them to it — which is what makes a file-scoped guard cover the feature.
 //!
@@ -346,6 +351,54 @@ pub async fn update(pool: &PgPool, id: Uuid, profile: &ValidProfile) -> Result<U
 
 #[cfg(test)]
 mod tests {
+    //! What these guards are worth, and where they stop.
+    //!
+    //! They read this file as text and decide two things about it: that every
+    //! statement is a named constant, and that every name a statement puts in
+    //! relation or type position is schema qualified. Deciding either exactly
+    //! would take a Rust lexer and an SQL parser. What is here instead is a
+    //! reader held to the shapes it claims, by tests of its own — so these
+    //! guards make a mistake **visible**, they do not make it **impossible**,
+    //! and the difference is this list.
+    //!
+    //! Four ways to reach sqlx without the reader seeing a call at all. Each
+    //! was written into this file, compiled and run on #6; each left all guards
+    //! green, and none of them is refused:
+    //!
+    //! - `use sqlx::query;` and then `query(&format!("…"))` — the reader looks
+    //!   for the path, so an import that drops it hides the call;
+    //! - `use sqlx::query as run;` and then `run(&statement)` — the same, under
+    //!   a name the reader has never heard of;
+    //! - `sqlx::QueryBuilder::<Postgres>::new(format!("…")).build()` — a third
+    //!   entry point, and not one of the two the reader knows;
+    //! - `use sqlx::Executor;` and then `pool.execute(statement)` — a method on
+    //!   the pool, with no sqlx path at the call site whatsoever.
+    //!
+    //! Two more get past with the call in plain sight:
+    //!
+    //! - `concat!("… FROM ", "public.profile")` reaches the reader as its
+    //!   pieces, so a relation name split across two of them follows no keyword
+    //!   in either;
+    //! - a name written as a quoted identifier — `FROM "profile"` — is not read
+    //!   as a name, so nothing checks that it is qualified.
+    //!
+    //! Closing those was weighed and declined on #6. Each is one more spelling
+    //! to recognise, and this module has already spent four turns moving the
+    //! same hole one notch at a time: a hand-copied list, then the spelling of
+    //! a declaration, then the spelling of a call and the width of a space.
+    //! What the guards do buy is worth stating as plainly: every statement this
+    //! file declares is read in every shape a declaration can be written in,
+    //! every keyword is matched whatever whitespace follows it, and the shape a
+    //! hurried change actually takes — `sqlx::query(&format!(…))` — turns them
+    //! red.
+    //!
+    //! Two refusals below are deliberate rather than exact: they turn down
+    //! legitimate SQL and legitimate Rust that this module does not use, on the
+    //! grounds that admitting them would take a parser. Both say so where they
+    //! are made — see [`no_statement_of_this_module_carries_an_interpolation_marker`]
+    //! on braces, and [`every_statement_of_this_module_is_a_named_constant`] on
+    //! qualified paths.
+
     use super::*;
 
     /// This file, read at compile time.
@@ -390,12 +443,9 @@ mod tests {
     /// errs towards guarding too much, which is the harmless direction, and
     /// this module declares none.
     ///
-    /// What no declaration form reaches, measured the same way: a statement
-    /// glued together by `concat!` is read as its pieces, and a relation name
-    /// split across two of them follows no keyword in either. That leaves the
-    /// injection guard standing — the constructor is still handed a name, and
-    /// no value from a request can enter a `concat!` of literals — and only
-    /// [`every_name_in_relation_position_is_schema_qualified`] blind.
+    /// What no declaration form reaches — `concat!` among it — is listed with
+    /// the other blind spots at the top of this module, where a reader looking
+    /// for what these guards are worth will find all of them together.
     fn string_literals_of_declarations(source: &str) -> Vec<String> {
         let mut literals = Vec::new();
         // The bracket depth the open declaration started at, if one is open.
@@ -506,8 +556,13 @@ mod tests {
 
     /// The content of the string literal `rest` opens, and its length.
     ///
-    /// Ordinary, byte and raw spellings alike; the content of a raw string is
-    /// its bytes as written, which is what SQL of several lines is made of.
+    /// Ordinary, byte and raw spellings alike. The escape sequences of an
+    /// ordinary literal are decoded, because a statement may be written
+    /// `"SELECT 1 FROM\n    public.profile"` as readily as across three lines
+    /// and the guards have to read the same whitespace in both: left as
+    /// written, that `\n` is a backslash and a letter, and the token after
+    /// `FROM` is neither of them a name. A raw string carries no escapes, so
+    /// its bytes are its content.
     fn string_literal(rest: &str) -> Option<(String, usize)> {
         let body = rest.strip_prefix('b').unwrap_or(rest);
         let marker = rest.len() - body.len();
@@ -518,7 +573,9 @@ mod tests {
             while at < bytes.len() {
                 match bytes[at] {
                     b'\\' => at += 2,
-                    b'"' => return Some((inside[..at].to_owned(), marker + 1 + at + 1)),
+                    b'"' => {
+                        return Some((unescaped(&inside[..at]), marker + 1 + at + 1));
+                    }
                     _ => at += 1,
                 }
             }
@@ -536,6 +593,64 @@ mod tests {
         ))
     }
 
+    /// What `escaped` stands for once the escape sequences Rust writes are
+    /// decoded.
+    ///
+    /// The set of them is finite and written down in the reference, which is
+    /// what makes this exact rather than one more guess at a spelling.
+    fn unescaped(escaped: &str) -> String {
+        let mut text = String::with_capacity(escaped.len());
+        let mut characters = escaped.chars().peekable();
+        while let Some(character) = characters.next() {
+            if character != '\\' {
+                text.push(character);
+                continue;
+            }
+            match characters.next() {
+                Some('n') => text.push('\n'),
+                Some('r') => text.push('\r'),
+                Some('t') => text.push('\t'),
+                Some('0') => text.push('\0'),
+                Some('x') => {
+                    let digits: String = (0..2).filter_map(|_| characters.next()).collect();
+                    push_code_point(&mut text, &digits);
+                }
+                Some('u') => {
+                    let mut digits = String::new();
+                    for digit in characters.by_ref() {
+                        if digit == '}' {
+                            break;
+                        }
+                        if digit != '{' {
+                            digits.push(digit);
+                        }
+                    }
+                    push_code_point(&mut text, &digits);
+                }
+                // A backslash ending a line eats the break and the indentation
+                // that follows it, so both spellings of a wrapped statement
+                // read alike.
+                Some('\n') => while characters.next_if(|c| c.is_whitespace()).is_some() {},
+                // `\\`, `\'` and `\"` stand for themselves.
+                Some(other) => text.push(other),
+                None => text.push('\\'),
+            }
+        }
+        text
+    }
+
+    /// Appends the character `digits` names in hexadecimal, or the digits
+    /// themselves when they name none.
+    fn push_code_point(text: &mut String, digits: &str) {
+        match u32::from_str_radix(digits, 16)
+            .ok()
+            .and_then(char::from_u32)
+        {
+            Some(character) => text.push(character),
+            None => text.push_str(digits),
+        }
+    }
+
     /// The length of the word `rest` opens, if it opens one.
     fn word_length(rest: &str) -> Option<usize> {
         let length = rest.len()
@@ -545,20 +660,56 @@ mod tests {
         (length > 0).then_some(length)
     }
 
+    /// This file with its comments and its string literals blanked out.
+    ///
+    /// [`first_arguments_of`] searches text, and text includes what is written
+    /// *about* the code. Before this, a comment saying what never to write —
+    /// `sqlx::query(&format!(…))`, spelled out as the counter-example it is —
+    /// turned [`every_statement_of_this_module_is_a_named_constant`] red, and
+    /// so would a test fixture quoting the same shape. A guard that punishes
+    /// the documentation of its own rule gets the documentation deleted.
+    ///
+    /// Blanking rather than removing keeps the code at its own offsets, and
+    /// blanking string literals is the second half of the rule the guard
+    /// states: SQL handed to a constructor as a literal is not the name of a
+    /// constant, and it now reads as the empty argument it is.
+    fn code_of(source: &str) -> String {
+        let mut code = String::with_capacity(source.len());
+        let mut at = 0;
+        while at < source.len() {
+            let rest = &source[at..];
+            let blanked =
+                comment_length(rest).or_else(|| string_literal(rest).map(|(_, length)| length));
+            if let Some(length) = blanked {
+                code.push_str(&" ".repeat(length));
+                at += length;
+                continue;
+            }
+            // A character literal is code, and `'"'` must not be read as the
+            // start of a string.
+            let length = character_or_lifetime_length(rest)
+                .unwrap_or_else(|| rest.chars().next().map_or(1, char::len_utf8));
+            code.push_str(&rest[..length]);
+            at += length;
+        }
+        code
+    }
+
     /// The text each call to an sqlx statement constructor passes first.
     ///
     /// `prefix` is the path up to the constructor family, e.g. the sqlx query
-    /// builders or the raw-SQL entry point. Occurrences that are not calls — the
-    /// word appearing in a comment, say — are skipped, and the guard that reads
-    /// this insists on finding some.
+    /// builders or the raw-SQL entry point. The search runs on [`code_of`] this
+    /// file, so the word occurring in a comment or inside a string is no call;
+    /// the guard that reads this insists on finding some all the same.
     fn first_arguments_of(prefix: &str) -> Vec<String> {
+        let code = code_of(SOURCE);
         let mut arguments = Vec::new();
         let mut from = 0;
-        while let Some(at) = SOURCE[from..].find(prefix) {
+        while let Some(at) = code[from..].find(prefix) {
             let after_prefix = from + at + prefix.len();
             from = after_prefix;
             // The rest of the function name: `_scalar`, `_as`, or nothing.
-            let rest = SOURCE[after_prefix..]
+            let rest = code[after_prefix..]
                 .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
             // An optional turbofish, whose own parentheses must not be mistaken
             // for the call's: `query_as::<_, (i64,)>(…)`.
@@ -598,12 +749,20 @@ mod tests {
 
     #[test]
     fn every_statement_of_this_module_is_a_named_constant() {
-        // The guard the other two rest on, and the one that closes the hole a
-        // transcribed list left open: whatever a statement says, it cannot be
-        // assembled from a value at run time, because the constructor is only
-        // ever handed the name of a constant. `format!("… {id} …")`, a `String`
-        // built above the call, a borrowed local — none of them is an upper-case
-        // identifier, so none of them gets past here.
+        // The guard the other two rest on: a call the reader sees is handed
+        // the name of a constant and nothing else. `format!("… {id} …")`, a
+        // `String` built above the call, a borrowed local, a statement written
+        // inline as a literal — none of them is an upper-case identifier, so
+        // none of them gets past here. What the reader does not see is the list
+        // at the top of this module: this makes the mistake visible, it does
+        // not make it impossible.
+        //
+        // A qualified path such as `Q::SQL` is refused as well, deliberately
+        // and not by oversight: the reader reads this file, so a statement
+        // named through a path could be declared somewhere no guard of this
+        // module would ever inspect it, and the file-scoped guarantee would
+        // quietly stop covering the feature. A constant this module runs is
+        // declared in this module.
         let mut seen = 0;
         for prefix in sql_constructor_prefixes() {
             for argument in first_arguments_of(&prefix) {
@@ -644,27 +803,144 @@ mod tests {
         }
     }
 
-    /// The names `keyword` introduces, `keyword` being given with its trailing
-    /// space and matched on an upper-cased copy of the statement.
+    /// The tokens of an SQL statement: its names, its punctuation, and each of
+    /// its string literals taken whole.
+    ///
+    /// Whitespace separates and nothing more, which is the whole point. The
+    /// reader this replaced looked for a keyword written with exactly one space
+    /// after it, so `FROM` at the end of a line — the shape every statement of
+    /// this file is written in — introduced no name at all as far as the guards
+    /// could see. Whitespace is a closed set, so tokenising is exact here in a
+    /// way that guessing at Rust spellings never was.
+    fn sql_tokens(statement: &str) -> Vec<&str> {
+        let bytes = statement.as_bytes();
+        let mut tokens = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let start = at;
+            if bytes[at].is_ascii_whitespace() {
+                at += 1;
+                continue;
+            } else if bytes[at] == b'\'' {
+                // One token: the words inside a literal are text, not names.
+                at += 1;
+                while at < bytes.len() {
+                    let quote = bytes[at] == b'\'';
+                    at += 1;
+                    // `''` is an escaped quote and not the end of the literal.
+                    if quote && bytes.get(at) != Some(&b'\'') {
+                        break;
+                    }
+                }
+            } else if bytes[at] == b':' && bytes.get(at + 1) == Some(&b':') {
+                at += 2;
+            } else if is_name_byte(bytes[at]) {
+                while at < bytes.len() && is_name_byte(bytes[at]) {
+                    at += 1;
+                }
+            } else {
+                // A whole character, so that the slicing below stays on a
+                // boundary whatever a statement is written in.
+                at += statement[at..].chars().next().map_or(1, char::len_utf8);
+            }
+            tokens.push(&statement[start..at]);
+        }
+        tokens
+    }
+
+    /// Whether `byte` can appear inside a name: an identifier, a qualified one,
+    /// or a placeholder such as `$1`.
+    fn is_name_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'$')
+    }
+
+    /// Whether `token` reads as a name rather than as punctuation or a literal.
+    fn is_a_name(token: &str) -> bool {
+        token.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+    }
+
+    /// The name each occurrence of `keyword` introduces in `statement`.
+    ///
+    /// `keyword` is matched as a whole token and against a whole token, so what
+    /// separates it from the name it introduces — one space, several, a
+    /// tabulation, the line break this file wraps its statements with — makes
+    /// no difference, and neither does its case.
     ///
     /// `LATERAL` is skipped rather than returned: `JOIN LATERAL public.f(…)`
-    /// names `public.f`, and the `LATERAL ` keyword picks it up on its own pass.
+    /// names `public.f`, and the `LATERAL` keyword picks it up on its own pass.
+    /// So is anything that is not a name at all: `FROM (SELECT …)` opens a
+    /// subquery, whose own `FROM` is read on its own.
     fn names_after(statement: &str, keyword: &str) -> Vec<String> {
-        let upper = statement.to_uppercase();
+        let tokens = sql_tokens(statement);
         let mut names = Vec::new();
-        let mut from = 0;
-        while let Some(at) = upper[from..].find(keyword) {
-            let after = from + at + keyword.len();
-            let name: String = statement[after..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
-                .collect();
-            if !name.eq_ignore_ascii_case("LATERAL") && !name.is_empty() {
-                names.push(name);
+        for (index, token) in tokens.iter().enumerate() {
+            if !token.eq_ignore_ascii_case(keyword) {
+                continue;
             }
-            from = after;
+            let Some(name) = tokens.get(index + 1) else {
+                continue;
+            };
+            if !name.eq_ignore_ascii_case("LATERAL") && is_a_name(name) {
+                names.push((*name).to_owned());
+            }
         }
         names
+    }
+
+    /// The type each cast of `statement` names, in both spellings PostgreSQL
+    /// accepts: `value::type`, whatever whitespace surrounds the colons, and
+    /// the standard `CAST(value AS type)`, which carries no colons at all.
+    ///
+    /// Only the `AS` of a `CAST` is read; the one that names a column or a
+    /// table alias introduces no type.
+    fn cast_target_names(statement: &str) -> Vec<String> {
+        let tokens = sql_tokens(statement);
+        let mut names = Vec::new();
+        for (index, token) in tokens.iter().enumerate() {
+            let target = if *token == "::" {
+                tokens.get(index + 1).copied()
+            } else if token.eq_ignore_ascii_case("CAST") {
+                type_named_by_cast(&tokens[index + 1..])
+            } else {
+                None
+            };
+            if let Some(name) = target.filter(|name| is_a_name(name)) {
+                names.push(name.to_owned());
+            }
+        }
+        names
+    }
+
+    /// The type named by the `CAST` whose arguments `tokens` open.
+    fn type_named_by_cast<'a>(tokens: &[&'a str]) -> Option<&'a str> {
+        if tokens.first() != Some(&"(") {
+            return None;
+        }
+        let mut depth = 0_u32;
+        for (index, token) in tokens.iter().enumerate() {
+            match *token {
+                "(" => depth += 1,
+                ")" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return None;
+                    }
+                }
+                _ if depth == 1 && token.eq_ignore_ascii_case("AS") => {
+                    return tokens.get(index + 1).copied();
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Whether `name` is qualified by the schema this migration owns.
+    ///
+    /// Case-folded, because PostgreSQL folds an unquoted name too: `PUBLIC.t`
+    /// and `public.t` are the same relation.
+    fn is_schema_qualified(name: &str) -> bool {
+        name.to_ascii_lowercase().starts_with("public.")
     }
 
     #[test]
@@ -675,12 +951,11 @@ mod tests {
         // names in relation position are looked at: a column called `sex` is not
         // one, and neither is the `profile` inside `profile_id`.
         for statement in declared_string_constants() {
-            for keyword in ["FROM ", "JOIN ", "LATERAL ", "INTO ", "UPDATE "] {
+            for keyword in ["FROM", "JOIN", "LATERAL", "INTO", "UPDATE"] {
                 for name in names_after(&statement, keyword) {
                     assert!(
-                        name.starts_with("public."),
-                        "`{name}` follows `{}` unqualified in: {statement}",
-                        keyword.trim()
+                        is_schema_qualified(&name),
+                        "`{name}` follows `{keyword}` unqualified in: {statement}"
                     );
                 }
             }
@@ -694,9 +969,12 @@ mod tests {
         // comes first whatever `search_path` says.
         const BUILT_IN: [&str; 2] = ["uuid", "text"];
         for statement in declared_string_constants() {
-            for name in names_after(&statement, "::") {
+            for name in cast_target_names(&statement) {
                 assert!(
-                    name.starts_with("public.") || BUILT_IN.contains(&name.as_str()),
+                    is_schema_qualified(&name)
+                        || BUILT_IN
+                            .iter()
+                            .any(|built_in| name.eq_ignore_ascii_case(built_in)),
                     "the cast to `{name}` is unqualified in: {statement}"
                 );
             }
@@ -707,13 +985,137 @@ mod tests {
     fn no_statement_of_this_module_carries_an_interpolation_marker() {
         // Belt to the brace of `every_statement_of_this_module_is_a_named
         // _constant`: a constant that had been through a `format!` before
-        // reaching the constructor would still show its braces here.
+        // reaching the constructor would still show its braces here — inside a
+        // quoted SQL literal included, which is exactly where an interpolated
+        // value does the most damage.
+        //
+        // Every brace is refused, deliberately and not by oversight: the
+        // PostgreSQL array literal `'{a,b}'` is legitimate SQL and is turned
+        // down all the same, because telling it from a placeholder that
+        // survived would take an SQL parser. A statement that needs one writes
+        // `ARRAY[a, b]`, which this module reads without complaint.
         for statement in declared_string_constants() {
             assert!(
                 !statement.contains('{') && !statement.contains('}'),
                 "a formatting placeholder survived into: {statement}"
             );
         }
+    }
+
+    #[test]
+    fn a_keyword_is_read_as_a_token_whatever_separates_it_from_its_name() {
+        // The guards used to look for a keyword written with exactly one space
+        // after it — and this file wraps every statement it declares, so the
+        // shape they could not see was the shape in use. Measured on #6 before
+        // the change: a constant naming its relation after a line break left
+        // `every_name_in_relation_position_is_schema_qualified` green. The set
+        // of whitespace is finite, so this one is exact.
+        for (separator, shape) in [
+            (" ", "one space"),
+            ("  ", "two spaces"),
+            ("\n    ", "a line break and its indentation"),
+            ("\t", "a tabulation"),
+            ("\r\n", "a carriage return and a line break"),
+        ] {
+            let statement = format!("SELECT 1 FROM{separator}profile");
+            assert_eq!(
+                names_after(&statement, "FROM"),
+                vec!["profile".to_owned()],
+                "the name after `FROM` is lost when {shape} separates them"
+            );
+        }
+        assert_eq!(
+            names_after("select 1 from profile", "FROM"),
+            vec!["profile".to_owned()],
+            "a keyword in lower case introduces a name all the same"
+        );
+        // `JOIN LATERAL f(…)` names `f`, and `LATERAL` picks it up on its pass.
+        assert!(names_after("JOIN LATERAL public.f(x)", "JOIN").is_empty());
+        assert_eq!(
+            names_after("JOIN LATERAL public.f(x)", "LATERAL"),
+            vec!["public.f".to_owned()]
+        );
+        // What is not a name is not read as one: a subquery opens with a
+        // parenthesis, and the words inside a literal are text.
+        assert!(names_after("SELECT 1 FROM (SELECT 2)", "FROM").is_empty());
+        assert!(names_after("SELECT 'a FROM b'", "FROM").is_empty());
+    }
+
+    #[test]
+    fn a_cast_is_read_in_both_spellings_postgresql_accepts() {
+        // `CAST(… AS …)` carries no colons at all, so the reader that looked
+        // for `::` saw no cast — measured green on #6 — and so did a `::`
+        // written with spaces around it.
+        for (statement, shape) in [
+            ("SELECT $1::quantity_unit", "colons written tight"),
+            ("SELECT $1 :: quantity_unit", "colons written spaced"),
+            ("SELECT CAST($1 AS quantity_unit)", "the standard spelling"),
+            (
+                "SELECT CAST(\n    $1\n    AS quantity_unit\n)",
+                "the standard spelling, wrapped over lines",
+            ),
+            (
+                "SELECT cast($1 as quantity_unit)",
+                "the standard spelling in lower case",
+            ),
+            (
+                "SELECT CAST(coalesce($1, $2) AS quantity_unit)",
+                "an argument of its own",
+            ),
+        ] {
+            assert_eq!(
+                cast_target_names(statement),
+                vec!["quantity_unit".to_owned()],
+                "the cast is not read when it is written with {shape}"
+            );
+        }
+        // The `AS` that names an alias introduces no type, and neither does a
+        // `CAST` that is only a word.
+        assert!(cast_target_names("SELECT p.sex AS sex FROM public.profile AS p").is_empty());
+        assert!(cast_target_names("SELECT cast_of_thousands FROM public.film").is_empty());
+    }
+
+    #[test]
+    fn a_statement_written_with_escapes_reads_as_the_text_it_stands_for() {
+        // A statement may be written `"… FROM\n    public.profile"` as readily
+        // as across two lines, and the guards have to see the same whitespace
+        // in both: left as written, `\n` is a backslash and a letter, and the
+        // token after `FROM` is neither of them a name.
+        assert_eq!(
+            string_literals_of_declarations(r#"const A: &str = "a\tb\n\u{63}\x64\"e\\f";"#),
+            vec!["a\tb\ncd\"e\\f".to_owned()]
+        );
+        // A raw string carries no escapes: its bytes are its content.
+        assert_eq!(
+            string_literals_of_declarations("const A: &str = r\"a\\tb\";"),
+            vec!["a\\tb".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_reader_of_calls_looks_at_code_and_not_at_prose() {
+        // A guard that turns red on the comment warning against the very shape
+        // it forbids gets the comment deleted, not the shape. Measured on #6:
+        // spelling the counter-example out in a comment turned
+        // `every_statement_of_this_module_is_a_named_constant` red.
+        let sqlx = "sqlx";
+        let call = format!("{sqlx}::query(&format!(\"DELETE FROM {{t}}\"))");
+        for (shape, source) in [
+            ("a line comment", format!("// never write {call}")),
+            ("a doc comment", format!("/// never write {call}")),
+            ("a block comment", format!("/* never write {call} */")),
+            (
+                "a string",
+                format!("fn f() {{ let warning = \"{call}\"; }}"),
+            ),
+        ] {
+            assert!(
+                !code_of(&source).contains(&format!("{sqlx}::")),
+                "the reader of calls reads {shape} as if it were code"
+            );
+        }
+        // And it does still read the code around them.
+        assert!(code_of(&format!("// {call}\n{call}")).contains(&format!("{sqlx}::query")));
     }
 
     #[test]
