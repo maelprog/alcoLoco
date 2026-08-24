@@ -20,9 +20,10 @@
 //! Rust exactly would take a Rust lexer, and reading SQL exactly an SQL parser,
 //! neither of which belongs in a test module. A guard that names its blind
 //! spots is worth more than one that promises they do not exist. The three
-//! sibling files of the module declare no statement at all, and a test holds
-//! them to it — against the modules `mod.rs` itself declares, so that a fourth
-//! file cannot join the module without that test saying so.
+//! sibling files of the module name no sqlx path at all, and a test holds them
+//! to that — which is the narrower thing it can actually read, standing in for
+//! "runs no statement" without proving it — over the file list `mod.rs` itself
+//! declares, so that a fourth file cannot join the module unnoticed.
 //!
 //! **Relations and types are schema qualified.** `pg_temp` is searched before
 //! `public`, so an unqualified `profile` can be shadowed by a temporary table
@@ -364,11 +365,13 @@ mod tests {
     //! **The list below is partial, and cannot be otherwise.** Three of the
     //! sets it touches are open: the grammar of SQL, the ways a Rust
     //! expression can reach a function, and the ways SQL text can enter this
-    //! file. A closed set is derived here rather than listed — whitespace is
-    //! Unicode's, escapes are Rust's grammar, the shapes of a declaration are
-    //! walked as tokens instead of matched as spellings, and the files of the
-    //! module are read off `mod.rs` — and those questions are settled, no list
-    //! of them surviving anywhere below. An open set admits no such move:
+    //! file. A closed set is derived here rather than listed — the whitespace
+    //! PostgreSQL recognises is five characters, escapes are Rust's grammar,
+    //! the shapes of a declaration are walked as tokens instead of matched as
+    //! spellings, an item ends at the `;` the language puts there, and the
+    //! files of the module are read off `mod.rs` — and those questions are
+    //! settled, no list of them surviving anywhere below. An open one admits
+    //! no such move:
     //! whatever is enumerated, the next issue may write the item that was not.
     //! What follows is what is **known** to get past, never what can.
     //!
@@ -429,13 +432,27 @@ mod tests {
     //! modules `mod.rs` declares; and the shape a hurried change actually takes
     //! — `sqlx::query(&format!(…))` — turns them red.
     //!
-    //! Three refusals below are deliberate rather than exact: they turn down
-    //! legitimate SQL and legitimate Rust that this module does not use,
-    //! because admitting them would take the parser this module has not got.
-    //! Each says so where it is made — see
-    //! [`no_statement_of_this_module_carries_an_interpolation_marker`] on
-    //! braces, and [`every_statement_of_this_module_is_a_named_constant`] on
-    //! qualified paths and on subscripts.
+    //! The refusals below are deliberate rather than exact. No count is given
+    //! for them on purpose: a count is one more thing to fall out of date, and
+    //! this one already had — it read "three" while there were more. Each turns
+    //! down legitimate SQL or legitimate Rust that this module does not use,
+    //! because admitting it would take the parser this module has not got, and
+    //! each says so where it is made:
+    //!
+    //! - every brace, so the PostgreSQL array literal `'{a,b}'` has to be
+    //!   written `ARRAY[…]` — see
+    //!   [`no_statement_of_this_module_carries_an_interpolation_marker`];
+    //! - a cast to a built-in type absent from the hand-written list in
+    //!   [`no_cast_of_this_module_can_be_shadowed_by_a_temporary_type`], which
+    //!   is partial too and says there what to do when it fires;
+    //! - a qualified path and a subscript at the call site — both in
+    //!   [`every_statement_of_this_module_is_a_named_constant`];
+    //! - a constant whose value is not a string literal written in this file,
+    //!   an alias of another constant of this same file included — see
+    //!   [`the_reader_finds_the_constants_this_file_declares`].
+    //!
+    //! Every one of them fails closed: each costs a rewrite, none a silent
+    //! pass.
 
     use super::*;
 
@@ -490,6 +507,32 @@ mod tests {
     /// it — is listed with the other known blind spots at the top of this
     /// module. That list is partial by construction, and says so there.
     fn string_literals_of_declarations(source: &str) -> Vec<String> {
+        declaration_literals(source, Scan::WholeSource)
+    }
+
+    /// The literals of the **first** `const` or `static` item of `source`, and
+    /// nothing after it.
+    ///
+    /// A Rust item ends at its `;`, which is the language's own boundary and
+    /// not a guess at one — the same kind of closed set as the whitespace and
+    /// the escapes this reader already derives instead of listing. Reading past
+    /// it is how [`literal_declared_for`] used to answer with the *next*
+    /// declaration's literal when an item held none of its own, and call a
+    /// statement guarded that it had never read.
+    fn literals_of_the_first_declaration(source: &str) -> Vec<String> {
+        declaration_literals(source, Scan::FirstDeclarationOnly)
+    }
+
+    /// How far [`declaration_literals`] reads.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Scan {
+        /// Every declaration of the source, to its end.
+        WholeSource,
+        /// The first one, stopping at the `;` that closes it.
+        FirstDeclarationOnly,
+    }
+
+    fn declaration_literals(source: &str, scan: Scan) -> Vec<String> {
         let mut literals = Vec::new();
         // The bracket depth the open declaration started at, if one is open.
         // Depth is what tells the `;` that ends an item from the one inside
@@ -527,6 +570,9 @@ mod tests {
                     // the declaration open over the rest of the file.
                     b';' if declared_at_depth.is_some_and(|opened| depth <= opened) => {
                         declared_at_depth = None;
+                        if scan == Scan::FirstDeclarationOnly {
+                            return literals;
+                        }
                     }
                     _ => {}
                 }
@@ -818,14 +864,13 @@ mod tests {
         names
     }
 
-    /// The value the declaration of `name` introduces, or `None` when this file
-    /// declares no such constant.
+    /// Where this file declares `name`, if it declares it.
     ///
     /// Located on [`code_of`] this file, so a mention in prose is not a
-    /// declaration, and read from the source at the same offset — blanking
+    /// declaration, and returned as an offset into the source itself — blanking
     /// leaves the code exactly where it stood, which
     /// [`the_reader_of_calls_looks_at_code_and_not_at_prose`] holds it to.
-    fn value_declared_for(name: &str) -> Option<String> {
+    fn declaration_offset_of(name: &str) -> Option<usize> {
         let code = code_of(SOURCE);
         for keyword in ["const", "static"] {
             let needle = format!("{keyword} {name}");
@@ -834,14 +879,27 @@ mod tests {
                 let start = from + at;
                 let after = &code[start + needle.len()..];
                 if !after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
-                    return string_literals_of_declarations(&SOURCE[start..])
-                        .into_iter()
-                        .next();
+                    return Some(start);
                 }
                 from = start + needle.len();
             }
         }
         None
+    }
+
+    /// The string literal the declaration of `name` gives it, when its value is
+    /// one and this file is where it is written.
+    ///
+    /// `None` covers two different answers, and the guard that calls this tells
+    /// them apart: this file declares no `name` at all, or it declares one
+    /// whose value is not a literal written here — `const PURGE: &str =
+    /// crate::PURGE_SQL;` names a constant of another file, whose text no guard
+    /// of this module ever reads.
+    fn literal_declared_for(name: &str) -> Option<String> {
+        let start = declaration_offset_of(name)?;
+        literals_of_the_first_declaration(&SOURCE[start..])
+            .into_iter()
+            .next()
     }
 
     #[test]
@@ -856,14 +914,18 @@ mod tests {
         //
         // Two refusals here are deliberate rather than exact, and neither is
         // an oversight. A qualified path such as `Q::SQL` is turned down
-        // because the reader reads *this* file: a statement named through a
-        // path could be declared somewhere no guard of this module would ever
-        // inspect, and the file-scoped guarantee would quietly stop covering
-        // the feature. A subscript — `sqlx::query(STATEMENTS[0])` — is turned
-        // down by the same rule, brackets being neither upper case nor an
-        // underscore: a module that wanted a table of statements would have to
-        // give each of them a name, which is what the guards below read. Both
-        // cost a rewrite, not a fix.
+        // because a statement named through a path is a statement whose text
+        // may be written in another file. That is the belt; the brace is
+        // `the_reader_finds_the_constants_this_file_declares`, which requires
+        // the constant a call names to carry a string literal of its own here.
+        // Until #6 the brace was missing and the belt was all there was, which
+        // was not enough: `const PURGE: &str = crate::PURGE_SQL;` handed
+        // `sqlx::query(PURGE)` a statement declared in `lib.rs` — unqualified
+        // relation, unqualified cast, call in plain sight — and left all
+        // thirteen guards green. A subscript, `sqlx::query(STATEMENTS[0])`, is
+        // turned down by the rule below, brackets being neither upper case nor
+        // an underscore: a module wanting a table of statements has to give
+        // each of them a name, which is what the guards read.
         for prefix in sql_constructor_prefixes() {
             let arguments = first_arguments_of(&prefix);
             for argument in &arguments {
@@ -921,13 +983,15 @@ mod tests {
     }
 
     #[test]
-    fn no_sql_of_the_profile_module_lives_outside_this_file() {
-        // What lets a guard scoped to one file speak for the feature: the
-        // handlers, the payload types and the validation touch no database at
-        // all, so a statement a profile write runs is declared here or nowhere
-        // — as far as the guards above see a statement at all, which is the
-        // reservation written at the head of this module and not repealed
-        // here.
+    fn no_file_of_the_profile_module_reaches_sqlx_but_this_one() {
+        // What lets a guard scoped to one file speak for the feature — and
+        // what is checked here is narrower than that property, which is why
+        // this test is named after the check and not after the conclusion. The
+        // siblings are required to name no `sqlx::` path at all. That stands in
+        // for "runs no statement" without proving it: a sibling calling into
+        // another module that runs SQL would pass. The name this test carried
+        // until #6 promised the conclusion, and it was green while a statement
+        // of this module lived in `lib.rs`.
         //
         // The files read here used to be three paths written out by hand, and
         // a fourth file added to the module was simply not read — measured on
@@ -981,8 +1045,11 @@ mod tests {
     /// reader this replaced looked for a keyword written with exactly one space
     /// after it, so `FROM` at the end of a line — the shape every statement of
     /// this file is written in — introduced no name at all as far as the guards
-    /// could see. Whitespace is a closed set, so tokenising is exact here in a
-    /// way that guessing at Rust spellings never was.
+    /// could see. The whitespace PostgreSQL recognises is space, tabulation,
+    /// newline, carriage return and form feed — five characters, which is
+    /// exactly what `is_ascii_whitespace` answers for — so tokenising is a
+    /// closed question here, in a way that guessing at Rust spellings never
+    /// was.
     fn sql_tokens(statement: &str) -> Vec<&str> {
         let bytes = statement.as_bytes();
         let mut tokens = Vec::new();
@@ -1141,11 +1208,53 @@ mod tests {
     }
 
     #[test]
-    fn every_cast_to_a_type_this_schema_owns_is_schema_qualified() {
+    fn no_cast_of_this_module_can_be_shadowed_by_a_temporary_type() {
         // A cast resolves through `search_path` too, so `$3::quantity_unit` is
-        // shadowable by a temporary type. Built-in types are not: `pg_catalog`
-        // comes first whatever `search_path` says.
-        const BUILT_IN: [&str; 2] = ["uuid", "text"];
+        // shadowable by a temporary type. A built-in is not: `pg_catalog` comes
+        // first whatever `search_path` says.
+        //
+        // The name of this test used to read the other way round — "every cast
+        // to a type this schema owns is schema qualified" — while what it
+        // does is refuse every cast to a type this schema does *not* own and
+        // nobody has listed.
+        //
+        // That list is written by hand and is **partial**: the catalogue of
+        // built-in types is PostgreSQL's, not something this module can derive,
+        // and #6 widened it rather than completing it. It fails closed, so it
+        // hides nothing — what it does is turn down a legitimate cast to a type
+        // no one has named yet. When that happens the fix is to add the type
+        // here, or to qualify the cast; never to loosen the check, which is the
+        // whole of what this guard is.
+        const BUILT_IN: &[&str] = &[
+            "bigint",
+            "bool",
+            "boolean",
+            "bytea",
+            "char",
+            "date",
+            "decimal",
+            "float4",
+            "float8",
+            "int",
+            "int2",
+            "int4",
+            "int8",
+            "integer",
+            "interval",
+            "json",
+            "jsonb",
+            "name",
+            "numeric",
+            "oid",
+            "real",
+            "smallint",
+            "text",
+            "time",
+            "timestamp",
+            "timestamptz",
+            "uuid",
+            "varchar",
+        ];
         for statement in declared_string_constants() {
             for name in cast_target_names(&statement) {
                 assert!(
@@ -1153,7 +1262,9 @@ mod tests {
                         || BUILT_IN
                             .iter()
                             .any(|built_in| name.eq_ignore_ascii_case(built_in)),
-                    "the cast to `{name}` is unqualified in: {statement}"
+                    "the cast to `{name}` is unqualified in: {statement}\n\
+                     if `{name}` is a built-in type, add it to `BUILT_IN` above; if it \
+                     belongs to this schema, write `public.{name}`"
                 );
             }
         }
@@ -1416,15 +1527,23 @@ mod tests {
             file!()
         );
         for name in named {
-            let value = value_declared_for(&name).unwrap_or_else(|| {
+            assert!(
+                declaration_offset_of(&name).is_some(),
+                "`{name}` is handed to a statement constructor but declared nowhere in {}",
+                file!()
+            );
+            let literal = literal_declared_for(&name).unwrap_or_else(|| {
                 panic!(
-                    "`{name}` is handed to a constructor but declared nowhere in {}",
+                    "`{name}` is declared in {} without a string literal of its own: its \
+                     value is a path or an expression, so the statement it stands for is \
+                     written somewhere no guard of this module reads. Declare the \
+                     statement here as a literal.",
                     file!()
                 )
             });
             assert!(
-                declared.contains(&value),
-                "the reader did not recover the statement `{name}` names: {value}"
+                declared.contains(&literal),
+                "the reader did not recover the statement `{name}` names: {literal}"
             );
         }
     }
