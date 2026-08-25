@@ -3,8 +3,8 @@
 //! This crate holds what every endpoint needs and nothing that belongs to a
 //! single one: configuration, connection pool, the error type and its RFC 7807
 //! rendering, the identifier and timestamp conventions, cursor pagination, and
-//! the generated OpenAPI document. Business routes are added by later issues on
-//! top of [`app`].
+//! the generated OpenAPI document. Business routes live in a module of their own
+//! and are mounted on [`app`] — [`profile`] is the first of them.
 //!
 //! Conventions posed here, to be reused rather than restated:
 //!
@@ -21,7 +21,6 @@ use axum::Router;
 use axum::http::{Method, Uri};
 use axum::routing::get;
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
 
 pub mod config;
 pub mod error;
@@ -30,12 +29,14 @@ pub mod health;
 pub mod id;
 pub mod openapi;
 pub mod pagination;
+pub mod profile;
 pub mod timestamp;
 
 pub use config::{Config, Environment};
 pub use error::{ApiError, FieldError, ProblemDetails};
 pub use id::new_id;
 pub use pagination::{Page, PageQuery, PageRequest};
+pub use profile::{Profile, ProfileSettings};
 pub use timestamp::Timestamp;
 
 /// How long a handler waits for a free connection before giving up.
@@ -65,7 +66,7 @@ impl AppState {
     ///
     /// Fails only when the connection string cannot be parsed.
     pub fn new(config: Config) -> Result<Self, sqlx::Error> {
-        let pool = PgPoolOptions::new()
+        let pool = db::pool_options()
             .max_connections(MAX_CONNECTIONS)
             .acquire_timeout(ACQUIRE_TIMEOUT)
             .connect_lazy(&config.database_url)?;
@@ -81,7 +82,13 @@ impl AppState {
 /// Kept separate from the binary so that tests drive the very same routes the
 /// server serves, without binding a socket.
 pub fn app(state: AppState) -> Router {
-    let mut router = Router::new().route("/health", get(health::health));
+    let mut router = Router::new()
+        .route("/health", get(health::health))
+        .route(
+            profile::COLLECTION_PATH,
+            get(profile::list).post(profile::create),
+        )
+        .route(profile::ITEM_PATH, get(profile::read).put(profile::update));
 
     if state.config.environment.exposes_openapi() {
         router = router.route(openapi::DOCUMENT_PATH, get(openapi::document));

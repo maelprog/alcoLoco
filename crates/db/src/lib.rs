@@ -4,6 +4,7 @@
 //! applies them and the development seed. It deliberately holds no query of the
 //! business modules: those belong to the modules themselves (SPEC.md §9).
 
+use sqlx::Executor;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
@@ -19,6 +20,92 @@ pub const DEFAULT_DATABASE_URL: &str = "postgres://alcoloco:alcoloco@localhost:5
 /// time so that applying them never depends on the current directory.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+/// The `search_path` the connections of this project's two pools run with.
+///
+/// `pg_temp` is **named**, and named last. That is the whole point of this
+/// constant. Left out of the list — which is what PostgreSQL does by default —
+/// the temporary schema is searched **first** for relations *and for types*, so
+/// any session may shadow a type a statement casts to:
+///
+/// ```text
+/// SELECT 'x'::text;                  -- x
+/// CREATE TEMP TABLE text (a int);
+/// SELECT 'x'::text;                  -- ERROR: malformed record literal: "x"
+/// ```
+///
+/// and, when the profile module still wrote `$1::uuid` unqualified, a temporary
+/// table named `uuid` turned its comparison into `ERROR: operator does not
+/// exist: pg_catalog.uuid > uuid`. Those statements name `pg_catalog` now, so
+/// that particular spelling is gone from the module; both errors were measured
+/// on `postgres:16-alpine`, the image of `docker-compose.yml`.
+///
+/// Naming `pg_temp` moves it to the position written here, which settles the
+/// resolution for every statement **the two pools built from
+/// [`pool_options`]** run — not only the statements someone remembered to
+/// qualify, and not only the shapes a text guard can recognise. The
+/// qualification guards of `crates/api/src/profile/store.rs` keep a convention
+/// worth keeping; they are no longer what stands between a temporary table and
+/// a mis-resolved name.
+///
+/// **What this does not reach**, so that the next reader does not take it for
+/// more than it is:
+///
+/// - a session that runs `DISCARD ALL` gets the default back — measured:
+///   `SHOW search_path` returns `"$user", public` straight after it. Nothing in
+///   this repository issues one, but a connection pooler in transaction mode
+///   does;
+/// - any client that is not one of these two pools — `psql`, an operations
+///   script, a future crate opening its own pool. For those,
+///   `crates/db/migrations/20260819090000_initial_schema.sql` still holds a live
+///   class (e) hole of its own: the deferred trigger
+///   `assert_profile_settings_version_present()` declares `target_profile uuid`
+///   unqualified. It is left alone on purpose — migrations are immutable here,
+///   and that line belongs to **#41**.
+///
+/// Closing the class *by construction* would take `ALTER DATABASE … SET
+/// search_path`, which no session can undo and no client can miss. That is
+/// #41's to decide; a session setting is what this issue can honestly do.
+///
+/// One thing this order **moves** rather than removes. PostgreSQL puts
+/// `pg_catalog` implicitly first when it is not named; naming it second puts it
+/// after `public`, so a type of `public` now shadows a built-in of the same
+/// name. Measured:
+///
+/// ```text
+/// SET search_path = public, pg_catalog, pg_temp;
+/// CREATE DOMAIN public.text AS pg_catalog.int4;
+/// SELECT pg_typeof(NULL::text);   -- public   (pg_catalog under the default)
+/// ```
+///
+/// That is a strictly better place for the risk to sit: shadowing now takes DDL
+/// on `public`, where before it took a temporary table any session may create
+/// with no privilege at all. And `public` has to come first regardless: with
+/// `pg_catalog` ahead of it, a migration does not create its objects elsewhere,
+/// it **fails** — `CREATE TABLE zzz_probe (a int)` answers `ERROR: permission
+/// denied to create "pg_catalog.zzz_probe"`, measured.
+pub const SEARCH_PATH: &str = "public, pg_catalog, pg_temp";
+
+/// Pool options carrying what a connection of this project needs.
+///
+/// The project's two pools are built from here — this crate's [`connect`] and
+/// the API's state — and a test covers each. Nothing in the language prevents a
+/// third being built elsewhere with `PgPoolOptions::new()`, and no guard would
+/// notice: what holds this is the two tests and this sentence, not the
+/// structure. `AppState::new` cannot simply call [`connect`] instead, because
+/// its pool is deliberately lazy — the server must come up and answer
+/// `GET /health` with the database down.
+#[must_use]
+pub fn pool_options() -> PgPoolOptions {
+    PgPoolOptions::new().after_connect(|connection, _metadata| {
+        Box::pin(async move {
+            connection
+                .execute(format!("SET search_path = {SEARCH_PATH}").as_str())
+                .await?;
+            Ok(())
+        })
+    })
+}
+
 /// Connection string to use, from the environment or from the local default.
 #[must_use]
 pub fn database_url() -> String {
@@ -31,7 +118,7 @@ pub fn database_url() -> String {
 ///
 /// Fails when the server is unreachable or refuses the credentials.
 pub async fn connect() -> Result<PgPool, sqlx::Error> {
-    PgPoolOptions::new()
+    pool_options()
         .max_connections(4)
         .connect(&database_url())
         .await
@@ -56,6 +143,10 @@ pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
 /// # Errors
 ///
 /// Fails when the schema cannot be dropped, or when a migration fails.
+/// A `search_path` naming a schema that does not exist is not an error:
+/// PostgreSQL skips the missing entry, so the window between the two statements
+/// below is harmless. Probed on #6 rather than assumed — see
+/// `crates/api/tests/database.rs`.
 pub async fn reset(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
         .execute(pool)

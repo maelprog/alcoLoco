@@ -35,6 +35,13 @@ export interface ProblemDetails {
  * `type` is the stable contract: it is what the front branches on. `title` is
  * an English summary that may be reworded at any time, so nothing here — no
  * message lookup, no test, no `switch` — may key on it.
+ *
+ * The mirroring is checked, in both directions, by
+ * `crates/api/tests/front_contract.rs`: it reads this object and `error.rs` and
+ * compares them, so a value rewritten here and a seventh kind added there both
+ * fail the Rust gate. Nothing in `web/` can catch either — a test living here
+ * would be reading these very constants. Keep this object a plain literal of
+ * string literals, which is the shape that test parses.
  */
 export const ProblemType = {
   badRequest: '/problems/bad_request',
