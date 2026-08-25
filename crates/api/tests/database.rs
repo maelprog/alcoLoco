@@ -1124,8 +1124,8 @@ async fn the_pool_the_api_builds_names_pg_temp_last_on_every_connection() {
 /// what puts the requests on the session owning the temporary tables — and what
 /// covers the other of the project's two pool constructions.
 #[tokio::test]
-async fn a_temporary_table_does_not_shadow_the_types_the_statements_cast_to() {
-    let test = "a_temporary_table_does_not_shadow_the_types_the_statements_cast_to";
+async fn the_endpoints_answer_on_a_connection_that_owns_shadowing_temporary_tables() {
+    let test = "the_endpoints_answer_on_a_connection_that_owns_shadowing_temporary_tables";
     let Some(url) = database_url(test) else {
         return;
     };

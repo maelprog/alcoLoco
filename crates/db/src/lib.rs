@@ -20,7 +20,7 @@ pub const DEFAULT_DATABASE_URL: &str = "postgres://alcoloco:alcoloco@localhost:5
 /// time so that applying them never depends on the current directory.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
-/// The `search_path` every connection this project opens runs with.
+/// The `search_path` the connections of this project's two pools run with.
 ///
 /// `pg_temp` is **named**, and named last. That is the whole point of this
 /// constant. Left out of the list — which is what PostgreSQL does by default —
@@ -79,11 +79,13 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 ///
 /// That is a strictly better place for the risk to sit: shadowing now takes DDL
 /// on `public`, where before it took a temporary table any session may create
-/// with no privilege at all. And `public` has to come first regardless, or the
-/// migrations would create their objects somewhere else.
+/// with no privilege at all. And `public` has to come first regardless: with
+/// `pg_catalog` ahead of it, a migration does not create its objects elsewhere,
+/// it **fails** — `CREATE TABLE zzz_probe (a int)` answers `ERROR: permission
+/// denied to create "pg_catalog.zzz_probe"`, measured.
 pub const SEARCH_PATH: &str = "public, pg_catalog, pg_temp";
 
-/// Pool options carrying what every connection of this project needs.
+/// Pool options carrying what a connection of this project needs.
 ///
 /// The project's two pools are built from here — this crate's [`connect`] and
 /// the API's state — and a test covers each. Nothing in the language prevents a

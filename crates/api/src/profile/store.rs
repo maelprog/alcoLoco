@@ -31,12 +31,16 @@
 //! (class (e) of the migration of #2).
 //!
 //! What closes that class is **not** the guard in this file. It is
-//! [`db::SEARCH_PATH`], which names `pg_temp` last on every connection the
-//! project opens: named, the temporary schema is searched where it is written,
-//! and the question is settled for every statement this project runs — those
-//! spelled in ways no text guard can read, and those not written yet. The rule
-//! is kept here as a convention and as a second line of defence should that
-//! setting ever go missing. No guard in this file reads `db::SEARCH_PATH` —
+//! [`db::SEARCH_PATH`], applied by [`db::pool_options`]: named, the temporary
+//! schema is searched where it is written, and the question is settled for the
+//! statements the two pools built from there run — including the ones spelled
+//! in ways no text guard can read. It is settled for those two pools and no
+//! further: nothing prevents a third being opened with `PgPoolOptions::new()`,
+//! `DISCARD ALL` puts the default back, and a client outside them — `psql`, an
+//! operations script — never had the setting at all. The doc of
+//! [`db::SEARCH_PATH`] lists that, and closing the class by construction is
+//! #41's to decide. The rule is kept here as a convention and as a second line
+//! of defence should that setting ever go missing. No guard in this file reads `db::SEARCH_PATH` —
 //! none could, these tests reading text and not a live connection; what holds
 //! the setting is `the_pool_the_api_builds_names_pg_temp_last_on_every_connection`
 //! in `crates/api/tests/database.rs`, which asks a real connection. The rule
@@ -1244,11 +1248,12 @@ mod tests {
         // names in relation position are looked at: a column called `sex` is not
         // one, and neither is the `profile` inside `profile_id`.
         //
-        // `db::SEARCH_PATH` is what actually closes the class, by naming
-        // `pg_temp` last on every connection. This keeps the convention and
-        // would catch a statement written before that setting takes effect; it
-        // is not the guarantee, and the head of this module says which reads
-        // this file cannot make.
+        // `db::SEARCH_PATH` is what settles the class for the statements the
+        // project's two pools run, by naming `pg_temp` last on their
+        // connections — and for those two pools only; its own doc says what it
+        // does not reach. This keeps the convention and would catch a statement
+        // written before that setting takes effect; it is not the guarantee,
+        // and the head of this module says which reads this file cannot make.
         for statement in declared_string_constants() {
             // Written out because SQL offers no closed grammar to derive them
             // from, which is why this list is partial and stays partial:
@@ -1299,11 +1304,11 @@ mod tests {
         // parses it as a type keyword.
         //
         // And none of this is what keeps the database safe any more.
-        // `db::SEARCH_PATH` names `pg_temp` last on every connection this
-        // project opens, which settles the question for every statement it
-        // runs — including the ones no text guard can read. What lives on here
-        // is the convention, and a second line of defence if that setting ever
-        // goes missing.
+        // `db::SEARCH_PATH` names `pg_temp` last on the connections of the
+        // project's two pools, which settles the question for the statements
+        // those pools run — including the ones no text guard can read, and no
+        // further than them. What lives on here is the convention, and a second
+        // line of defence if that setting ever goes missing.
         const BUILT_IN: &[&str] = &[
             "bigint",
             "boolean",
