@@ -4,5 +4,6 @@ description = "Pure blood alcohol computation engine, free of any I/O or framewo
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
