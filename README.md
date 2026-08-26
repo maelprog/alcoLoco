@@ -1,188 +1,135 @@
 # alcoLoco
 
-Application de suivi d'alcoolémie. Chaque utilisateur saisit ses consommations — boissons simples
-ou cocktails composés — et l'application calcule puis affiche son taux d'alcoolémie dans le temps,
-individuellement et en comparaison des autres participants d'un même événement.
+Blood alcohol tracking application. Each user records what they drink — plain drinks or multi-part
+cocktails — and the application computes and displays their blood alcohol concentration over time,
+both individually and side by side with the other participants of a same event.
 
-> ⚠️ **Avertissement** — L'alcoolémie affichée est une **estimation statistique**. Elle ne peut en
-> aucun cas servir à déterminer l'aptitude à conduire.
+> ⚠️ **Disclaimer** — The blood alcohol concentration shown is a **statistical estimate**. It must
+> never be used to decide whether someone is fit to drive.
 
 ---
 
-## État du projet
+## Project status
 
-Squelette technique en place : workspace Rust, application Angular, PostgreSQL local et CI. Aucune
-fonctionnalité métier n'est encore implémentée — le backend n'expose qu'un point de santé et le
-front qu'une page vide.
+The technical skeleton is in place: Rust workspace, Angular application, local PostgreSQL and CI.
+No business feature has been implemented yet — the backend only exposes a health endpoint and the
+frontend only serves an empty page.
 
-La source de vérité unique est **[SPEC.md](SPEC.md)**. Toute question de périmètre, de modèle de
-domaine ou de règle de calcul s'y tranche ; ce README n'en est qu'un résumé d'entrée.
+The single source of truth is **[docs/SPEC.md](docs/SPEC.md)**. Every question about scope, domain
+model or calculation rules is settled there; this README is only an entry-point summary.
 
-## Stack technique
+## Tech stack
 
-| Couche | Techno |
+| Layer | Technology |
 |---|---|
-| Backend | Rust — framework **axum** |
+| Backend | Rust — **axum** framework |
 | Frontend | TypeScript — **Angular** |
-| Base de données | **PostgreSQL** |
+| Database | **PostgreSQL** |
 
 ---
 
-## Démarrage local
+## Local setup
 
-### Prérequis
+### Prerequisites
 
-| Outil | Version de référence | Sert à |
+| Tool | Reference version | Used for |
 |---|---|---|
-| Docker + Docker Compose | v2 (`docker compose`) | base de données locale |
-| Rust (`rustup`) | **1.97.1**, avec `rustfmt` et `clippy` | backend |
+| Docker + Docker Compose | v2 (`docker compose`) | local database |
+| Rust (`rustup`) | **1.97.1**, with `rustfmt` and `clippy` | backend |
 | Node.js + npm | **22.x** | frontend |
 
-La version de Rust est celle épinglée par la CI (`.github/workflows/ci.yml`) : s'en écarter en local
-expose à des écarts de `rustfmt` et de `clippy`.
+The Rust version is the one pinned by CI (`.github/workflows/ci.yml`); using a different one
+locally invites `rustfmt` and `clippy` discrepancies.
 
-### Arborescence
+### Repository layout
 
 ```
-crates/api/       binaire axum — point d'entrée HTTP
-crates/db/        schéma PostgreSQL, migrations et jeu de données de développement
-crates/domain/    moteur de calcul, sans I/O ni framework (SPEC.md §7, §9)
-web/              application Angular
-docker-compose.yml  PostgreSQL local
+crates/api/         axum binary — HTTP entry point
+crates/db/          PostgreSQL schema, migrations and development seed data
+crates/domain/      calculation engine, free of I/O and framework (docs/SPEC.md §7, §9)
+web/                Angular application
+docs/               project documentation, including the spec (docs/SPEC.md)
+docker-compose.yml  local PostgreSQL
 ```
 
-### Base de données
+### Database
 
 ```bash
-docker compose up -d          # démarre PostgreSQL 16
-docker compose logs -f db     # suit les journaux
-docker compose down           # arrête ; ajouter -v pour effacer les données
+docker compose up -d          # starts PostgreSQL 16
+docker compose logs -f db     # follows the logs
+docker compose down           # stops; add -v to wipe the data
 ```
 
-Le service écoute sur `localhost:5432` et les identifiants par défaut sont
-`alcoloco` / `alcoloco` / base `alcoloco`. Ils sont surchargeables par variables d'environnement —
-utile pour faire tourner plusieurs instances en parallèle :
+The service listens on `localhost:5432` and the default credentials are `alcoloco` / `alcoloco`,
+database `alcoloco`. They can be overridden through environment variables — handy to run several
+instances in parallel:
 
 ```bash
-POSTGRES_PORT=55432 docker compose -p alcoloco-autre up -d
+POSTGRES_PORT=55432 docker compose -p alcoloco-other up -d
 ```
 
-| Variable | Défaut |
+| Variable | Default |
 |---|---|
 | `POSTGRES_USER` | `alcoloco` |
 | `POSTGRES_PASSWORD` | `alcoloco` |
 | `POSTGRES_DB` | `alcoloco` |
 | `POSTGRES_PORT` | `5432` |
 
-### Migrations et jeu de données de développement
+### Migrations and development seed data
 
-Le schéma vit dans `crates/db/migrations/`. Les migrations sont **embarquées à la compilation** et
-appliquées par l'outil `db`, qui les enregistre dans la table `_sqlx_migrations` : relancer
-`migrate` sur une base déjà à jour ne réexécute rien.
+The schema lives in `crates/db/migrations/`. Migrations are **embedded at compile time** and applied
+by the `db` tool, which records them in the `_sqlx_migrations` table: re-running `migrate` against
+an up-to-date database replays nothing.
 
 ```bash
-cargo run -p db -- migrate    # applique les migrations en attente
-cargo run -p db -- seed       # insère le jeu de données de développement (base vide)
-cargo run -p db -- reset      # supprime le schéma public, remigre, puis seed
+cargo run -p db -- migrate    # applies pending migrations
+cargo run -p db -- seed       # inserts the development seed data (empty database)
+cargo run -p db -- reset      # drops the public schema, re-migrates, then seeds
 ```
 
-La chaîne de connexion vient de `DATABASE_URL`, par défaut
-`postgres://alcoloco:alcoloco@localhost:5432/alcoloco` — les identifiants du `docker-compose.yml`.
+The connection string comes from `DATABASE_URL`, defaulting to
+`postgres://alcoloco:alcoloco@localhost:5432/alcoloco` — the credentials from `docker-compose.yml`.
 
-Les migrations sont **append-only** une fois sur `main` : on n'édite jamais un fichier déjà appliqué
-(l'outil rejetterait la somme de contrôle), on en ajoute un nouveau.
+Migrations are **append-only** once merged to `main`: never edit a file that has already been
+applied (the tool would reject the checksum), add a new one instead.
 
-Points de schéma utiles à connaître avant d'écrire une requête :
+Schema facts worth knowing before writing a query:
 
-- les identifiants sont des `uuid` **sans valeur par défaut** : l'application fournit un **UUID v7**
-  (PostgreSQL 16 n'a pas de `uuidv7()` natif) ;
-- les paramètres physiologiques (poids, taille, sexe, date de naissance) vivent **uniquement** dans
-  `profile_settings_version` ; `profile` ne porte que l'identité et les préférences de saisie, qui
-  ne sont pas versionnées ;
-- tout profil possède **au moins une version** de paramètres : deux triggers de contrainte différés
-  rejettent au `COMMIT` un profil créé sans version, la suppression de sa dernière version et
-  l'`UPDATE` qui déplacerait cette dernière version vers un autre profil ; un troisième trigger,
-  `profile_keeps_its_id`, rend `profile.id` **immuable** et refuse la renumérotation d'un profil
-  **sur-le-champ**. Sans lui, supprimer toutes les versions d'un profil puis renuméroter ce profil
-  dans la même transaction validait sans erreur : la clé étrangère est `NO ACTION` sur `UPDATE` et
-  ne rejette que **tant qu'une version pointe encore** sur l'ancien identifiant. L'ordre d'écriture
-  n'est pas libre pour autant : le profil doit précéder sa première version, la clé étrangère
-  `profile_settings_version_profile_id_fkey` n'étant **pas** `DEFERRABLE` — l'ordre inverse est
-  refusé **sur-le-champ** (23503), et `SET CONSTRAINTS ALL DEFERRED` n'y change rien ;
-- **portée exacte de cette garantie**, et elle n'est pas absolue — `SPEC.md` §5.1 et §10.0-L en sont
-  la source de vérité, ce qui suit n'en est que le résumé. Ce qui tient : une transaction
-  **s'exécutant seule** qui laisserait un profil existant sans version ne commite pas, pour
-  `INSERT`, `UPDATE`, `DELETE`, `COPY` et `MERGE`. Cinq classes y échappent, toutes reproduites
-  sur PostgreSQL 16 : **(a)** `TRUNCATE profile_settings_version`, qui ne parcourt aucune ligne et
-  ne déclenche donc aucun trigger `FOR EACH ROW` (les profils restent, leurs versions
-  disparaissent) ; **(b)** la désactivation ou la suppression des triggers
-  (`SET session_replication_role = replica`, `ALTER TABLE … DISABLE TRIGGER USER`, `DROP TRIGGER`) ;
-  **(c)** la vérification étant différée, la transaction **qui écrit** elle-même, qui lit son propre
-  état intermédiaire entre le `DELETE` et le `COMMIT` — elle ne laisse rien de durable pour autant :
-  ou bien le profil est encore à zéro version au `COMMIT` et le `COMMIT` est refusé, ou bien elle a
-  remis une version et valide sur un état cohérent ;
-  **(d)** la **concurrence** : deux transactions simultanées qui suppriment chacune une *autre* des
-  versions d'un même profil valident **toutes deux sans erreur**, chacune voyant subsister la
-  version que l'autre retire, et le profil reste durablement à zéro version ;
-  **(e)** l'**occultation par `pg_temp`**, **fermée** depuis, et ouverte à tout rôle capable
-  d'écrire tant qu'elle ne l'était pas : le `search_path` consulte `pg_temp` avant `public`, et le
-  privilège `TEMP` sur une base appartient à `PUBLIC` par défaut, si bien qu'un rôle n'ayant reçu
-  que `SELECT`, `INSERT`, `UPDATE` et `DELETE` pouvait créer une table temporaire `profile` vide et
-  faire lire *celle-là* à la fonction de trigger, dont le retour anticipé se déclenchait alors à
-  chaque appel — les trois triggers devenaient inopérants d'un coup et un profil pouvait perdre
-  durablement toutes ses versions ; la même occultation sur `profile_settings_version` injectait un
-  poids, une taille, un sexe et une date de naissance fabriqués dans chaque réponse de
-  `profile_settings_at()`, donc dans chaque courbe. Ce qui la ferme est la **qualification par le
-  schéma** : les corps de fonction écrivent `public.profile` et `public.profile_settings_version`,
-  et un nom qualifié ne consulte aucun `search_path`. Qualification plutôt que clause `SET
-  search_path`, délibérément : `SET` rendrait `profile_settings_at()` opaque à l'inlining, et elle
-  est sur le chemin chaud de chaque requête de courbe. Les classes (a), (b) et (d) laissent un état
-  durablement incohérent, où `profile_settings_at()` ne rend aucune ligne pour un profil qui existe
-  toujours, sans rien signaler, et (e) en laissait un aussi tant qu'elle était ouverte ;
-- **qui atteint quoi** : (a) exige le privilège `TRUNCATE` et (b) le superutilisateur, la propriété
-  de la table ou un `GRANT SET ON PARAMETER session_replication_role` (PostgreSQL 15 et suivants)
-  — un rôle limité au DML n'atteint ni l'une ni l'autre, et toutes deux
-  relèvent d'une restauration, d'une remise à zéro de fixtures ou d'un import en masse. Cela vaut
-  pour (a) et (b) **seulement**, et ne doit pas se lire « les droits DML sont sans danger ». **(c),
-  (d) et (e), si** : (c) et (d) sont des écritures DML ordinaires, que **n'importe quel** rôle
-  capable d'écrire atteint, à commencer par celui de l'application ; (e) n'exigeait même pas cela,
-  le privilège `TEMP` que tout rôle détient par défaut suffisait, et c'était la plus large des cinq
-  tant qu'elle est restée ouverte — un rôle limité au DML atteignait par elle le trou durable de
-  (a) et (b) sans posséder aucun de leurs privilèges, et les **valeurs rendues** par-dessus. Aucune
-  révocation ne la ferme en pratique, seule la qualification par le schéma la ferme, et elle est en
-  place. (d) est ouverte dans le régime nominal, celui du
-  niveau d'isolation par défaut de PostgreSQL comme du pilote employé par le backend ; seules deux
-  transactions validant l'une et l'autre en `SERIALIZABLE` sont refusées (`40001`). **Conséquence :
-  aucune fonctionnalité — #7, #16 ou une autre — ne peut s'appuyer sur cet invariant en présence
-  d'écritures concurrentes tant que l'issue #43 n'est pas fermée** ; #43 porte la fermeture réelle
-  et bloque #7 ;
-- `profile_settings_at(profile_id, instant)` rend la version en vigueur à un instant donné, avec
-  repli sur la plus ancienne (borne basse ouverte). Elle rend **zéro ou une ligne** (`RETURNS SETOF`)
-  et **aucune ligne** pour un profil inconnu ou un instant NULL, jamais un repli silencieux. La
-  contrepartie du `SETOF` a trois volets : la forme scalaire
-  `(profile_settings_at($1, $2)).weight_kg` rend zéro ligne au lieu d'un NULL ; elle est de plus
-  **illégale** dans `WHERE`, dans une condition `JOIN … ON`, dans `CASE` et en argument d'agrégat,
-  refusée dès l'analyse, qu'une version applicable existe ou non ; et en liste de sélection, un
-  résultat vide fait disparaître **la ligne entière** de la requête englobante — `SELECT p.id,
-  (profile_settings_at(p.id, NULL)).weight_kg FROM profile p` ne rend aucune ligne pour un profil
-  valide qui possède bien une version. D'où la forme à écrire :
-  `SELECT * FROM profile_settings_at($1, $2)`, ou `LEFT JOIN LATERAL … ON true` lorsque la ligne de
-  la requête englobante doit survivre à un résultat vide ;
-- une version ne stocke que sa borne basse : la borne haute est le `valid_from` suivant, ce qui rend
-  chevauchements et trous **non représentables** ;
-- les durées sont des entiers de secondes (`*_duration_seconds`), les volumes des millilitres
-  (`*_ml`).
+- identifiers are `uuid` columns **without a default**: the application supplies a **UUID v7**
+  (PostgreSQL 16 has no native `uuidv7()`);
+- physiological parameters (weight, height, sex, date of birth) live **only** in
+  `profile_settings_version`; `profile` carries nothing but identity and input preferences, which
+  are not versioned;
+- a version stores only its lower bound: the upper bound is the next `valid_from`, which makes
+  overlaps and gaps **unrepresentable**;
+- `profile_settings_at(profile_id, instant)` returns the version in effect at a given instant,
+  falling back to the oldest one (open lower bound). It `RETURNS SETOF`, so write
+  `SELECT * FROM profile_settings_at($1, $2)`, or `LEFT JOIN LATERAL … ON true` when the enclosing
+  row must survive an empty result. The scalar form `(profile_settings_at($1, $2)).weight_kg` is
+  either illegal or silently drops the whole enclosing row;
+- durations are integer seconds (`*_duration_seconds`), volumes are millilitres (`*_ml`).
+
+Every profile is meant to hold **at least one settings version**, and deferred constraint triggers
+enforce that for a transaction running on its own. The guarantee is **not absolute**: bulk wipes
+(`TRUNCATE`), anything that disables the triggers, and above all **concurrent writes** can leave a
+profile durably versionless, with `profile_settings_at()` returning no row for a profile that still
+exists and signalling nothing. **Consequence: no feature — #7, #16 or any other — may rely on this
+invariant in the presence of concurrent writes until issue
+[#43](https://github.com/maelprog/alcoLoco/issues/43) is closed**; #43 carries the actual fix and
+blocks [#7](https://github.com/maelprog/alcoLoco/issues/7). The exhaustive account — every escape
+class, who can reach it and with which privileges — is in
+[§5.1](docs/SPEC.md#51-profils) and [§10.0-L](docs/SPEC.md#100-décisions-actées) of the spec.
 
 ### Backend
 
 ```bash
-cargo run -p api              # sert sur http://localhost:8080
+cargo run -p api              # serves on http://localhost:8080
 curl http://localhost:8080/health   # -> ok
 ```
 
-L'adresse d'écoute est surchargeable par `ALCOLOCO_API_ADDR` (défaut `0.0.0.0:8080`).
+The listen address can be overridden with `ALCOLOCO_API_ADDR` (default `0.0.0.0:8080`).
 
-Contrôles qualité, identiques à ceux de la CI :
+Quality checks, identical to CI:
 
 ```bash
 cargo fmt --all -- --check
@@ -195,105 +142,108 @@ cargo test --workspace
 ```bash
 cd web
 npm ci
-npm start                     # sert sur http://localhost:4200
-npm run build                 # bundle de production dans web/dist/
+npm start                     # serves on http://localhost:4200
+npm run build                 # production bundle in web/dist/
 ```
 
-Contrôles qualité, identiques à ceux de la CI :
+Quality checks, identical to CI:
 
 ```bash
 npm run lint
 npm run test -- --watch=false
 ```
 
-Les tests unitaires du front tournent sous **Vitest** avec l'environnement `jsdom` : aucun
-navigateur n'est nécessaire.
+Frontend unit tests run under **Vitest** with the `jsdom` environment: no browser required.
 
-### Intégration continue
+### Continuous integration
 
-Le workflow `.github/workflows/ci.yml` s'exécute sur chaque *pull request* et sur `main`. Il porte
-deux jobs : **`rust`** (format, clippy, tests) et **`web`** (lint, tests).
+The `.github/workflows/ci.yml` workflow runs on every pull request and on `main`. It carries two
+jobs: **`rust`** (format, clippy, tests) and **`web`** (lint, tests).
 
-## Périmètre V1
+## V1 scope
 
-- Profils prédéfinis, **sans authentification** — sélection dans une liste au démarrage.
-- Création d'événements et ajout direct de profils participants (pas d'invitation).
-- Saisie d'une consommation selon 3 modes : **saisie libre**, **menu mixologie** (boisson composée
-  de plusieurs composantes), **duplication depuis l'historique**.
-- Bibliothèque de boissons de base fournie par l'application, en lecture seule, avec recherche
-  textuelle.
-- Calcul d'alcoolémie par la **formule de Widmark**, volume de diffusion estimé par les équations
-  de **Watson**.
-- Affichage de l'alcoolémie instantanée (g/L de sang) et des courbes des participants en parallèle
-  sur la durée de l'événement.
-- Historique des consommations par profil, toutes soirées confondues, modifiable et supprimable.
-- Historique versionné des paramètres physiologiques du profil (poids, taille, sexe, âge).
-- Note de ressenti à la saisie, avec valeur par défaut suggérée selon l'alcoolémie.
+- Predefined profiles, **no authentication** — picked from a list at startup.
+- Event creation and direct addition of participating profiles (no invitations).
+- Drink entry in 3 modes: **free-form entry**, **mixology menu** (a drink made of several
+  components), **duplication from history**.
+- A read-only base drink library shipped with the application, with full-text search.
+- Blood alcohol computed with the **Widmark formula**, the volume of distribution estimated from the
+  **Watson** equations.
+- Display of the instantaneous blood alcohol concentration (g/L of blood) and of the participants'
+  curves side by side over the duration of the event.
+- Per-profile drink history across all events, editable and deletable.
+- Versioned history of the profile's physiological parameters (weight, height, sex, age).
+- A subjective rating captured at entry time, with a default value suggested from the computed
+  blood alcohol concentration.
 
-### Reporté en V2+
+### Deferred to V2+
 
-Authentification et comptes · toggle « suivre la consommation » par événement · bibliothèque
-personnelle évolutive et bibliothèques des autres participants · export CSV · profil d'alcoolémie
-personnalisé avec calibrage · extraction du service mixologie en microservice · intégration à
+Authentication and accounts · per-event "track my drinking" toggle · growable personal library and
+access to other participants' libraries · CSV export · personalised blood alcohol profile with
+calibration · extraction of the mixology service into a microservice · integration with
 *Manage Our Home*.
 
-## Modèle de domaine
+## Domain model
 
-- **Profile** — identité, paramètres physiologiques courants et préférences de saisie. En base, les
-  paramètres physiologiques ne sont pas dupliqués sur `profile` : les « courants » sont ceux de la
-  version en vigueur maintenant.
-- **ProfileSettingsVersion** — snapshot horodaté des paramètres physiologiques ; chaque consommation
-  est rattachée à la version en vigueur à son heure d'ingestion, pour rejouer fidèlement les courbes
-  passées.
-- **Event** — un événement daté et ses profils participants.
-- **Drink** — une boisson consommée : nom, heure et durée d'ingestion, durée d'absorption, note de
-  ressenti optionnelle, événement optionnel, une ou plusieurs composantes.
-- **DrinkComponent** — nom, degré d'alcool (% vol), quantité en cL ou en % du volume total.
-- **LibraryItem** — entrée de la bibliothèque de base : nom, degré par défaut, catégorie
-  (alcool / soft).
+- **Profile** — identity, current physiological parameters and input preferences. In the database
+  the physiological parameters are not duplicated on `profile`: the "current" ones are those of the
+  version in effect right now.
+- **ProfileSettingsVersion** — a timestamped snapshot of the physiological parameters; every drink
+  is attached to the version in effect at its ingestion time, so that past curves can be replayed
+  faithfully.
+- **Event** — a dated event and its participating profiles.
+- **Drink** — a consumed drink: name, ingestion time and duration, absorption duration, optional
+  subjective rating, optional event, one or more components.
+- **DrinkComponent** — name, alcohol by volume (% vol), quantity in cL or as a percentage of the
+  total volume.
+- **LibraryItem** — an entry of the base library: name, default ABV, category (alcoholic / soft).
 
-Relation clé : une consommation appartient **toujours** à l'historique du profil ; le rattachement à
-un événement est optionnel.
+Key relationship: a drink **always** belongs to the profile's history; attaching it to an event is
+optional.
 
-## Moteur de calcul
+## Calculation engine
 
-Détail complet en [§6 de la spec](SPEC.md#6-règles-de-calcul-de-référence).
+Full detail in [§6 of the spec](docs/SPEC.md#6-règles-de-calcul-de-référence).
 
-- **Alcool ingéré** : `A (g) = volume(mL) × degré(%) / 100 × 0,789`, sommé sur les composantes.
-- **Volume de diffusion** : eau corporelle totale (TBW) par **Watson (1980)** à partir du poids, de
-  la taille, de l'âge et du sexe ; `C₀ = 0,806 × A / TBW`. Repli sur les constantes de Widmark
-  (`r` = 0,68 / 0,55) si une donnée manque. L'âge est celui de l'heure d'ingestion de la boisson.
-- **Élimination** : ordre zéro, `β = 0,15 g/L/h` par défaut, **bornée à zéro** — aucune dette
-  reportée sur une consommation ultérieure.
-- **Profil d'absorption** : **trapèze** (convolution durée d'ingestion × durée d'absorption), retenu
-  comme *défaut d'implémentation*. Il dégénère vers la rampe linéaire et vers Widmark pur selon les
-  durées saisies.
-- **Superposition** : les débits d'apparition se somment, mais l'élimination `β` est globale au
-  corps et ne s'applique **qu'une seule fois**. Courbe obtenue par intégration en avant à pas fixe.
+- **Ingested alcohol**: `A (g) = volume(mL) × abv(%) / 100 × 0.789`, summed over the components.
+- **Volume of distribution**: total body water (TBW) from **Watson (1980)** using weight, height,
+  age and sex; `C₀ = 0.806 × A / TBW`. Falls back to the Widmark constants (`r` = 0.68 / 0.55) when
+  a datum is missing. Age is the age at the drink's ingestion time.
+- **Elimination**: zero-order, `β = 0.15 g/L/h` by default, **clamped at zero** — no debt carried
+  over to a later drink.
+- **Absorption profile**: **trapezoid** (convolution of ingestion duration with absorption
+  duration), adopted as the *implementation default*. It degenerates into the linear ramp and into
+  pure Widmark depending on the entered durations.
+- **Superposition**: appearance rates add up, but the elimination term `β` is global to the body and
+  applies **only once**. The curve is obtained by forward integration at a fixed step.
 
-Le calcul est **déterministe et rejouable** : à historique identique, courbe identique. Le moteur
-est isolé dans un module dédié, testable unitairement.
+The computation is **deterministic and replayable**: identical history, identical curve. The engine
+is isolated in a dedicated module and unit-testable.
 
-> 🚧 Le choix du profil d'absorption **n'est pas définitif** : il doit être confronté aux variantes
-> (Widmark pur, rampe linéaire, exponentielle d'ordre 1) **avant la release V1** — voir
-> [§10.1](SPEC.md#101-modèle-dingestion-et-dabsorption--défaut-retenu-arbitrage-final-avant-release-v1-37)
-> et l'issue [#37](https://github.com/maelprog/alcoLoco/issues/37).
+> 🚧 The choice of absorption profile is **not final**: it must be compared against the alternatives
+> (pure Widmark, linear ramp, first-order exponential) **before the V1 release** — see
+> [§10.1](docs/SPEC.md#101-modèle-dingestion-et-dabsorption--défaut-retenu-arbitrage-final-avant-release-v1-37)
+> and issue [#37](https://github.com/maelprog/alcoLoco/issues/37).
 
 ## Architecture
 
-La V1 est monolithique, mais découpée pour anticiper trois extractions en microservices : la
-**mixologie / bibliothèque**, les **groupes & événements** (délégués à *Manage Our Home*) et le
-**moteur d'alcoolémie** (service de calcul pur, sans état). En pratique : modules Rust séparés,
-frontières explicites, aucun accès direct aux tables d'un module depuis un autre.
+V1 is a monolith, but it is carved up to anticipate three microservice extractions: **mixology /
+library**, **groups & events** (to be delegated to *Manage Our Home*) and the **blood alcohol
+engine** (a pure, stateless computation service). Concretely: separate Rust modules, explicit
+boundaries, and no direct access from one module to another module's tables.
 
-Autres contraintes transverses : horodatages stockés en UTC et affichés dans le fuseau local du
-client.
+Other cross-cutting constraints: timestamps are stored in UTC and displayed in the client's local
+time zone.
 
-## Points ouverts
+## Open questions
 
-| Sujet | Statut |
+| Topic | Status |
 |---|---|
-| Arbitrage final du modèle d'absorption | Bloquant V1 — issue #37 |
-| Persistance des composantes hors bibliothèque en V1 | À confirmer ([§10.2](SPEC.md#102-composantes-hors-bibliothèque-en-v1--ouvert)) |
-| Pas d'échantillonnage et fenêtre d'affichage des courbes | Acté le 2026-08-17 — 1 min, fenêtre + 3 h ([§10.3](SPEC.md#103-granularité-des-courbes--acté-le-2026-08-17-voir-100-i)) |
-| Ajout d'un item à la bibliothèque | Reporté V2+ ([§10.4](SPEC.md#104-ajout-dun-item-à-la-bibliothèque-v2--ouvert)) |
+| Final arbitration of the absorption model | V1 blocker — issue #37 |
+| Persistence of off-library components in V1 | To be confirmed ([§10.2](docs/SPEC.md#102-composantes-hors-bibliothèque-en-v1--ouvert)) |
+| Sampling step and display window of the curves | Settled on 2026-08-17 — 1 min, window + 3 h ([§10.3](docs/SPEC.md#103-granularité-des-courbes--acté-le-2026-08-17-voir-100-i)) |
+| Adding an item to the library | Deferred to V2+ ([§10.4](docs/SPEC.md#104-ajout-dun-item-à-la-bibliothèque-v2--ouvert)) |
+
+## License
+
+Released under the [MIT License](LICENSE).
