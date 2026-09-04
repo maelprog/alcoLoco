@@ -1,3 +1,5 @@
+[![CI](https://github.com/maelprog/alcoLoco/actions/workflows/ci.yml/badge.svg)](https://github.com/maelprog/alcoLoco/actions/workflows/ci.yml)
+
 # alcoLoco
 
 Blood alcohol tracking application. Each user records what they drink — plain drinks or multi-part
