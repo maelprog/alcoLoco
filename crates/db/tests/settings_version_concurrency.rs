@@ -359,13 +359,30 @@ async fn wait_until_blocked(pool: &PgPool, pids: &[i32]) -> bool {
     false
 }
 
+/// Opens a transaction on a fresh connection that writes the guard row of each
+/// of `profiles` and keeps it: every check of those profiles then queues behind
+/// this connection until it commits.
+async fn hold_guard_rows(url: &str, profiles: &[Uuid]) -> PgConnection {
+    let mut holder = connection(url).await;
+    run(&mut holder, "BEGIN").await.expect("BEGIN");
+    for profile in profiles {
+        run(
+            &mut holder,
+            &format!("SELECT public.write_profile_settings_guard('{profile}')"),
+        )
+        .await
+        .expect("the holder must write the guard row");
+    }
+    holder
+}
+
 #[tokio::test]
 async fn read_committed_commits_that_overlap_leave_the_last_version_in_place() {
     // The race of #43 at its narrowest: two READ COMMITTED transactions whose
     // commits overlap. The overlap is forced rather than hoped for: a third
-    // connection holds the profile row, both COMMITs are sent, and the row is
-    // released only once both are seen waiting behind it. Exactly one of them
-    // may pass, and the other must be refused by the check itself.
+    // connection holds the guard row of the profile, both COMMITs are sent, and
+    // the row is released only once both are seen waiting behind it. Exactly
+    // one of them may pass, and the other must be refused by the check itself.
     let name = "read_committed_commits_that_overlap_leave_the_last_version_in_place";
     let Some(url) = database_url(name) else {
         return;
@@ -373,7 +390,6 @@ async fn read_committed_commits_that_overlap_leave_the_last_version_in_place() {
     let pool = migrated_pool(&url).await;
     let (profile, versions) = profile_with_versions(&pool, 2).await;
 
-    let mut holder = connection(&url).await;
     let mut a = connection(&url).await;
     let mut b = connection(&url).await;
     let pids = [backend_pid(&mut a).await, backend_pid(&mut b).await];
@@ -387,14 +403,7 @@ async fn read_committed_commits_that_overlap_leave_the_last_version_in_place() {
     delete_version(&mut a, versions[0]).await;
     delete_version(&mut b, versions[1]).await;
 
-    run(&mut holder, "BEGIN").await.expect("BEGIN");
-    run(
-        &mut holder,
-        &format!("SELECT 1 FROM profile WHERE id = '{profile}' FOR NO KEY UPDATE"),
-    )
-    .await
-    .expect("the holder must lock the profile row");
-
+    let mut holder = hold_guard_rows(&url, &[profile]).await;
     let commit_a = tokio::spawn(async move { run(&mut a, "COMMIT").await });
     let commit_b = tokio::spawn(async move { run(&mut b, "COMMIT").await });
     let both_blocked = wait_until_blocked(&pool, &pids).await;
@@ -408,7 +417,7 @@ async fn read_committed_commits_that_overlap_leave_the_last_version_in_place() {
 
     assert!(
         both_blocked,
-        "both COMMITs must queue on the profile row: the check has to serialise \
+        "both COMMITs must queue on the guard row: the check has to serialise \
          the writers of one profile at commit time"
     );
     let refused: Vec<_> = outcomes.iter().filter(|outcome| outcome.is_err()).collect();
@@ -425,11 +434,11 @@ async fn read_committed_commits_that_overlap_leave_the_last_version_in_place() {
 async fn opposite_traversal_orders_do_not_deadlock_at_commit() {
     // Two transactions remove one version from each of two profiles, in
     // opposite orders — the probe that condemned `SELECT ... FOR UPDATE` in the
-    // check (#43). The rows each check has to lock at COMMIT are then the same
-    // two profiles, reached in opposite orders if they were locked in the order
-    // of the row events. A third connection holds both profile rows until both
-    // COMMITs are queued, so that both resume at once: locked in event order
-    // they deadlock, locked in one global order they do not.
+    // check (#43). The guard rows each check has to write at COMMIT are then
+    // those of the same two profiles, reached in opposite orders if they were
+    // written in the order of the row events. A third connection holds both
+    // guard rows until both COMMITs are queued, so that both resume at once:
+    // written in event order they deadlock, in one global order they do not.
     let name = "opposite_traversal_orders_do_not_deadlock_at_commit";
     let Some(url) = database_url(name) else {
         return;
@@ -440,7 +449,6 @@ async fn opposite_traversal_orders_do_not_deadlock_at_commit() {
         let (x, xs) = profile_with_versions(&pool, 3).await;
         let (y, ys) = profile_with_versions(&pool, 3).await;
 
-        let mut holder = connection(&url).await;
         let mut a = connection(&url).await;
         let mut b = connection(&url).await;
         let pids = [backend_pid(&mut a).await, backend_pid(&mut b).await];
@@ -452,14 +460,7 @@ async fn opposite_traversal_orders_do_not_deadlock_at_commit() {
         delete_version(&mut b, ys[1]).await;
         delete_version(&mut b, xs[1]).await;
 
-        run(&mut holder, "BEGIN").await.expect("BEGIN");
-        run(
-            &mut holder,
-            &format!("SELECT 1 FROM profile WHERE id IN ('{x}', '{y}') FOR NO KEY UPDATE"),
-        )
-        .await
-        .expect("the holder must lock both profile rows");
-
+        let mut holder = hold_guard_rows(&url, &[x, y]).await;
         let commit_a = tokio::spawn(async move { run(&mut a, "COMMIT").await });
         let commit_b = tokio::spawn(async move { run(&mut b, "COMMIT").await });
         let both_blocked = wait_until_blocked(&pool, &pids).await;
@@ -487,48 +488,233 @@ async fn opposite_traversal_orders_do_not_deadlock_at_commit() {
     }
 }
 
+/// Runs `statements` in order on `conn`, stopping at the first error, after
+/// which the transaction is rolled back. Returns the connection with the
+/// outcome, so that a task can own the connection and hand it back.
+async fn run_all(
+    mut conn: PgConnection,
+    statements: Vec<String>,
+) -> (PgConnection, Result<(), sqlx::Error>) {
+    for statement in statements {
+        if let Err(error) = run(&mut conn, &statement).await {
+            let _ = run(&mut conn, "ROLLBACK").await;
+            return (conn, Err(error));
+        }
+    }
+    (conn, Ok(()))
+}
+
+type Session = tokio::task::JoinHandle<(PgConnection, Result<(), sqlx::Error>)>;
+
+fn spawn_session(conn: PgConnection, statements: &[String]) -> Session {
+    tokio::spawn(run_all(conn, statements.to_vec()))
+}
+
+/// Waits until the task driving backend `pid` has either finished or is
+/// blocked on a heavyweight lock, whichever the schema makes it do.
+async fn wait_until_settled(pool: &PgPool, pid: i32, task: &Session) {
+    for _ in 0..500 {
+        if task.is_finished() || wait_until_blocked_once(pool, pid).await {
+            return;
+        }
+        sqlx::query("SELECT pg_sleep(0.01)")
+            .execute(pool)
+            .await
+            .expect("pg_sleep");
+    }
+    panic!("backend {pid} neither finished nor blocked within 5 s");
+}
+
+async fn wait_until_blocked_once(pool: &PgPool, pid: i32) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                        WHERE pid = $1 AND wait_event_type = 'Lock')",
+    )
+    .bind(pid)
+    .fetch_one(pool)
+    .await
+    .expect("pg_stat_activity must be readable")
+}
+
+async fn outcome_of(session: Session) -> Result<(), sqlx::Error> {
+    session.await.expect("the session task must not panic").1
+}
+
+fn delete_sql(version: Uuid) -> String {
+    format!("DELETE FROM profile_settings_version WHERE id = '{version}'")
+}
+
+/// Six interleavings of ordinary DML around the removal of a settings version,
+/// each of which commits without error on the initial schema. The check must
+/// not turn any of them into a deadlock: it may only wait for other checks.
 #[tokio::test]
-async fn deleting_a_profile_while_one_of_its_versions_is_removed_does_not_deadlock() {
-    // A transaction has removed one version of a profile and not committed yet;
-    // another deletes the profile, which cascades to its versions. The check
-    // writes the profile row at COMMIT, so the order in which the two meet
-    // matters: if the profile DELETE got hold of the row first, it would wait
-    // for the version the first transaction removed while that transaction
-    // waits for the row. The removal takes the lock a foreign key check takes,
-    // `FOR KEY SHARE` on the profile, so the DELETE queues up front instead.
-    let name = "deleting_a_profile_while_one_of_its_versions_is_removed_does_not_deadlock";
+async fn ordinary_dml_around_a_version_removal_does_not_deadlock() {
+    let name = "ordinary_dml_around_a_version_removal_does_not_deadlock";
     let Some(url) = database_url(name) else {
         return;
     };
     let pool = migrated_pool(&url).await;
-    let (profile, versions) = profile_with_versions(&pool, 2).await;
+    let s = |text: &str| text.to_owned();
 
-    let mut remover = connection(&url).await;
-    let mut deleter = connection(&url).await;
-    let deleter_pid = backend_pid(&mut deleter).await;
-
-    run(&mut remover, "BEGIN").await.expect("BEGIN");
-    delete_version(&mut remover, versions[0]).await;
-
-    let delete_profile = tokio::spawn(async move {
-        run(
-            &mut deleter,
-            &format!("DELETE FROM profile WHERE id = '{profile}'"),
-        )
-        .await
-    });
-    let deleter_blocked = wait_until_blocked(&pool, &[deleter_pid]).await;
-    let committed = run(&mut remover, "COMMIT").await;
-    let deleted = delete_profile.await.expect("task");
-
-    assert!(
-        deleter_blocked,
-        "the profile DELETE must wait for the remover"
-    );
-    for outcome in [&committed, &deleted] {
-        if let Err(error) = outcome {
-            panic!("no statement may fail here: {error}");
+    // 1. Crossed: t renames X then removes a version of Y; t2 renames Y then
+    //    removes a version of X. Both COMMITs are sent together.
+    {
+        let (x, xs) = profile_with_versions(&pool, 3).await;
+        let (y, ys) = profile_with_versions(&pool, 3).await;
+        let mut t = connection(&url).await;
+        let mut t2 = connection(&url).await;
+        for (conn, renamed, removed) in [(&mut t, x, ys[0]), (&mut t2, y, xs[0])] {
+            run(conn, "BEGIN").await.expect("BEGIN");
+            run(
+                conn,
+                &format!("UPDATE profile SET display_name = 'renamed' WHERE id = '{renamed}'"),
+            )
+            .await
+            .expect("rename");
+            run(conn, &delete_sql(removed)).await.expect("remove");
+        }
+        let commits = [
+            spawn_session(t, &[s("COMMIT")]),
+            spawn_session(t2, &[s("COMMIT")]),
+        ];
+        for commit in commits {
+            outcome_of(commit)
+                .await
+                .unwrap_or_else(|error| panic!("crossed: {error}"));
         }
     }
-    assert_eq!(version_count(&pool, profile).await, 0);
+
+    // 2. One profile: t removes v1 of P; t2 renames P, then removes the same
+    //    v1, which waits for t; then t commits.
+    {
+        let (p, ps) = profile_with_versions(&pool, 3).await;
+        let mut t = connection(&url).await;
+        let mut t2 = connection(&url).await;
+        let t2_pid = backend_pid(&mut t2).await;
+        run(&mut t, "BEGIN").await.expect("BEGIN");
+        run(&mut t, &delete_sql(ps[0])).await.expect("remove");
+        run(&mut t2, "BEGIN").await.expect("BEGIN");
+        run(
+            &mut t2,
+            &format!("UPDATE profile SET display_name = 'renamed' WHERE id = '{p}'"),
+        )
+        .await
+        .expect("rename");
+        let second = spawn_session(t2, &[delete_sql(ps[0]), s("COMMIT")]);
+        assert!(
+            wait_until_blocked(&pool, &[t2_pid]).await,
+            "the second removal must wait for the first"
+        );
+        run(&mut t, "COMMIT")
+            .await
+            .unwrap_or_else(|error| panic!("rename then remove, t: {error}"));
+        outcome_of(second)
+            .await
+            .unwrap_or_else(|error| panic!("rename then remove, t2: {error}"));
+        assert_eq!(version_count(&pool, p).await, 2);
+    }
+
+    // 3 and 4. t2 locks P (FOR UPDATE, or by renaming it); t removes v1 of P
+    //    and commits; t2 deletes P.
+    for (label, lock) in [
+        (
+            "lock then delete",
+            "SELECT 1 FROM profile WHERE id = '{p}' FOR UPDATE",
+        ),
+        (
+            "rename then delete",
+            "UPDATE profile SET display_name = 'renamed' WHERE id = '{p}'",
+        ),
+    ] {
+        let (p, ps) = profile_with_versions(&pool, 3).await;
+        let mut t = connection(&url).await;
+        let t_pid = backend_pid(&mut t).await;
+        let mut t2 = connection(&url).await;
+        run(&mut t2, "BEGIN").await.expect("BEGIN");
+        run(&mut t2, &lock.replace("{p}", &p.to_string()))
+            .await
+            .expect("lock");
+        let remover = spawn_session(t, &[s("BEGIN"), delete_sql(ps[0]), s("COMMIT")]);
+        wait_until_settled(&pool, t_pid, &remover).await;
+        let deleter = spawn_session(
+            t2,
+            &[format!("DELETE FROM profile WHERE id = '{p}'"), s("COMMIT")],
+        );
+        outcome_of(remover)
+            .await
+            .unwrap_or_else(|error| panic!("{label}, remover: {error}"));
+        outcome_of(deleter)
+            .await
+            .unwrap_or_else(|error| panic!("{label}, deleter: {error}"));
+        assert_eq!(version_count(&pool, p).await, 0, "{label}");
+    }
+
+    // 5. Both share-lock P and remove a different version each; both COMMITs
+    //    are sent together.
+    {
+        let (p, ps) = profile_with_versions(&pool, 3).await;
+        let mut t = connection(&url).await;
+        let mut t2 = connection(&url).await;
+        for (conn, removed) in [(&mut t, ps[0]), (&mut t2, ps[1])] {
+            run(conn, "BEGIN").await.expect("BEGIN");
+            run(
+                conn,
+                &format!("SELECT 1 FROM profile WHERE id = '{p}' FOR SHARE"),
+            )
+            .await
+            .expect("share lock");
+            run(conn, &delete_sql(removed)).await.expect("remove");
+        }
+        let commits = [
+            spawn_session(t, &[s("COMMIT")]),
+            spawn_session(t2, &[s("COMMIT")]),
+        ];
+        for commit in commits {
+            outcome_of(commit)
+                .await
+                .unwrap_or_else(|error| panic!("share both: {error}"));
+        }
+        assert_eq!(version_count(&pool, p).await, 1);
+    }
+
+    // 6. A DELETE FROM profile over two rows has deleted P and waits on the
+    //    second one, X, held by a third connection: P's cascade has not run
+    //    yet. t removes v1 of P meanwhile and commits; then X is released.
+    {
+        let (p, ps) = profile_with_versions(&pool, 3).await;
+        let (x, _) = profile_with_versions(&pool, 3).await;
+        let mut holder = connection(&url).await;
+        run(&mut holder, "BEGIN").await.expect("BEGIN");
+        run(
+            &mut holder,
+            &format!("SELECT 1 FROM profile WHERE id = '{x}' FOR UPDATE"),
+        )
+        .await
+        .expect("hold X");
+        let mut t2 = connection(&url).await;
+        let t2_pid = backend_pid(&mut t2).await;
+        let deleter = spawn_session(
+            t2,
+            &[
+                format!("DELETE FROM profile WHERE id IN ('{p}', '{x}')"),
+                s("COMMIT"),
+            ],
+        );
+        assert!(
+            wait_until_blocked(&pool, &[t2_pid]).await,
+            "the multi-row DELETE must wait for X"
+        );
+        let mut t = connection(&url).await;
+        let t_pid = backend_pid(&mut t).await;
+        let remover = spawn_session(t, &[s("BEGIN"), delete_sql(ps[0]), s("COMMIT")]);
+        wait_until_settled(&pool, t_pid, &remover).await;
+        run(&mut holder, "COMMIT").await.expect("release X");
+        outcome_of(remover)
+            .await
+            .unwrap_or_else(|error| panic!("multi-row delete, remover: {error}"));
+        outcome_of(deleter)
+            .await
+            .unwrap_or_else(|error| panic!("multi-row delete, deleter: {error}"));
+        assert_eq!(version_count(&pool, p).await, 0);
+    }
 }

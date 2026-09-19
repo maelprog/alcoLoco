@@ -178,6 +178,9 @@ being refused **outright** rather than at commit, since a version cannot referen
 does not exist yet. Under concurrency, one of two transactions removing versions of the same
 profile may be refused: by the check itself under `READ COMMITTED`, with a retryable serialization
 failure (`40001`) under `REPEATABLE READ` and `SERIALIZABLE` — even when versions remain. The
+check only ever waits for other checks on the same profile, never for a lock taken by ordinary
+writes, so it adds no deadlock with them unless it is run mid-transaction (`SET CONSTRAINTS …
+IMMEDIATE`). The
 guarantee is **not absolute**: bulk wipes (`TRUNCATE`) and anything that disables the triggers can
 leave a profile durably versionless, with `profile_settings_at()` returning no row for a profile
 that still exists and signalling nothing. The exhaustive account — every escape class, who can
