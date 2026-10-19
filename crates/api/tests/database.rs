@@ -1157,7 +1157,10 @@ async fn the_pool_db_connect_opens_names_pg_temp_last() {
 /// why it may not be the thing this correction rests on.
 ///
 /// The pool is built by [`db::pool_options`] with **one** connection, which is
-/// what puts the requests on the session owning the temporary tables.
+/// what puts the requests on the session owning the temporary tables. That is
+/// asserted after the requests rather than assumed: the pool must then hold a
+/// single connection, and that connection must still own both tables — so the
+/// session the requests ran on is the one the tables were created on.
 #[tokio::test]
 async fn the_endpoints_answer_on_a_connection_that_owns_shadowing_temporary_tables() {
     let test = "the_endpoints_answer_on_a_connection_that_owns_shadowing_temporary_tables";
@@ -1195,11 +1198,32 @@ async fn the_endpoints_answer_on_a_connection_that_owns_shadowing_temporary_tabl
 
     let mut payload = a_sound_payload("Ombre corrigée");
     payload["settings"]["weight_kg"] = Value::from(63.5);
+    let pool = state.pool.clone();
     let answer = send(state, "PUT", &format!("/profiles/{id}"), Some(payload)).await;
     assert_eq!(
         answer.status,
         StatusCode::OK,
         "the update was refused: {}",
         answer.body
+    );
+
+    // What the name of this test claims, checked: one connection served every
+    // request, and it is the session that owns the shadowing tables.
+    assert_eq!(
+        pool.size(),
+        1,
+        "the requests were spread over more than one connection, so not all of \
+         them ran on the session owning the shadowing tables"
+    );
+    let (shadowing,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pg_class
+         WHERE relname IN ('text', 'uuid') AND relnamespace = pg_my_temp_schema()",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the temporary schema must be readable");
+    assert_eq!(
+        shadowing, 2,
+        "the connection the requests ran on does not own the shadowing tables"
     );
 }
