@@ -40,10 +40,12 @@
 //! operations script — never had the setting at all. The doc of
 //! [`db::SEARCH_PATH`] lists that, and closing the class by construction is
 //! #41's to decide. The rule is kept here as a convention and as a second line
-//! of defence should that setting ever go missing. No guard in this file reads `db::SEARCH_PATH` —
-//! none could, these tests reading text and not a live connection; what holds
-//! the setting is `the_pool_the_api_builds_names_pg_temp_last_on_every_connection`
-//! in `crates/api/tests/database.rs`, which asks a real connection. The rule
+//! of defence should that setting ever go missing. No guard in this file reads
+//! `db::SEARCH_PATH` — none could, these tests reading text and not a live
+//! connection; what holds the setting, for each of the two pools, is
+//! `the_pool_the_api_builds_names_pg_temp_last_on_every_connection` and
+//! `the_pool_db_connect_opens_names_pg_temp_last` in
+//! `crates/api/tests/database.rs`, each asking a real connection. The rule
 //! below is no longer what stands between a temporary table and a mis-resolved
 //! name.
 //!

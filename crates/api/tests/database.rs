@@ -998,13 +998,10 @@ async fn a_non_positive_weight_or_height_is_still_refused() {
     }
 }
 
-/// Every connection of the pool the API runs on names `pg_temp` last.
+/// Asks one connection of a pool what it carries, rather than watching for a
+/// consequence. Two assertions, in this order:
 ///
-/// **This is the test that holds [`db::pool_options`]**, and it asks the
-/// connection what it carries rather than watching for a consequence. Two
-/// assertions, in this order:
-///
-/// 1. `SHOW search_path` on a connection of that pool equals [`db::SEARCH_PATH`];
+/// 1. `SHOW search_path` on that connection equals [`db::SEARCH_PATH`];
 /// 2. with a temporary table named `text` and another named `uuid` in place on
 ///    that same session, `pg_typeof(NULL::text)` and `pg_typeof(NULL::uuid)`
 ///    still resolve inside `pg_catalog`.
@@ -1015,31 +1012,11 @@ async fn a_non_positive_weight_or_height_is_still_refused() {
 /// here — the end-to-end test below used to be what held this correction, and it
 /// bit for a reason its own comment got wrong.
 ///
-/// The pool comes from [`AppState::new`], which is the pool the server runs on,
-/// and one connection is taken and held for the whole test: a temporary table
+/// The caller holds the one connection for the whole check: a temporary table
 /// belongs to the session that created it, so a second connection would test
 /// nothing and pass regardless. That the two tables really are on this session
-/// is asserted rather than assumed.
-///
-/// Taking the `after_connect` out of `crates/db/src/lib.rs` fails assertion 1
-/// with `"$user", public`; putting `PgPoolOptions::new()` back in
-/// `crates/api/src/lib.rs` fails the same assertion. Both were run.
-#[tokio::test]
-async fn the_pool_the_api_builds_names_pg_temp_last_on_every_connection() {
-    let test = "the_pool_the_api_builds_names_pg_temp_last_on_every_connection";
-    let Some(url) = database_url(test) else {
-        return;
-    };
-
-    // Through `AppState::new` on purpose: that constructor is the one this test
-    // is here to cover.
-    let state = state(&url);
-    let mut connection = state
-        .pool
-        .acquire()
-        .await
-        .expect("the pool must hand out a connection");
-
+/// is asserted rather than assumed. `pool` names the pool in the messages.
+async fn assert_pg_temp_named_last(connection: &mut sqlx::PgConnection, pool: &str) {
     let (search_path,): (String,) = sqlx::query_as("SHOW search_path")
         .fetch_one(&mut *connection)
         .await
@@ -1047,8 +1024,8 @@ async fn the_pool_the_api_builds_names_pg_temp_last_on_every_connection() {
     assert_eq!(
         search_path,
         db::SEARCH_PATH,
-        "a connection of the pool `AppState::new` builds does not carry the \
-         project's search_path"
+        "a connection of the pool {pool} builds does not carry the project's \
+         search_path"
     );
 
     sqlx::raw_sql("CREATE TEMP TABLE text (a int); CREATE TEMP TABLE uuid (a int);")
@@ -1090,10 +1067,69 @@ async fn the_pool_the_api_builds_names_pg_temp_last_on_every_connection() {
             .expect("the catalogue must answer");
         assert_eq!(
             namespace, "pg_catalog",
-            "`::{name}` resolves into `{namespace}`: a temporary table shadows a \
-             built-in type on this connection"
+            "`::{name}` resolves into `{namespace}` on a connection of the pool \
+             {pool} builds: a temporary table shadows a built-in type"
         );
     }
+}
+
+/// A connection of the pool the API runs on names `pg_temp` last.
+///
+/// **One of the two tests that hold [`db::pool_options`]**: this one takes the
+/// pool from [`AppState::new`], the pool the server runs on, and puts one of its
+/// connections through [`assert_pg_temp_named_last`].
+///
+/// Taking the `after_connect` out of `crates/db/src/lib.rs` fails assertion 1
+/// with `"$user", public`; putting `PgPoolOptions::new()` back in
+/// `crates/api/src/lib.rs` fails the same assertion. Both were run.
+#[tokio::test]
+async fn the_pool_the_api_builds_names_pg_temp_last_on_every_connection() {
+    let test = "the_pool_the_api_builds_names_pg_temp_last_on_every_connection";
+    let Some(url) = database_url(test) else {
+        return;
+    };
+
+    // Through `AppState::new` on purpose: that constructor is the one this test
+    // is here to cover.
+    let state = state(&url);
+    let mut connection = state
+        .pool
+        .acquire()
+        .await
+        .expect("the pool must hand out a connection");
+
+    assert_pg_temp_named_last(&mut connection, "`AppState::new`").await;
+}
+
+/// A connection of the pool `db::connect()` opens names `pg_temp` last.
+///
+/// **The other of the two tests that hold [`db::pool_options`]**: this one goes
+/// through [`db::connect`] itself — the pool `crates/db/src/main.rs` opens for
+/// `migrate`, `reset` and `seed` — and puts one of its connections through
+/// [`assert_pg_temp_named_last`]. It does not rebuild that pool from
+/// `db::pool_options()`: a test doing so would hold the options, and say
+/// nothing of the function meant to use them.
+///
+/// `db::connect()` reads `DATABASE_URL`, the variable this test is conditioned
+/// on, so it opens the same database as the rest of this file.
+///
+/// Building the pool of `db::connect()` from `PgPoolOptions::new()` instead of
+/// `pool_options()` fails assertion 1 with `"$user", public`; so does taking the
+/// `after_connect` out of `crates/db/src/lib.rs`. Both were run.
+#[tokio::test]
+async fn the_pool_db_connect_opens_names_pg_temp_last() {
+    let test = "the_pool_db_connect_opens_names_pg_temp_last";
+    if database_url(test).is_none() {
+        return;
+    }
+
+    let pool = db::connect().await.expect("`db::connect()` must open");
+    let mut connection = pool
+        .acquire()
+        .await
+        .expect("the pool must hand out a connection");
+
+    assert_pg_temp_named_last(&mut connection, "`db::connect()`").await;
 }
 
 /// The four endpoints answer on a connection that owns shadowing temporary
@@ -1101,8 +1137,8 @@ async fn the_pool_the_api_builds_names_pg_temp_last_on_every_connection() {
 ///
 /// Kept for its own sake — it exercises the real router, the real statements and
 /// the real triggers under the condition this issue is about — but it is **not**
-/// what holds the `search_path` correction; the test above is. The comment here
-/// used to claim otherwise, and was wrong twice over:
+/// what holds the `search_path` correction; the two tests above are. The comment
+/// here used to claim otherwise, and was wrong twice over:
 ///
 /// - it announced failing on `operator does not exist: pg_catalog.uuid > uuid`,
 ///   which can no longer happen: the statements of the module write
@@ -1121,8 +1157,7 @@ async fn the_pool_the_api_builds_names_pg_temp_last_on_every_connection() {
 /// why it may not be the thing this correction rests on.
 ///
 /// The pool is built by [`db::pool_options`] with **one** connection, which is
-/// what puts the requests on the session owning the temporary tables — and what
-/// covers the other of the project's two pool constructions.
+/// what puts the requests on the session owning the temporary tables.
 #[tokio::test]
 async fn the_endpoints_answer_on_a_connection_that_owns_shadowing_temporary_tables() {
     let test = "the_endpoints_answer_on_a_connection_that_owns_shadowing_temporary_tables";

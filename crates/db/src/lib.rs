@@ -88,10 +88,13 @@ pub const SEARCH_PATH: &str = "public, pg_catalog, pg_temp";
 /// Pool options carrying what a connection of this project needs.
 ///
 /// The project's two pools are built from here — this crate's [`connect`] and
-/// the API's state — and a test covers each. Nothing in the language prevents a
-/// third being built elsewhere with `PgPoolOptions::new()`, and no guard would
-/// notice: what holds this is the two tests and this sentence, not the
-/// structure. `AppState::new` cannot simply call [`connect`] instead, because
+/// the API's state — and a test covers each, in `crates/api/tests/database.rs`:
+/// `the_pool_db_connect_opens_names_pg_temp_last` and
+/// `the_pool_the_api_builds_names_pg_temp_last_on_every_connection`, each asking
+/// a connection of its pool for its `search_path`. Nothing in the language
+/// prevents a third being built elsewhere with `PgPoolOptions::new()`, and no
+/// guard would notice: what holds this is the two tests and this sentence, not
+/// the structure. `AppState::new` cannot simply call [`connect`] instead, because
 /// its pool is deliberately lazy — the server must come up and answer
 /// `GET /health` with the database down.
 #[must_use]
