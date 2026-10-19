@@ -1696,28 +1696,37 @@ mod tests {
         // `as_api_error` recognises a duplicate `valid_from` by the *name* of
         // the constraint PostgreSQL reports. Renamed on the schema side only,
         // the same write turns from a 409 into a 500 and no other test without
-        // a database sees it (measured on the verification of #6). The text is
-        // what can be read without a database: the declaration, with the
-        // columns it covers, and no later migration dropping or renaming it.
+        // a database sees it (measured on the verification of #6).
+        //
+        // The guard is **lexical**: it reads the migration text, without a
+        // database. It requires the declaration, with the columns it covers,
+        // and requires it to be the *only* place any migration names the
+        // constraint, in any case. Every statement that drops or renames it by
+        // name therefore fails here, whatever its spelling — `DROP CONSTRAINT
+        // IF EXISTS`, `RENAME CONSTRAINT`, `ALTER INDEX … RENAME TO`, a quoted
+        // identifier — and so does a mere comment naming it, which costs a
+        // rewording and is the safe direction. What it cannot see is a change
+        // that does not write the name: a `DROP TABLE` and recreation, a name
+        // assembled at run time inside a `DO` block, a drop through the
+        // catalogue. The live check is `two_versions_may_not_start_at_the_same_instant`
+        // in `crates/api/tests/database.rs`, which needs a database.
         let declaration =
-            format!("CONSTRAINT {UNIQUE_VERSION_START} UNIQUE (profile_id, valid_from)");
-        let declared = db::MIGRATOR
-            .migrations
-            .iter()
-            .filter(|migration| migration.sql.contains(&declaration))
-            .count();
-        assert_eq!(declared, 1, "no migration declares `{declaration}`");
-
-        for undoing in ["DROP CONSTRAINT", "RENAME CONSTRAINT"] {
-            let undone = format!("{undoing} {UNIQUE_VERSION_START}");
-            assert!(
-                !db::MIGRATOR
-                    .migrations
-                    .iter()
-                    .any(|migration| migration.sql.contains(&undone)),
-                "a migration runs `{undone}`"
-            );
+            format!("constraint {UNIQUE_VERSION_START} unique (profile_id, valid_from)");
+        let mut declared = 0;
+        let mut mentioned = 0;
+        for migration in db::MIGRATOR.migrations.iter() {
+            let lowered = migration.sql.to_lowercase();
+            declared += lowered.matches(&declaration).count();
+            mentioned += lowered.matches(UNIQUE_VERSION_START).count();
         }
+        assert_eq!(
+            declared, 1,
+            "the migrations do not declare `{declaration}` exactly once"
+        );
+        assert_eq!(
+            mentioned, 1,
+            "a migration names `{UNIQUE_VERSION_START}` outside its declaration"
+        );
     }
 
     #[test]
