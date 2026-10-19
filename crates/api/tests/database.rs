@@ -475,29 +475,76 @@ async fn changing_a_physiological_parameter_posts_a_version() {
     assert_eq!(version_count(&state.pool, id).await, 2);
 }
 
+/// Writes one settings version straight to the database, at `valid_from`, with
+/// the parameters of [`a_sound_payload`] except the weight.
+async fn insert_version_at(pool: &sqlx::PgPool, profile: Uuid, valid_from: &str, weight_kg: f64) {
+    sqlx::query(
+        "INSERT INTO public.profile_settings_version (
+             id, profile_id, valid_from, weight_kg, height_cm, sex, birth_date
+         ) VALUES ($1, $2, $3::timestamptz, $4, 168.0, 'female'::public.sex, '1994-05-12'::date)",
+    )
+    .bind(api::new_id())
+    .bind(profile)
+    .bind(valid_from)
+    .bind(weight_kg)
+    .execute(pool)
+    .await
+    .expect("the version must be written");
+}
+
+/// The settings history of a profile, oldest first, as `(valid_from, weight)`.
+async fn history(pool: &sqlx::PgPool, profile: Uuid) -> Vec<(String, f64)> {
+    sqlx::query_as(
+        "SELECT to_char(valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), weight_kg
+         FROM public.profile_settings_version
+         WHERE profile_id = $1
+         ORDER BY valid_from",
+    )
+    .bind(profile)
+    .fetch_all(pool)
+    .await
+    .expect("the history must be readable")
+}
+
+/// The weight in force for a profile at `at`, through `profile_settings_at()`.
+async fn weight_at(pool: &sqlx::PgPool, profile: Uuid, at: &str) -> f64 {
+    sqlx::query_scalar("SELECT weight_kg FROM public.profile_settings_at($1, $2::timestamptz)")
+        .bind(profile)
+        .bind(at)
+        .fetch_one(pool)
+        .await
+        .expect("the lookup must run")
+}
+
 #[tokio::test]
-async fn a_retroactive_valid_from_is_stored_where_it_belongs_in_the_history() {
-    // The "I had the wrong weight" gesture of SPEC.md §5.1. What #6 owes is that
-    // the version lands at the instant the caller chose, which is checked here
-    // through `profile_settings_at()` at that instant.
+async fn a_retroactive_valid_from_replaces_the_later_versions_and_says_so() {
+    // The "I had the wrong weight" gesture of SPEC.md §5.1: posting a version
+    // at T closes the previous one at T and **replaces** every version already
+    // later than T, and the answer says how many were replaced (issue #7).
     //
-    // What #6 deliberately does **not** do, and what this test pins so the
-    // boundary is visible rather than assumed: closing the versions already
-    // later than that instant. SPEC.md §5.1 has a retroactive post replace every
-    // later version and report how many it replaced — that is issue #7. Until
-    // then the later version stays, and it is still the one in
-    // force now, which is why the answer keeps the old weight.
-    let name = "a_retroactive_valid_from_is_stored_where_it_belongs_in_the_history";
+    // The history is built so that every branch of that rule is exercised at
+    // once: one version strictly before T that must survive and close at T, and
+    // three strictly after it — two written straight to the database, plus the
+    // one the creation posted at now — that must all go.
+    let name = "a_retroactive_valid_from_replaces_the_later_versions_and_says_so";
     let Some(state) = migrated(name).await else {
         return;
     };
 
-    let (id, created) = create_profile(&state, &a_sound_payload("Rétroactif")).await;
+    let (id, _) = create_profile(&state, &a_sound_payload("Rétroactif")).await;
+    for (at, weight) in [
+        ("2020-01-01T00:00:00Z", 50.0),
+        ("2022-01-01T00:00:00Z", 52.0),
+        ("2023-01-01T00:00:00Z", 53.0),
+    ] {
+        insert_version_at(&state.pool, id, at, weight).await;
+    }
+    assert_eq!(version_count(&state.pool, id).await, 4);
 
-    let earlier = "2025-01-01T00:00:00Z";
+    let corrected_from = "2021-06-01T00:00:00Z";
     let mut payload = a_sound_payload("Rétroactif");
     payload["settings"]["weight_kg"] = Value::from(58.0);
-    payload["settings"]["valid_from"] = Value::from(earlier);
+    payload["settings"]["valid_from"] = Value::from(corrected_from);
     let answer = send(
         state.clone(),
         "PUT",
@@ -507,21 +554,385 @@ async fn a_retroactive_valid_from_is_stored_where_it_belongs_in_the_history() {
     .await;
 
     assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
-    assert_eq!(version_count(&state.pool, id).await, 2);
-
-    let then: f64 =
-        sqlx::query_scalar("SELECT weight_kg FROM public.profile_settings_at($1, $2::timestamptz)")
-            .bind(id)
-            .bind(earlier)
-            .fetch_one(&state.pool)
-            .await
-            .expect("the lookup must run");
-    assert_eq!(then, 58.0, "the corrected value must apply at {earlier}");
+    assert_eq!(answer.body["settings_version_created"], true);
+    assert_eq!(answer.body["settings_versions_replaced"], 3);
+    assert_eq!(
+        answer.body["settings"]["weight_kg"], 58.0,
+        "nothing later than the correction is left, so it is the version in force now"
+    );
+    assert_eq!(answer.body["settings"]["valid_from"], corrected_from);
 
     assert_eq!(
-        answer.body["settings"], created["settings"],
-        "closing the later version is issue #7, not #6"
+        history(&state.pool, id).await,
+        vec![
+            ("2020-01-01T00:00:00Z".to_owned(), 50.0),
+            (corrected_from.to_owned(), 58.0),
+        ],
+        "the version before T is kept and closes at T; the ones after T are gone"
     );
+    assert_eq!(
+        weight_at(&state.pool, id, "2021-05-31T23:59:59Z").await,
+        50.0
+    );
+    assert_eq!(weight_at(&state.pool, id, corrected_from).await, 58.0);
+}
+
+#[tokio::test]
+async fn each_retroactive_correction_answers_the_weight_it_posted() {
+    // Replays the sequence the verification of PR #50 measured: a creation at
+    // 88.5 kg, then two retroactive corrections, each earlier than the last.
+    // Under #6 the second one answered 200 with the *old* weight and no signal.
+    let name = "each_retroactive_correction_answers_the_weight_it_posted";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+
+    let mut payload = a_sound_payload("Vérification #6");
+    payload["settings"]["weight_kg"] = Value::from(88.5);
+    let (id, _) = create_profile(&state, &payload).await;
+
+    for (valid_from, weight) in [
+        ("2025-06-01T00:00:00Z", 91.0),
+        ("2024-03-15T00:00:00Z", 95.25),
+    ] {
+        payload["settings"]["weight_kg"] = Value::from(weight);
+        payload["settings"]["valid_from"] = Value::from(valid_from);
+        let answer = send(
+            state.clone(),
+            "PUT",
+            &format!("/profiles/{id}"),
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+        assert_eq!(answer.body["settings_version_created"], true);
+        assert_eq!(answer.body["settings_versions_replaced"], 1);
+        assert_eq!(answer.body["settings"]["weight_kg"], weight);
+    }
+    assert_eq!(
+        history(&state.pool, id).await,
+        vec![("2024-03-15T00:00:00Z".to_owned(), 95.25)]
+    );
+}
+
+#[tokio::test]
+async fn repeating_the_values_in_force_at_t_still_replaces_what_follows_t() {
+    // A request says "from T on, these are the values". When they already are
+    // the values in force at T, no version needs posting — but the versions
+    // after T contradict the request and are replaced all the same; otherwise
+    // the call would answer 200 and leave the profile saying something else.
+    let name = "repeating_the_values_in_force_at_t_still_replaces_what_follows_t";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+
+    let mut payload = a_sound_payload("Répétition");
+    payload["settings"]["weight_kg"] = Value::from(70.0);
+    let (id, _) = create_profile(&state, &payload).await;
+    insert_version_at(&state.pool, id, "2020-01-01T00:00:00Z", 62.0).await;
+
+    payload["settings"]["weight_kg"] = Value::from(62.0);
+    payload["settings"]["valid_from"] = Value::from("2021-01-01T00:00:00Z");
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/profiles/{id}"),
+        Some(payload),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["settings_version_created"], false);
+    assert_eq!(answer.body["settings_versions_replaced"], 1);
+    assert_eq!(answer.body["settings"]["weight_kg"], 62.0);
+    assert_eq!(
+        history(&state.pool, id).await,
+        vec![("2020-01-01T00:00:00Z".to_owned(), 62.0)]
+    );
+}
+
+#[tokio::test]
+async fn a_correction_earlier_than_the_whole_history_keeps_one_version() {
+    // T before every version: all of them are later than T, the oldest one
+    // included — which is also the one `profile_settings_at(id, T)` falls back
+    // to through the open lower bound. Comparing against that fallback and then
+    // deleting it would leave the profile empty and the COMMIT refused.
+    let name = "a_correction_earlier_than_the_whole_history_keeps_one_version";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+
+    let (id, _) = create_profile(&state, &a_sound_payload("Avant tout")).await;
+
+    let mut payload = a_sound_payload("Avant tout");
+    payload["settings"]["valid_from"] = Value::from("2001-01-01T00:00:00Z");
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/profiles/{id}"),
+        Some(payload),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["settings_version_created"], true);
+    assert_eq!(answer.body["settings_versions_replaced"], 1);
+    assert_eq!(
+        history(&state.pool, id).await,
+        vec![("2001-01-01T00:00:00Z".to_owned(), 62.0)]
+    );
+}
+
+#[tokio::test]
+async fn a_put_says_whether_it_posted_a_version() {
+    // The signal the verification of #6 found missing. A write of the input
+    // preferences alone posts nothing and replaces nothing; a change of weight
+    // at now posts one version and, no version being allowed to start in the
+    // future, replaces none.
+    let name = "a_put_says_whether_it_posted_a_version";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+
+    let (id, _) = create_profile(&state, &a_sound_payload("Signal")).await;
+
+    let mut payload = a_sound_payload("Signal renommé");
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/profiles/{id}"),
+        Some(payload.clone()),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["settings_version_created"], false);
+    assert_eq!(answer.body["settings_versions_replaced"], 0);
+
+    payload["settings"]["weight_kg"] = Value::from(63.0);
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/profiles/{id}"),
+        Some(payload),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["settings_version_created"], true);
+    assert_eq!(answer.body["settings_versions_replaced"], 0);
+    assert_eq!(version_count(&state.pool, id).await, 2);
+}
+
+#[tokio::test]
+async fn a_refused_put_replaces_nothing() {
+    // The replacement and the post are one transaction: a post refused for its
+    // duplicate `valid_from` must leave the versions it would have replaced.
+    let name = "a_refused_put_replaces_nothing";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+
+    let (id, _) = create_profile(&state, &a_sound_payload("Refus")).await;
+    insert_version_at(&state.pool, id, "2020-01-01T00:00:00Z", 50.0).await;
+    let before = history(&state.pool, id).await;
+
+    let mut payload = a_sound_payload("Refus");
+    payload["settings"]["weight_kg"] = Value::from(51.0);
+    payload["settings"]["valid_from"] = Value::from("2020-01-01T00:00:00Z");
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/profiles/{id}"),
+        Some(payload),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::CONFLICT, "{}", answer.body);
+    assert_eq!(history(&state.pool, id).await, before);
+}
+
+/// A drink as the acceptance test of issue #7 needs it: when, and how much
+/// alcohol. The engine of #16 will read far more; this is enough to tell which
+/// settings version a drink was computed with.
+struct Drink {
+    ingested_at: &'static str,
+    volume_ml: f64,
+    abv_percent: f64,
+}
+
+/// Blood alcohol a single drink produces once fully absorbed, before any
+/// elimination, computed with the settings in force at its ingestion time and
+/// the age at that same instant (SPEC.md §5.6, §10.0-K).
+async fn bac_of(pool: &sqlx::PgPool, profile: Uuid, drink: &Drink) -> f64 {
+    let at: api::Timestamp = drink.ingested_at.parse().expect("a real instant");
+    let settings = api::profile::store::settings_at(pool, profile, at)
+        .await
+        .expect("the lookup must run")
+        .expect("a profile always has an applicable version");
+    let age_days = (at.date_naive() - settings.birth_date).num_days();
+    let age_years = f64::from(i32::try_from(age_days).expect("an age in days fits")) / 365.2425;
+    let sex = match settings.sex {
+        api::profile::Sex::Male => domain::Sex::Male,
+        api::profile::Sex::Female => domain::Sex::Female,
+    };
+    let water = domain::watson_total_body_water_litres(
+        sex,
+        settings.weight_kg,
+        settings.height_cm,
+        age_years,
+    );
+    domain::initial_bac_g_per_l(
+        domain::ingested_alcohol_grams(drink.volume_ml, drink.abv_percent),
+        water,
+    )
+}
+
+#[tokio::test]
+async fn a_weight_change_moves_only_the_drinks_after_it_and_a_correction_moves_its_period() {
+    // The two acceptance criteria of issue #7, which have to hold together:
+    //
+    // - "I gained weight" (valid_from between the two drinks): the earlier
+    //   drink keeps exactly the alcohol level it had, the later one moves;
+    // - "I had the wrong weight" (valid_from earlier than both): the period the
+    //   correction covers is recomputed with the corrected value.
+    //
+    // Male, so that the age term of Watson is in play and is taken at each
+    // drink's own ingestion time.
+    let name = "a_weight_change_moves_only_the_drinks_after_it_and_a_correction_moves_its_period";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+
+    let mut payload = a_sound_payload("Deux verres");
+    payload["settings"]["sex"] = Value::from("male");
+    payload["settings"]["weight_kg"] = Value::from(80.0);
+    payload["settings"]["height_cm"] = Value::from(180.0);
+    payload["settings"]["valid_from"] = Value::from("2025-01-01T00:00:00Z");
+    let (id, _) = create_profile(&state, &payload).await;
+
+    let before = Drink {
+        ingested_at: "2025-03-01T21:00:00Z",
+        volume_ml: 250.0,
+        abv_percent: 5.0,
+    };
+    let after = Drink {
+        ingested_at: "2025-09-01T21:00:00Z",
+        volume_ml: 250.0,
+        abv_percent: 5.0,
+    };
+    let before_at_first = bac_of(&state.pool, id, &before).await;
+    let after_at_first = bac_of(&state.pool, id, &after).await;
+
+    // "I gained weight", effective between the two drinks.
+    payload["settings"]["weight_kg"] = Value::from(95.0);
+    payload["settings"]["valid_from"] = Value::from("2025-06-01T00:00:00Z");
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/profiles/{id}"),
+        Some(payload.clone()),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["settings_versions_replaced"], 0);
+
+    assert_eq!(
+        bac_of(&state.pool, id, &before).await.to_bits(),
+        before_at_first.to_bits(),
+        "a weight change may not move a drink ingested before it"
+    );
+    let after_heavier = bac_of(&state.pool, id, &after).await;
+    assert!(
+        after_heavier < after_at_first - 1e-6,
+        "a heavier body dilutes the later drink: {after_heavier} vs {after_at_first}"
+    );
+
+    // "I had the wrong weight": corrected from before both drinks. The version
+    // posted above starts after that instant, so it is replaced.
+    payload["settings"]["weight_kg"] = Value::from(70.0);
+    payload["settings"]["valid_from"] = Value::from("2025-02-01T00:00:00Z");
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/profiles/{id}"),
+        Some(payload),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["settings_versions_replaced"], 1);
+
+    let before_corrected = bac_of(&state.pool, id, &before).await;
+    let after_corrected = bac_of(&state.pool, id, &after).await;
+    assert!(
+        before_corrected > before_at_first + 1e-6,
+        "the correction covers the earlier drink and must move it: \
+         {before_corrected} vs {before_at_first}"
+    );
+    assert!(
+        after_corrected > after_heavier + 1e-6 && after_corrected > after_at_first + 1e-6,
+        "the correction covers the later drink too: {after_corrected}"
+    );
+}
+
+/// Writes one settings version with the given birth date straight to the
+/// database and says whether the schema accepted it.
+async fn schema_accepts_birth_date(
+    pool: &sqlx::PgPool,
+    profile: Uuid,
+    birth_date: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO public.profile_settings_version (
+             id, profile_id, valid_from, weight_kg, height_cm, sex, birth_date
+         ) VALUES ($1, $2, now() - ($3 || ' seconds')::interval, 62.0, 168.0,
+                   'female'::public.sex, $4::date)",
+    )
+    .bind(api::new_id())
+    .bind(profile)
+    .bind(fastrand_seconds())
+    .bind(birth_date)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+#[tokio::test]
+async fn the_schema_refuses_a_birth_date_in_the_future() {
+    // The API refuses it already; this is the database refusing it too, for
+    // every writer that does not go through the API. Today (UTC) is the last
+    // date accepted, as it is for the API.
+    let name = "the_schema_refuses_a_birth_date_in_the_future";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+
+    let (id, _) = create_profile(&state, &a_sound_payload("Naissance")).await;
+    let today: String =
+        sqlx::query_scalar("SELECT ((now() AT TIME ZONE 'UTC')::date)::pg_catalog.text")
+            .fetch_one(&state.pool)
+            .await
+            .expect("the date must be readable");
+    let tomorrow: String =
+        sqlx::query_scalar("SELECT ((now() AT TIME ZONE 'UTC')::date + 1)::pg_catalog.text")
+            .fetch_one(&state.pool)
+            .await
+            .expect("the date must be readable");
+
+    schema_accepts_birth_date(&state.pool, id, &today)
+        .await
+        .expect("today is not in the future");
+    let refused = schema_accepts_birth_date(&state.pool, id, &tomorrow)
+        .await
+        .expect_err("a birth date in the future must be refused");
+    assert!(refused.contains("birth date"), "{refused}");
+
+    let moved = sqlx::query(
+        "UPDATE public.profile_settings_version SET birth_date = $2::date WHERE profile_id = $1",
+    )
+    .bind(id)
+    .bind(&tomorrow)
+    .execute(&state.pool)
+    .await
+    .expect_err("an UPDATE may not move a birth date into the future either")
+    .to_string();
+    assert!(moved.contains("birth date"), "{moved}");
 }
 
 #[tokio::test]

@@ -125,6 +125,25 @@ pub struct Profile {
     pub updated_at: Timestamp,
 }
 
+/// A replaced profile, and what the replacement did to its settings history.
+///
+/// The profile alone could not say it: `settings` shows the version in force
+/// now, and it can read the same whether nothing was posted, a version was
+/// posted with the values already in force, or the history behind it was
+/// rewritten. The two members below tell those cases apart (SPEC.md §5.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ProfileUpdate {
+    /// The profile as replaced, with the parameters in force now.
+    #[serde(flatten)]
+    pub profile: Profile,
+    /// Whether a settings version was posted at the requested `valid_from`.
+    /// `false` when the four parameters already were those in force then.
+    pub settings_version_created: bool,
+    /// How many settings versions starting after the requested `valid_from`
+    /// were replaced.
+    pub settings_versions_replaced: u64,
+}
+
 /// The physiological half of a write, as it arrives.
 ///
 /// Every member is optional so that a missing one is reported as a field error

@@ -11,9 +11,9 @@
 //! - a write that changes those four parameters posts a settings version at the
 //!   `valid_from` the caller chose, defaulting to now and never in the future;
 //!   a write that changes only the preferences posts none (SPEC.md §10.0-J);
-//! - the rest of the versioning policy — closing the previous version at `T`,
-//!   replacing every version already later than `T` and reporting how many were
-//!   replaced (SPEC.md §5.1) — is issue #7.
+//! - a write at `T` replaces every version already later than `T`, and the
+//!   answer to a `PUT` reports whether a version was posted and how many were
+//!   replaced (SPEC.md §5.1, issue #7).
 
 pub mod model;
 pub mod store;
@@ -32,7 +32,9 @@ use crate::pagination::{Page, PageQuery};
 use crate::timestamp;
 use crate::{AppState, ProblemDetails};
 
-pub use model::{Profile, ProfileRequest, ProfileSettings, QuantityUnit, SettingsRequest, Sex};
+pub use model::{
+    Profile, ProfileRequest, ProfileSettings, ProfileUpdate, QuantityUnit, SettingsRequest, Sex,
+};
 pub use validation::{ValidProfile, ValidSettings};
 
 /// Where the collection is served.
@@ -132,9 +134,12 @@ pub async fn create(
 
 /// Replaces a profile.
 ///
-/// A settings version is posted only when the four physiological parameters
-/// differ from those in force at the requested `valid_from`. Rewriting the input
-/// preferences alone posts none: they enter no computation (SPEC.md §10.0-J).
+/// Every settings version starting after the requested `valid_from` is
+/// replaced, and a version is posted there only when the four physiological
+/// parameters differ from those in force at that instant (SPEC.md §5.1).
+/// Rewriting the input preferences alone posts none: they enter no computation
+/// (SPEC.md §10.0-J). The answer says whether a version was posted and how many
+/// were replaced.
 #[utoipa::path(
     put,
     path = ITEM_PATH,
@@ -142,7 +147,7 @@ pub async fn create(
     params(("id" = Uuid, Path, description = "Identifier of the profile")),
     request_body = ProfileRequest,
     responses(
-        (status = 200, description = "The profile as replaced", body = Profile),
+        (status = 200, description = "The profile as replaced, and what became of its settings history", body = ProfileUpdate),
         (status = 400, description = "The payload is unreadable or invalid", body = ProblemDetails),
         (status = 404, description = "No profile carries that identifier", body = ProblemDetails),
         (status = 409, description = "A settings version already starts at that `valid_from`", body = ProblemDetails),
@@ -152,17 +157,25 @@ pub async fn update(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     JsonBody(request): JsonBody<ProfileRequest>,
-) -> Result<Json<Profile>, ApiError> {
+) -> Result<Json<ProfileUpdate>, ApiError> {
     let profile = request.validate(timestamp::now())?;
 
-    if store::update(&state.pool, id, &profile).await? == store::Updated::NoSuchProfile {
+    let store::Updated::Written {
+        version_created,
+        versions_replaced,
+    } = store::update(&state.pool, id, &profile).await?
+    else {
         return Err(no_such_profile(id));
-    }
+    };
 
-    store::read(&state.pool, id)
+    let profile = store::read(&state.pool, id)
         .await?
-        .map(Json)
-        .ok_or_else(|| no_such_profile(id))
+        .ok_or_else(|| no_such_profile(id))?;
+    Ok(Json(ProfileUpdate {
+        profile,
+        settings_version_created: version_created,
+        settings_versions_replaced: versions_replaced,
+    }))
 }
 
 #[cfg(test)]
