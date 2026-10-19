@@ -387,6 +387,8 @@ Section vivante — une ligne à ajouter après chaque mur rencontré.
    journal réel a sauté la vérification bloquante qui motivait un arbitrage. **Écrire l'état de
    l'orchestrateur en chemin absolu, toujours**, et vérifier le `git status` d'un worktree avant de
    le supposer propre — un `?? .claude/…` inattendu est la signature de cette erreur.
+   Depuis le désuivi de l'état (file, journaux, arbitrages hors git), un worktree n'en porte plus
+   de copie : une écriture relative y crée un fichier orphelin, invisible au `git status` (ignoré).
 
 - **16.** **Un rapport d'agent n'est pas un artefact du dépôt.** Commis par l'orchestrateur sur
    #42 : un chiffre issu du *rapport de fin de tâche* d'un agent a été recopié au journal,
