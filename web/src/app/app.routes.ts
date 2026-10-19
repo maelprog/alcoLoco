@@ -18,14 +18,14 @@ export const routes: Routes = [
     path: 'profiles',
     title: 'Choix du profil — alcoLoco',
     loadComponent: () =>
-      import('./features/profile-selection/profile-selection-page').then(
+      import('./pages/profile-selection/profile-selection-page').then(
         (m) => m.ProfileSelectionPage,
       ),
   },
   {
     path: 'profile',
     title: 'Mon profil — alcoLoco',
-    loadComponent: () => import('./features/profile/profile-page').then((m) => m.ProfilePage),
+    loadComponent: () => import('./pages/profile/profile-page').then((m) => m.ProfilePage),
   },
   {
     path: 'events',
