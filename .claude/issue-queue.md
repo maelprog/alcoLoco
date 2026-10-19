@@ -13,13 +13,34 @@ bloque, pour que la file reste correcte prise en tête. Ne pas la « remettre da
 Au-delà de cette exception, l'ordre respecte les « Bloqué par » déclarés dans chaque corps.
 Détail d'une issue en cours : `.claude/issue-log/<N>.md`.
 
+> **Prévu (arbitrage du 2026-10-19) : sortir `issue-queue.md` et `issue-log/` du suivi git.**
+> **Déclencheur : après le merge de #6 ET de #43** (pas avant). À faire hors issue GitHub, sur une branche `chore/untrack-orchestrator-state` (jamais sur `main`) :
+> 1. Dernier commit de l'état courant (journaux #6, #7, #10, #13, #16, #43, file) pour garder l'historique.
+> 2. `git rm -r --cached .claude/issue-queue.md .claude/issue-log/` — les fichiers restent sur disque.
+> 3. `.gitignore` : ajouter `/.claude/issue-queue.md` et `/.claude/issue-log/`, corriger le commentaire
+>    « Le reste de .claude/ (…) l'est » → seul `orchestrator.md` reste versionné.
+> 4. `orchestrator.md:386` (journaux écrits dans le worktree) : le piège disparaît, ajuster la mention.
+> 5. PR, CI, squash. PR #50 et #54 ne touchent pas `.claude/` : pas de conflit attendu.
+> Conséquence : plus de PR `chore(orchestrator)` pour solder une issue ; l'état n'existe que sur ce poste.
+>
+> **Prévu ensuite (arbitrage du 2026-10-19) : retirer les issues front de la file.**
+> **Déclencheur : untracking ci-dessus mergé** (édition locale seulement, plus de commit). Le front
+> est développé par un autre acteur : les issues restent ouvertes sur GitHub, seule la file les oublie.
+> 1. Retirer les lignes `[ ]` front : #8, #9, #12, #19–#28 (13 issues). Garder `[x] #4` (historique).
+> 2. `issue-log/8.md` (dettes léguées par #4 au front) : le transmettre à l'autre acteur, puis le
+>    supprimer — par ex. en commentaire sur l'issue #8 GitHub.
+> 3. **#29 dépend de #19 (front)** : la garder, mais noter la dépendance comme externe à la file
+>    (`dép: #14 #17 #19 (front, hors file)`) — l'orchestrateur ne doit ni la prendre avant #19 mergée, ni la croire débloquée.
+> 4. En-tête : milestone V1 → 18 issues dans la file (31 − 13), mention « front hors file, autre acteur ».
+> 5. `orchestrator.md` : gates 4-5 (lint/tests front) restent pertinents en CI ; rien à changer,
+>    sauf si une règle y suppose que l'orchestrateur implémente le front — à vérifier à ce moment.
+
 - [x] #1  infra  — Bootstrap du dépôt : workspace Rust, app Angular, Postgres local | PR #39 mergée (`5a9f96f`) | journal: issue-log/archive/1.md
 - [x] #2  bdd    — Schéma de base initial et outillage de migrations                | PR #42 mergée (`f35a171`) et **PR #41 mergée** le 2026-08-20 (`f525035`, rebase, 7 commits) | journal: issue-log/archive/2.md
 - [x] #3  back   — Squelette de l'API axum : config, erreurs, healthcheck, OpenAPI   | PR #45 mergée le 2026-08-20 (squash `56c6f56`) | 3 gates verts (4-5 n/a), 1 aller-retour | journal: issue-log/archive/3.md
 - [x] #4  front  — Squelette de l'app Angular : routing, layout, client HTTP         | PR #46 mergée le 2026-08-21 (squash `e614a81`) | 2 gates verts (1-3 n/a), 1 aller-retour | journal: issue-log/archive/4.md
 - [x] #5  calcul — Arbitrages actés et cas de référence chiffrés                     | PR #48 mergée le 2026-08-23 (squash `add113a`) | 3 gates verts (4-5 n/a), 0 aller-retour | journal: issue-log/archive/5.md
-- [ ] #6  back   — Profils : modèle et API CRUD                                      | dép: #3 | statut: à faire
-- [ ] #43 bdd    — Fermer le trou de concurrence de l'invariant « un profil a une version » | dép: #2 | bloque #7 | statut: à faire
+- [!] #43 bdd    — Fermer le trou de concurrence de l'invariant « un profil a une version » | dép: #2 | bloque #7 | PR #54 | BLOQUÉE sur arbitrage → issue-log/43.md
 - [ ] #7  back   — Versionnage de l'historique des paramètres du profil              | dép: #6 **#43** | statut: à faire (⚠ #43 bloquante : invariant faux sous concurrence — noté aussi en commentaire sur l'issue)
 - [ ] #8  front  — Écran de sélection de profil                                      | dép: #4 #6 | statut: à faire
 - [ ] #9  front  — Écran d'édition du profil et des préférences par défaut           | dép: #8 | statut: à faire
