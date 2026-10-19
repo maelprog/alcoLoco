@@ -1,10 +1,6 @@
-import { Component, inject } from '@angular/core';
+import { Component, OnInit, inject, signal } from '@angular/core';
+import { ProfileClient, ProfileSummary } from '../../core/profile/profile-client';
 import { CurrentProfileStore } from '../../core/profile/current-profile-store';
-
-interface ProfileSummary {
-  id: string;
-  display_name: string;
-}
 
 @Component({
   selector: 'app-profile-selection-page',
@@ -12,16 +8,26 @@ interface ProfileSummary {
   templateUrl: './profile-selection-page.html',
   styleUrl: './profile-selection-page.css',
 })
-export class ProfileSelectionPage {
+export class ProfileSelectionPage implements OnInit {
+  private readonly profileClient = inject(ProfileClient);
   private readonly currentProfileStore = inject(CurrentProfileStore);
 
-  // Données fictives pour développer l'interface avant de connecter l'API.
-  readonly profiles: ProfileSummary[] = [
-    { id: 'toto', display_name: 'Toto' },
-    { id: 'tata', display_name: 'Tata' },
-    { id: 'titi', display_name: 'Titi' },
-    { id: 'tutu', display_name: 'Tutu' },
-  ];
+  readonly profiles = signal<ProfileSummary[]>([]);
+  loading = true;
+  errorMessage = '';
+
+  ngOnInit(): void {
+    this.profileClient.list().subscribe({
+      next: (page) => {
+        this.profiles.set(page.items);
+        this.loading = false;
+      },
+      error: () => {
+        this.errorMessage = 'Impossible de charger les profils. Réessaie plus tard.';
+        this.loading = false;
+      },
+    });
+  }
 
   selectProfile(profile: ProfileSummary): void {
     this.currentProfileStore.select(profile);

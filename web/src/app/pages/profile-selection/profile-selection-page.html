@@ -10,7 +10,7 @@
     class="profile-grid"
     aria-label="Profils disponibles"
   >
-    @for (profile of profiles; track profile.id) {
+    @for (profile of profiles(); track profile.id) {
       <article class="profile-card">
         <h2>{{ profile.display_name }}</h2>
 
