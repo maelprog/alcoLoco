@@ -718,3 +718,75 @@ async fn ordinary_dml_around_a_version_removal_does_not_deadlock() {
         assert_eq!(version_count(&pool, p).await, 0);
     }
 }
+
+/// SQLSTATE `insufficient_privilege`.
+const INSUFFICIENT_PRIVILEGE: &str = "42501";
+
+#[tokio::test]
+async fn removing_a_version_needs_insert_update_and_select_on_the_guard_table() {
+    // The trigger functions run with the privileges of the caller, so the
+    // migration states which ones a role removing versions needs on
+    // `profile_settings_guard`. SELECT is the easy one to miss: the check's
+    // `ON CONFLICT DO UPDATE` reads the existing row. Each privilege is taken
+    // away in turn, and the refusal must come from the privilege check at
+    // COMMIT, the profile keeping both of its versions.
+    let name = "removing_a_version_needs_insert_update_and_select_on_the_guard_table";
+    let Some(url) = database_url(name) else {
+        return;
+    };
+    let pool = migrated_pool(&url).await;
+    let mut admin = connection(&url).await;
+
+    for missing in [None, Some("INSERT"), Some("UPDATE"), Some("SELECT")] {
+        let role = format!("guard_probe_{}", Uuid::now_v7().simple());
+        let guard_privileges = ["INSERT", "UPDATE", "SELECT"]
+            .into_iter()
+            .filter(|privilege| Some(*privilege) != missing)
+            .collect::<Vec<_>>()
+            .join(", ");
+        for grant in [
+            format!("CREATE ROLE {role}"),
+            format!("GRANT SELECT, DELETE ON profile_settings_version TO {role}"),
+            format!("GRANT SELECT ON profile TO {role}"),
+            format!("GRANT {guard_privileges} ON profile_settings_guard TO {role}"),
+        ] {
+            run(&mut admin, &grant)
+                .await
+                .unwrap_or_else(|error| panic!("{grant}: {error}"));
+        }
+
+        let (profile, versions) = profile_with_versions(&pool, 2).await;
+        let mut conn = connection(&url).await;
+        run(&mut conn, "BEGIN").await.expect("BEGIN");
+        run(&mut conn, &format!("SET LOCAL ROLE {role}"))
+            .await
+            .expect("SET ROLE");
+        delete_version(&mut conn, versions[0]).await;
+        let outcome = run(&mut conn, "COMMIT").await;
+        drop(conn);
+
+        for cleanup in [format!("DROP OWNED BY {role}"), format!("DROP ROLE {role}")] {
+            run(&mut admin, &cleanup)
+                .await
+                .unwrap_or_else(|error| panic!("{cleanup}: {error}"));
+        }
+
+        match missing {
+            None => {
+                outcome.unwrap_or_else(|error| {
+                    panic!("INSERT, UPDATE and SELECT must be enough: {error}")
+                });
+                assert_eq!(version_count(&pool, profile).await, 1);
+            }
+            Some(privilege) => {
+                let error = outcome.expect_err("the COMMIT must be refused");
+                assert_eq!(
+                    sqlstate(&error).as_deref(),
+                    Some(INSUFFICIENT_PRIVILEGE),
+                    "without {privilege}: wrong mechanism: {error}"
+                );
+                assert_eq!(version_count(&pool, profile).await, 2);
+            }
+        }
+    }
+}

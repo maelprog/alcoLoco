@@ -77,6 +77,13 @@
 -- Savepoints need no care: a rolled back subtransaction takes both its row
 -- events and its change to the setting with it.
 --
+-- The setting is a comma-separated text that the immediate trigger searches
+-- and rewrites at every row, so a transaction removing versions of N distinct
+-- profiles costs O(N²): a single DELETE of one version from each of 16 000
+-- profiles took about 12 s instead of 7 ms on the initial schema, and 47 s at
+-- 32 000 (measured on PostgreSQL 16.15 while closing #43). The cost is per
+-- transaction, since the setting lives as long as the transaction does.
+--
 -- What remains, and where the "no new deadlock" argument stops: a guard row is
 -- held from the moment the check writes it to the end of the transaction. At
 -- COMMIT that is the end of the transaction's work, so the holder waits for
@@ -88,9 +95,10 @@
 -- the triggers off, and (c) the writing transaction reading its own
 -- intermediate state are unchanged.
 --
--- A role that removes settings versions needs INSERT and UPDATE on
+-- A role that removes settings versions needs INSERT, UPDATE and SELECT on
 -- `profile_settings_guard`: the trigger functions run with the privileges of
--- the caller.
+-- the caller, and the `ON CONFLICT DO UPDATE` of the check reads the existing
+-- guard row. Without any of the three, the COMMIT fails with 42501.
 --
 -- Every relation is read schema-qualified, as every function of this schema
 -- does: class (e) of the initial migration, `pg_temp` shadowing.
