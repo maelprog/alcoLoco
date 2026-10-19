@@ -71,7 +71,9 @@ use super::validation::{ValidProfile, ValidSettings};
 
 /// Constraint that refuses two versions of a profile starting at the same
 /// instant. Named by the migration of #2; a violation of it is the caller's
-/// fault, not the server's, so it answers 409 rather than 500.
+/// fault, not the server's, so it answers 409 rather than 500. Tied to that
+/// migration by
+/// `the_constraint_answered_as_a_conflict_is_the_one_the_schema_declares`.
 const UNIQUE_VERSION_START: &str = "profile_settings_version_unique_start";
 
 /// One page of profiles, resumed after `$1` when it is not null.
@@ -1685,6 +1687,35 @@ mod tests {
             assert!(
                 declared.contains(&literal),
                 "the reader did not recover the statement `{name}` names: {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_constraint_answered_as_a_conflict_is_the_one_the_schema_declares() {
+        // `as_api_error` recognises a duplicate `valid_from` by the *name* of
+        // the constraint PostgreSQL reports. Renamed on the schema side only,
+        // the same write turns from a 409 into a 500 and no other test without
+        // a database sees it (measured on the verification of #6). The text is
+        // what can be read without a database: the declaration, with the
+        // columns it covers, and no later migration dropping or renaming it.
+        let declaration =
+            format!("CONSTRAINT {UNIQUE_VERSION_START} UNIQUE (profile_id, valid_from)");
+        let declared = db::MIGRATOR
+            .migrations
+            .iter()
+            .filter(|migration| migration.sql.contains(&declaration))
+            .count();
+        assert_eq!(declared, 1, "no migration declares `{declaration}`");
+
+        for undoing in ["DROP CONSTRAINT", "RENAME CONSTRAINT"] {
+            let undone = format!("{undoing} {UNIQUE_VERSION_START}");
+            assert!(
+                !db::MIGRATOR
+                    .migrations
+                    .iter()
+                    .any(|migration| migration.sql.contains(&undone)),
+                "a migration runs `{undone}`"
             );
         }
     }
