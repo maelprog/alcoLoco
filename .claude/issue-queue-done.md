@@ -1,1 +1,0 @@
-- [x] #6 back — Profils : modèle et API CRUD | PR #50 mergée le 2026-10-19 (ac6bfcf) | 13 allers-retours

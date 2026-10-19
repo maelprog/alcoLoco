@@ -11,5 +11,11 @@ node_modules/
 .env.local
 
 # Worktrees des agents : contenu volatil, jamais versionné.
-# Le reste de .claude/ (briefing, file d'issues, journaux) l'est.
 /.claude/worktrees/
+
+# État de l'orchestrateur : local à ce poste. Seul le briefing
+# (.claude/orchestrator.md) reste versionné.
+/.claude/issue-queue.md
+/.claude/issue-queue-done.md
+/.claude/arbitrages.md
+/.claude/issue-log/
