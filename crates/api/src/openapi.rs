@@ -11,14 +11,9 @@ use utoipa::OpenApi;
 /// Where the document is served, when it is served.
 pub const DOCUMENT_PATH: &str = "/openapi.json";
 
-/// The OpenAPI document of the alcoLoco API, **before** [`spec`] repairs it.
+/// The OpenAPI document of the alcoLoco API, as the derive builds it.
 ///
-/// Deliberately private, and it is not a matter of taste. `ApiDoc::openapi()`
-/// carries the empty licence object described on [`spec`]; while this type was
-/// public, the guard `the_document_makes_no_empty_claim_about_a_licence` watched
-/// `spec()` and nothing watched the other way out, so a caller reaching for the
-/// derive got an invalid OpenAPI 3.1 document with no warning. Keeping the type
-/// private leaves exactly one way out of this module, the repaired one.
+/// Private: the document leaves this module through [`spec`] only.
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -55,18 +50,11 @@ struct ApiDoc;
 
 /// The document, as served.
 ///
-/// `utoipa` fills `info.license` from the Cargo manifest, and this crate carries
-/// no `license` field, so the derive leaves `{"name": ""}` behind. OpenAPI 3.1
-/// makes `license.name` required, and an empty name is not a name: the object is
-/// dropped rather than filled with a licence the project has not chosen.
-///
-/// This is the only way the document leaves the module, which is what makes the
-/// repair unavoidable — see [`ApiDoc`].
+/// `utoipa` fills `info.license` from the Cargo manifest, so the document
+/// publishes the licence the workspace declares (`license = "MIT"`).
 #[must_use]
 pub fn spec() -> utoipa::openapi::OpenApi {
-    let mut spec = ApiDoc::openapi();
-    spec.info.license = None;
-    spec
+    ApiDoc::openapi()
 }
 
 /// Serves the OpenAPI document.
@@ -83,31 +71,14 @@ mod tests {
     }
 
     #[test]
-    fn the_document_makes_no_empty_claim_about_a_licence() {
-        // `{"name": ""}` is what utoipa leaves when the manifest names no
-        // licence, and OpenAPI 3.1 requires a name on the object it appears in.
+    fn the_document_publishes_the_mit_licence() {
+        // The workspace is licensed MIT, and the document says so. OpenAPI 3.1
+        // requires `name` on a licence object, so an empty one would not do.
         let document = rendered();
-        assert!(
-            document["info"]["license"].is_null(),
-            "an empty licence object reached the document: {document}"
-        );
-    }
-
-    #[test]
-    fn the_repair_is_still_needed_and_still_on_the_only_way_out() {
-        // Two halves of the same statement. That the derive still produces the
-        // empty licence — so the day utoipa stops, this test says so instead of
-        // leaving dead code behind; and that the repaired document is the only
-        // one leaving the module, which is what `ApiDoc` being private buys.
-        // The test can name `ApiDoc` because it is a child of the module; no
-        // caller outside it can.
-        let raw = serde_json::to_value(ApiDoc::openapi()).expect("must serialise");
         assert_eq!(
-            raw["info"]["license"],
-            serde_json::json!({ "name": "" }),
-            "utoipa no longer leaves an empty licence: `spec()` may stop repairing it"
+            document["info"]["license"]["name"], "MIT",
+            "the document does not publish the MIT licence: {document}"
         );
-        assert!(rendered()["info"]["license"].is_null());
     }
 
     #[test]
