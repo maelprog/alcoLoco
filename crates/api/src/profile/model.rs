@@ -9,9 +9,9 @@
 //!
 //! `settings` is **nullable in the answer**. `profile_settings_at()` returns zero
 //! rows rather than a row of `NULL`s when a profile owns no version, and SPEC.md
-//! §10.0-L class (d) says that state is reachable under concurrent writes for as
-//! long as #43 is open. Rendering it as `null` is the honest reading; inventing
-//! defaults would be the dishonest one.
+//! §10.0-L classes (a) and (b) say that state is still reachable, by a bulk wipe
+//! of the versions or by switching the checks off. Rendering it as `null` is the
+//! honest reading; inventing defaults would be the dishonest one.
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -246,8 +246,8 @@ mod tests {
     #[test]
     fn a_profile_without_settings_renders_them_as_null() {
         // The shape the empty result of `profile_settings_at()` reaches a client
-        // as. A profile that lost its only version under the concurrency hole of
-        // SPEC.md §10.0-L class (d) is reported, not hidden behind zeroes.
+        // as. A profile that lost its only version through SPEC.md §10.0-L class
+        // (a) or (b) is reported, not hidden behind zeroes.
         let rendered = serde_json::to_value(a_profile(None)).expect("must serialise");
         assert!(rendered["settings"].is_null(), "{rendered}");
     }

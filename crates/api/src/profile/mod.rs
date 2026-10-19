@@ -13,7 +13,7 @@
 //!   a write that changes only the preferences posts none (SPEC.md §10.0-J);
 //! - the rest of the versioning policy — closing the previous version at `T`,
 //!   replacing every version already later than `T` and reporting how many were
-//!   replaced (SPEC.md §5.1) — is issue #7, and #43 blocks it.
+//!   replaced (SPEC.md §5.1) — is issue #7.
 
 pub mod model;
 pub mod store;
