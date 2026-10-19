@@ -33,6 +33,7 @@ dependencies = [
  "axum",
  "chrono",
  "db",
+ "domain",
  "http-body-util",
  "serde",
  "serde_json",

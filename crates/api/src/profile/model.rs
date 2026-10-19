@@ -10,8 +10,10 @@
 //! `settings` is **nullable in the answer**. `profile_settings_at()` returns zero
 //! rows rather than a row of `NULL`s when a profile owns no version, and SPEC.md
 //! §10.0-L classes (a) and (b) say that state is still reachable, by a bulk wipe
-//! of the versions or by switching the checks off. Rendering it as `null` is the
-//! honest reading; inventing defaults would be the dishonest one.
+//! of the versions or by taking the checks away — switching the triggers off, or
+//! deleting the `profile_settings_guard` rows that serialise concurrent removals
+//! (#43) while two of them race. Rendering it as `null` is the honest reading;
+//! inventing defaults would be the dishonest one.
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -123,6 +125,25 @@ pub struct Profile {
     /// Instant the profile row was last written.
     #[schema(value_type = String, format = DateTime, example = "2026-08-20T21:04:05Z")]
     pub updated_at: Timestamp,
+}
+
+/// A replaced profile, and what the replacement did to its settings history.
+///
+/// The profile alone could not say it: `settings` shows the version in force
+/// now, and it can read the same whether nothing was posted, a version was
+/// posted with the values already in force, or the history behind it was
+/// rewritten. The two members below tell those cases apart (SPEC.md §5.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ProfileUpdate {
+    /// The profile as replaced, with the parameters in force now.
+    #[serde(flatten)]
+    pub profile: Profile,
+    /// Whether a settings version was posted at the requested `valid_from`.
+    /// `false` when the four parameters already were those in force then.
+    pub settings_version_created: bool,
+    /// How many settings versions starting after the requested `valid_from`
+    /// were replaced.
+    pub settings_versions_replaced: u64,
 }
 
 /// The physiological half of a write, as it arrives.

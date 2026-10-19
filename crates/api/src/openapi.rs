@@ -37,6 +37,7 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         crate::profile::Profile,
         crate::profile::ProfileRequest,
         crate::profile::ProfileSettings,
+        crate::profile::ProfileUpdate,
         crate::profile::QuantityUnit,
         crate::profile::Sex,
         crate::profile::SettingsRequest,

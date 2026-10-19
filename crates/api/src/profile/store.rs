@@ -71,7 +71,9 @@ use super::validation::{ValidProfile, ValidSettings};
 
 /// Constraint that refuses two versions of a profile starting at the same
 /// instant. Named by the migration of #2; a violation of it is the caller's
-/// fault, not the server's, so it answers 409 rather than 500.
+/// fault, not the server's, so it answers 409 rather than 500. Tied to that
+/// migration by
+/// `the_constraint_answered_as_a_conflict_is_the_one_the_schema_declares`.
 const UNIQUE_VERSION_START: &str = "profile_settings_version_unique_start";
 
 /// One page of profiles, resumed after `$1` when it is not null.
@@ -148,8 +150,16 @@ const UPDATE_PROFILE: &str = "
 /// Takes the row lock that serialises two updates of the same profile.
 const LOCK_PROFILE: &str = "SELECT 1 FROM public.profile WHERE id = $1 FOR UPDATE";
 
+/// Every version of a profile starting strictly after an instant: the versions
+/// a post at that instant replaces (SPEC.md §5.1).
+const DELETE_VERSIONS_AFTER: &str = "
+    DELETE FROM public.profile_settings_version
+    WHERE profile_id = $1 AND valid_from > $2
+";
+
 /// The parameters in force at a given instant, for the comparison that decides
-/// whether an update has to post a version at all (SPEC.md §10.0-J).
+/// whether an update has to post a version at all (SPEC.md §10.0-J), and for
+/// [`settings_at`].
 const SELECT_SETTINGS_AT: &str = "
     SELECT valid_from, weight_kg, height_cm, sex::pg_catalog.text AS sex, birth_date
     FROM public.profile_settings_at($1, $2)
@@ -232,6 +242,33 @@ pub async fn read(pool: &PgPool, id: Uuid) -> Result<Option<Profile>, ApiError> 
         .transpose()
 }
 
+/// The physiological parameters in force for a profile at `at` (SPEC.md §5.6).
+///
+/// The resolution every computation goes through: a drink is computed with the
+/// version in force at its ingestion time, and an instant earlier than the
+/// whole history falls back to the oldest version (the open lower bound of
+/// SPEC.md §5.1). `None` when no profile carries that identifier, or when the
+/// profile owns no version — the reachable cases of SPEC.md §10.0-L.
+///
+/// # Errors
+///
+/// Fails when the query cannot be run or the row cannot be read.
+pub async fn settings_at(
+    pool: &PgPool,
+    id: Uuid,
+    at: Timestamp,
+) -> Result<Option<ProfileSettings>, ApiError> {
+    Ok(sqlx::query(SELECT_SETTINGS_AT)
+        .bind(id)
+        .bind(at)
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(settings_from_row)
+        .transpose()?
+        .flatten())
+}
+
 /// Writes a settings version inside an open transaction.
 async fn insert_version(
     tx: &mut Transaction<'_, Postgres>,
@@ -297,23 +334,44 @@ pub async fn create(pool: &PgPool, id: Uuid, profile: &ValidProfile) -> Result<(
 pub enum Updated {
     /// No profile carries that identifier.
     NoSuchProfile,
-    /// The preferences were written; the parameters were already those in force.
-    PreferencesOnly,
-    /// The preferences were written and a settings version was posted.
-    WithNewVersion,
+    /// The profile was replaced.
+    Written {
+        /// Whether a settings version was posted at the requested `valid_from`.
+        version_created: bool,
+        /// How many versions starting strictly after that `valid_from` were
+        /// replaced (SPEC.md §5.1).
+        versions_replaced: u64,
+    },
 }
 
 /// Replaces a profile, posting a settings version only if one is needed.
 ///
-/// A version is posted when the four parameters of SPEC.md §10.0-D differ from
-/// those in force **at the requested `valid_from`**, and when the profile owns no
-/// applicable version at all. Rewriting only the input preferences posts nothing:
-/// they enter no computation, and SPEC.md §10.0-J leaves them unversioned.
+/// The settings half of the request reads "from `valid_from` on, these are the
+/// parameters", and SPEC.md §5.1 spells out what that does to the history:
 ///
-/// The comparison is made against the instant the caller asked for rather than
-/// against now, so that a retroactive correction is judged against the values it
-/// actually corrects. Closing the versions already later than `valid_from` is the
-/// remaining half of SPEC.md §5.1 and belongs to issue #7.
+/// - every version starting **strictly after** `valid_from` is replaced, that
+///   is deleted — including when no version is posted, since those versions
+///   contradict the request, and keeping them would answer 200 on a profile
+///   still saying something else from their start on;
+/// - a version is then posted at `valid_from` when the four parameters of
+///   SPEC.md §10.0-D differ from those in force **at that instant**, or when
+///   no version is left to be in force at all. The previous version is closed
+///   at `valid_from` by construction: a version stores its lower bound only.
+///
+/// Rewriting only the input preferences posts nothing: they enter no
+/// computation, and SPEC.md §10.0-J leaves them unversioned.
+///
+/// The deletion runs **before** the comparison, and the order is the point.
+/// When `valid_from` precedes the whole history, `profile_settings_at()` falls
+/// back to the oldest version — which is itself later than `valid_from`, so
+/// about to be replaced. Compared first, that fallback could find the request
+/// identical, post nothing, and leave the profile without a version, which the
+/// schema then refuses at `COMMIT`. Compared after, it finds nothing left, and
+/// the request is posted.
+///
+/// A version already starting at exactly `valid_from` is not later than it,
+/// so it is not replaced: posting different values there is refused as a
+/// conflict, and the whole transaction — deletions included — rolls back.
 ///
 /// # Errors
 ///
@@ -342,6 +400,14 @@ pub async fn update(pool: &PgPool, id: Uuid, profile: &ValidProfile) -> Result<U
         .await
         .map_err(as_api_error)?;
 
+    let versions_replaced = sqlx::query(DELETE_VERSIONS_AFTER)
+        .bind(id)
+        .bind(profile.settings.valid_from)
+        .execute(&mut *tx)
+        .await
+        .map_err(as_api_error)?
+        .rows_affected();
+
     let in_force = sqlx::query(SELECT_SETTINGS_AT)
         .bind(id)
         .bind(profile.settings.valid_from)
@@ -352,11 +418,11 @@ pub async fn update(pool: &PgPool, id: Uuid, profile: &ValidProfile) -> Result<U
         .transpose()?
         .flatten();
 
-    let needs_version = in_force
+    let version_created = in_force
         .as_ref()
         .is_none_or(|current| profile.settings.differs_from(current));
 
-    if needs_version {
+    if version_created {
         insert_version(&mut tx, id, &profile.settings)
             .await
             .map_err(as_api_error)?;
@@ -364,10 +430,9 @@ pub async fn update(pool: &PgPool, id: Uuid, profile: &ValidProfile) -> Result<U
 
     tx.commit().await.map_err(as_api_error)?;
 
-    Ok(if needs_version {
-        Updated::WithNewVersion
-    } else {
-        Updated::PreferencesOnly
+    Ok(Updated::Written {
+        version_created,
+        versions_replaced,
     })
 }
 
@@ -1624,6 +1689,44 @@ mod tests {
                 "the reader did not recover the statement `{name}` names: {literal}"
             );
         }
+    }
+
+    #[test]
+    fn the_constraint_answered_as_a_conflict_is_the_one_the_schema_declares() {
+        // `as_api_error` recognises a duplicate `valid_from` by the *name* of
+        // the constraint PostgreSQL reports. Renamed on the schema side only,
+        // the same write turns from a 409 into a 500 and no other test without
+        // a database sees it (measured on the verification of #6).
+        //
+        // The guard is **lexical**: it reads the migration text, without a
+        // database. It requires the declaration, with the columns it covers,
+        // and requires it to be the *only* place any migration names the
+        // constraint, in any case. Every statement that drops or renames it by
+        // name therefore fails here, whatever its spelling — `DROP CONSTRAINT
+        // IF EXISTS`, `RENAME CONSTRAINT`, `ALTER INDEX … RENAME TO`, a quoted
+        // identifier — and so does a mere comment naming it, which costs a
+        // rewording and is the safe direction. What it cannot see is a change
+        // that does not write the name: a `DROP TABLE` and recreation, a name
+        // assembled at run time inside a `DO` block, a drop through the
+        // catalogue. The live check is `two_versions_may_not_start_at_the_same_instant`
+        // in `crates/api/tests/database.rs`, which needs a database.
+        let declaration =
+            format!("constraint {UNIQUE_VERSION_START} unique (profile_id, valid_from)");
+        let mut declared = 0;
+        let mut mentioned = 0;
+        for migration in db::MIGRATOR.migrations.iter() {
+            let lowered = migration.sql.to_lowercase();
+            declared += lowered.matches(&declaration).count();
+            mentioned += lowered.matches(UNIQUE_VERSION_START).count();
+        }
+        assert_eq!(
+            declared, 1,
+            "the migrations do not declare `{declaration}` exactly once"
+        );
+        assert_eq!(
+            mentioned, 1,
+            "a migration names `{UNIQUE_VERSION_START}` outside its declaration"
+        );
     }
 
     #[test]
