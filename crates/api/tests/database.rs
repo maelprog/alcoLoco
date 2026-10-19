@@ -484,8 +484,8 @@ async fn a_retroactive_valid_from_is_stored_where_it_belongs_in_the_history() {
     // What #6 deliberately does **not** do, and what this test pins so the
     // boundary is visible rather than assumed: closing the versions already
     // later than that instant. SPEC.md §5.1 has a retroactive post replace every
-    // later version and report how many it replaced — that is issue #7, which
-    // #43 blocks. Until then the later version stays, and it is still the one in
+    // later version and report how many it replaced — that is issue #7. Until
+    // then the later version stays, and it is still the one in
     // force now, which is why the answer keeps the old weight.
     let name = "a_retroactive_valid_from_is_stored_where_it_belongs_in_the_history";
     let Some(state) = migrated(name).await else {
