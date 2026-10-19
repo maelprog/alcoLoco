@@ -964,6 +964,10 @@ async fn the_schema_refuses_a_birth_date_in_the_future() {
         assert!(refused.contains("birth date"), "{zone}: {refused}");
     }
 
+    sqlx::query("SAVEPOINT birth_date_update")
+        .execute(&mut *tx)
+        .await
+        .expect("the savepoint must be set");
     let moved = sqlx::query(
         "UPDATE public.profile_settings_version SET birth_date = $2::date WHERE profile_id = $1",
     )
@@ -973,6 +977,10 @@ async fn the_schema_refuses_a_birth_date_in_the_future() {
     .await
     .expect_err("an UPDATE may not move a birth date into the future either")
     .to_string();
+    sqlx::query("ROLLBACK TO SAVEPOINT birth_date_update")
+        .execute(&mut *tx)
+        .await
+        .expect("the refused UPDATE must roll back to its savepoint");
     assert!(moved.contains("birth date"), "{moved}");
 }
 
