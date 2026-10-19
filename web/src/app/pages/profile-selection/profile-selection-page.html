@@ -1,0 +1,29 @@
+<main class="profile-selection">
+  <header class="page-header">
+    <h1>Choix du profil</h1>
+    <p>
+      Sélectionne le profil que tu souhaites utiliser.
+    </p>
+  </header>
+
+  <section
+    class="profile-grid"
+    aria-label="Profils disponibles"
+  >
+    @for (profile of profiles(); track profile.id) {
+      <article class="profile-card">
+        <h2>{{ profile.display_name }}</h2>
+
+        <button
+          type="button"
+          class="profile-card__button"
+          (click)="selectProfile(profile)"
+        >
+          Choisir ce profil
+        </button>
+      </article>
+    } @empty {
+      <p>Aucun profil disponible.</p>
+    }
+  </section>
+</main>

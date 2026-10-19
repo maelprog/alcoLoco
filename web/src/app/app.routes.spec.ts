@@ -7,8 +7,8 @@ import { routes } from './app.routes';
 import { EventDetailPage } from './features/events/event-detail-page';
 import { EventListPage } from './features/events/event-list-page';
 import { NotFoundPage } from './features/not-found/not-found-page';
-import { ProfilePage } from './features/profile/profile-page';
-import { ProfileSelectionPage } from './features/profile-selection/profile-selection-page';
+import { ProfilePage } from './pages/profile/profile-page';
+import { ProfileSelectionPage } from './pages/profile-selection/profile-selection-page';
 import { NAV_LINKS } from './layout/nav-links';
 
 describe('application routes', () => {
