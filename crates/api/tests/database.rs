@@ -871,23 +871,27 @@ async fn a_weight_change_moves_only_the_drinks_after_it_and_a_correction_moves_i
 }
 
 /// Writes one settings version with the given birth date straight to the
-/// database, from a session set to `time_zone`, and says whether the schema
-/// accepted it.
+/// database, inside the caller's transaction, from a session set to
+/// `time_zone`, and says whether the schema accepted it.
 ///
-/// The zone is set with `SET LOCAL` semantics inside a transaction of its own,
-/// so the pooled connection goes back to the pool with its usual zone.
+/// The zone is set with `SET LOCAL` semantics, so it never outlives the
+/// transaction. The write runs under a savepoint: a refused write is rolled
+/// back to it, and the transaction stays usable for the next one.
 async fn schema_accepts_birth_date(
-    pool: &sqlx::PgPool,
+    tx: &mut sqlx::PgConnection,
     profile: Uuid,
     birth_date: &str,
     time_zone: &str,
 ) -> Result<(), String> {
-    let mut tx = pool.begin().await.expect("a transaction must open");
     sqlx::query("SELECT pg_catalog.set_config('TimeZone', $1, true)")
         .bind(time_zone)
         .execute(&mut *tx)
         .await
         .expect("the time zone must be accepted");
+    sqlx::query("SAVEPOINT birth_date_write")
+        .execute(&mut *tx)
+        .await
+        .expect("the savepoint must be set");
     let written = sqlx::query(
         "INSERT INTO public.profile_settings_version (
              id, profile_id, valid_from, weight_kg, height_cm, sex, birth_date
@@ -902,9 +906,15 @@ async fn schema_accepts_birth_date(
     .await
     .map(|_| ())
     .map_err(|error| error.to_string());
-    if written.is_ok() {
-        tx.commit().await.expect("the accepted write must commit");
-    }
+    let closing = if written.is_ok() {
+        "RELEASE SAVEPOINT birth_date_write"
+    } else {
+        "ROLLBACK TO SAVEPOINT birth_date_write"
+    };
+    sqlx::query(closing)
+        .execute(&mut *tx)
+        .await
+        .expect("the savepoint must close");
     written
 }
 
@@ -921,28 +931,34 @@ async fn the_schema_refuses_a_birth_date_in_the_future() {
     // still on yesterday's until 11:00 UTC, so at any instant at least one of
     // the two dates differs from the UTC one. A rule read in the session zone
     // then either accepts tomorrow (UTC) or refuses today (UTC) there.
+    //
+    // One transaction for the reading of today and for every write, because
+    // `now()` is frozen at the start of a transaction: the trigger then judges
+    // every write against the very date the test read, even when midnight UTC
+    // passes while the test runs. Across separate transactions, today would
+    // turn into yesterday and tomorrow into today at midnight, and the test
+    // would fail with nothing wrong in the schema. Each refusal is rolled back
+    // to a savepoint, so that the transaction goes on.
     let name = "the_schema_refuses_a_birth_date_in_the_future";
     let Some(state) = migrated(name).await else {
         return;
     };
 
     let (id, _) = create_profile(&state, &a_sound_payload("Naissance")).await;
-    let today: String =
-        sqlx::query_scalar("SELECT ((now() AT TIME ZONE 'UTC')::date)::pg_catalog.text")
-            .fetch_one(&state.pool)
-            .await
-            .expect("the date must be readable");
-    let tomorrow: String =
-        sqlx::query_scalar("SELECT ((now() AT TIME ZONE 'UTC')::date + 1)::pg_catalog.text")
-            .fetch_one(&state.pool)
-            .await
-            .expect("the date must be readable");
+    let mut tx = state.pool.begin().await.expect("a transaction must open");
+    let (today, tomorrow): (String, String) = sqlx::query_as(
+        "SELECT ((now() AT TIME ZONE 'UTC')::date)::pg_catalog.text,
+                ((now() AT TIME ZONE 'UTC')::date + 1)::pg_catalog.text",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the dates must be readable");
 
     for zone in ["UTC", "Pacific/Kiritimati", "Pacific/Pago_Pago"] {
-        schema_accepts_birth_date(&state.pool, id, &today, zone)
+        schema_accepts_birth_date(&mut tx, id, &today, zone)
             .await
             .unwrap_or_else(|error| panic!("today (UTC) is not in the future in {zone}: {error}"));
-        let refused = schema_accepts_birth_date(&state.pool, id, &tomorrow, zone)
+        let refused = schema_accepts_birth_date(&mut tx, id, &tomorrow, zone)
             .await
             .expect_err("a birth date after today (UTC) must be refused");
         assert!(refused.contains("birth date"), "{zone}: {refused}");
@@ -953,7 +969,7 @@ async fn the_schema_refuses_a_birth_date_in_the_future() {
     )
     .bind(id)
     .bind(&tomorrow)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .expect_err("an UPDATE may not move a birth date into the future either")
     .to_string();
