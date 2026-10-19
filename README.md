@@ -181,8 +181,9 @@ failure (`40001`) under `REPEATABLE READ` and `SERIALIZABLE` — even when versi
 check only ever waits for other checks on the same profile, never for a lock taken by ordinary
 writes, so it adds no deadlock with them unless it is run mid-transaction (`SET CONSTRAINTS …
 IMMEDIATE`). The
-guarantee is **not absolute**: bulk wipes (`TRUNCATE`) and anything that disables the triggers can
-leave a profile durably versionless, with `profile_settings_at()` returning no row for a profile
+guarantee is **not absolute**: bulk wipes (`TRUNCATE`), anything that disables the triggers, and
+deleting the guard rows of `profile_settings_guard` while two `REPEATABLE READ` or `SERIALIZABLE`
+removals race can leave a profile durably versionless, with `profile_settings_at()` returning no row for a profile
 that still exists and signalling nothing. The exhaustive account — every escape class, who can
 reach it and with which privileges — is in [§5.1](docs/SPEC.md#51-profils) and
 [§10.0-L](docs/SPEC.md#100-décisions-actées) of the spec.

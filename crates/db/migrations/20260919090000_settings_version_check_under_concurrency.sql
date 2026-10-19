@@ -60,7 +60,18 @@
 -- and bring the profile's lockers back into the check's waits. A guard row
 -- outlives its profile; it is a few bytes, carries no data, and is recreated
 -- on demand if deleted, since the check writes it with `INSERT ... ON
--- CONFLICT DO UPDATE`. Deleting or emptying the table weakens nothing.
+-- CONFLICT DO UPDATE`.
+--
+-- Deleting guard rows is **not** harmless, though. Under REPEATABLE READ and
+-- SERIALIZABLE the check relies on finding the guard row a concurrent remover
+-- has written since its snapshot. If a third transaction deletes that row
+-- (`DELETE` or `TRUNCATE` of `profile_settings_guard`) and commits in between,
+-- the check inserts a fresh row instead, without any serialization failure,
+-- then reads its old snapshot and still sees the version the other remover
+-- took away: both removals commit and the profile is left at zero versions.
+-- Any role holding DELETE or TRUNCATE on the guard table can therefore reopen
+-- the concurrency hole; this belongs with class (b) below, an operation that
+-- takes the database's checks away. The application never deletes guard rows.
 --
 -- Deadlocks between checks. The deferred triggers fire at COMMIT in the order
 -- their row events were queued, so two transactions removing versions of
