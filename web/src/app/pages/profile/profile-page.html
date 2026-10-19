@@ -1,0 +1,128 @@
+<main class="profile-page">
+  <header>
+    <h1>Mon profil</h1>
+    <p>Modifie tes paramètres physiologiques et tes préférences de saisie.</p>
+  </header>
+
+  <form (ngSubmit)="saveProfile()">
+    <fieldset>
+      <legend>Paramètres physiologiques</legend>
+
+      <div>
+        <label for="weightKg">Poids (kg) *</label>
+        <input
+          id="weightKg"
+          name="weightKg"
+          type="number"
+          min="1"
+          step="any"
+          [ngModel]="weightKg()"
+          (ngModelChange)="weightKg.set($event)"
+          required
+        />
+      </div>
+
+      <div>
+        <label for="heightCm">Taille (cm) *</label>
+        <input
+          id="heightCm"
+          name="heightCm"
+          type="number"
+          min="1"
+          step="any"
+          [ngModel]="heightCm()"
+          (ngModelChange)="heightCm.set($event)"
+          required
+        />
+      </div>
+
+      <div>
+        <label for="sex">Sexe *</label>
+        <select
+          id="sex"
+          name="sex"
+          [ngModel]="sex()"
+          (ngModelChange)="sex.set($event)"
+          required
+        >
+          <option value="">Sélectionner…</option>
+          <option value="female">Féminin</option>
+          <option value="male">Masculin</option>
+        </select>
+      </div>
+
+      <div>
+        <label for="birthDate">Date de naissance *</label>
+        <input
+          id="birthDate"
+          name="birthDate"
+          type="date"
+          [ngModel]="birthDate()"
+          (ngModelChange)="birthDate.set($event)"
+          required
+        />
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Préférences de saisie</legend>
+
+      <div>
+        <label for="defaultUnit">Unité par défaut</label>
+        <select
+          id="defaultUnit"
+          name="defaultUnit"
+          [ngModel]="defaultUnit()"
+          (ngModelChange)="defaultUnit.set($event)"
+        >
+          <option value="cl">Volume (cL)</option>
+          <option value="percent">Pourcentage (%)</option>
+        </select>
+      </div>
+
+      <div>
+        <label for="ingestionDuration">
+          Durée d'ingestion par défaut (minutes)
+        </label>
+        <input
+          id="ingestionDuration"
+          name="ingestionDuration"
+          type="number"
+          min="0"
+          step="1"
+          [ngModel]="defaultIngestionDuration()"
+          (ngModelChange)="defaultIngestionDuration.set($event)"
+        />
+      </div>
+
+      <div>
+        <label for="absorptionDuration">
+          Durée d'absorption par défaut (minutes)
+        </label>
+        <input
+          id="absorptionDuration"
+          name="absorptionDuration"
+          type="number"
+          min="0"
+          step="1"
+          [ngModel]="defaultAbsorptionDuration()"
+          (ngModelChange)="defaultAbsorptionDuration.set($event)"
+        />
+      </div>
+    </fieldset>
+
+    <p class="profile-page__notice">
+      Les modifications de tes paramètres ne réécrivent pas les courbes passées.
+    </p>
+
+    @if (errorMessage()) {
+      <p role="alert">{{ errorMessage() }}</p>
+    }
+
+    @if (successMessage()) {
+      <p role="status">{{ successMessage() }}</p>
+    }
+
+    <button type="submit">Enregistrer les modifications</button>
+  </form>
+</main>
