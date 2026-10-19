@@ -1379,6 +1379,7 @@ mod tests {
             ("\n    ", "a line break and its indentation"),
             ("\t", "a tabulation"),
             ("\r\n", "a carriage return and a line break"),
+            ("\x0c", "a form feed"),
         ] {
             let statement = format!("SELECT 1 FROM{separator}profile");
             assert_eq!(
