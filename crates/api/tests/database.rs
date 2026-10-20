@@ -2770,24 +2770,28 @@ async fn an_invalid_write_is_a_400_and_leaves_the_stored_drink_alone() {
 
 #[tokio::test]
 async fn an_ingestion_time_is_held_to_what_the_database_stores() {
-    // Ties `earliest_ingested_at` to the live server in both directions: the
-    // bound itself is stored and read back unchanged, one microsecond earlier
-    // is a field error and not the 500 PostgreSQL would answer.
+    // Ties `earliest_ingested_at` to the live server in both directions. The
+    // two instants are written out, not derived from the constant: the
+    // earliest instant a `timestamptz` holds must be accepted, stored and
+    // read back unchanged — a stricter bound refuses it here — and the
+    // microsecond before it must be a field error — a looser bound lets it
+    // reach PostgreSQL, which answers it with a 500.
     let name = "an_ingestion_time_is_held_to_what_the_database_stores";
     let Some(state) = migrated(name).await else {
         return;
     };
     let (profile, _) = create_profile(&state, &a_sound_payload("Préhistoire")).await;
-    let earliest = api::drink::validation::earliest_ingested_at();
-    let rendered = serde_json::to_value(earliest).expect("must serialise");
+    let earliest = "-4713-11-24T00:00:00Z";
+    let just_before = "-4713-11-23T23:59:59.999999Z";
 
     let mut payload = a_beer("Bière", "unused");
-    payload["ingested_at"] = rendered.clone();
+    payload["ingested_at"] = Value::from(earliest);
     let (drink, body) = record_drink(&state, profile, &payload).await;
-    assert_eq!(body["ingested_at"], rendered);
+    assert_eq!(body["ingested_at"], earliest);
+    let (_, read) = body_of(state.clone(), &format!("/drinks/{drink}")).await;
+    assert_eq!(read["ingested_at"], earliest);
 
-    payload["ingested_at"] =
-        serde_json::to_value(earliest - chrono::Duration::microseconds(1)).expect("must serialise");
+    payload["ingested_at"] = Value::from(just_before);
     let answer = send(
         state.clone(),
         "POST",
