@@ -201,32 +201,103 @@ async fn version_count(pool: &sqlx::PgPool, profile: Uuid) -> i64 {
         .expect("the count must run")
 }
 
+/// `sql` lowercased, with its `--` and `/* */` comments removed (block comments
+/// nest, as in PostgreSQL) and every run of whitespace collapsed to one space.
+///
+/// Single-quoted strings and double-quoted identifiers are copied as they are,
+/// so that a `--` or a `/*` inside a literal is not taken for a comment. Dollar
+/// quotes are not recognised: a function body is scanned like the rest of the
+/// file, which is right for its comments and its own quoted strings. What this
+/// does not handle is an `E'…\'…'` string, whose backslash-escaped quote would
+/// end the literal early; no migration writes one.
+fn without_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+
+    while let Some(character) = chars.next() {
+        match character {
+            '-' if chars.peek() == Some(&'-') => {
+                for skipped in chars.by_ref() {
+                    if skipped == '\n' {
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut depth = 1;
+                while depth > 0 {
+                    match chars.next() {
+                        Some('/') if chars.peek() == Some(&'*') => {
+                            chars.next();
+                            depth += 1;
+                        }
+                        Some('*') if chars.peek() == Some(&'/') => {
+                            chars.next();
+                            depth -= 1;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                out.push(' ');
+            }
+            '\'' | '"' => {
+                // A doubled quote inside a literal closes it and reopens it at
+                // once, which copies the same characters.
+                out.push(character);
+                for inner in chars.by_ref() {
+                    out.push(inner);
+                    if inner == character {
+                        break;
+                    }
+                }
+            }
+            _ => out.push(character),
+        }
+    }
+
+    out.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Names a `CREATE TABLE` / `DROP TABLE` statement of `sql` acts on.
 ///
-/// `keyword` is matched on a lowercased copy, so it must be given lowercase and
-/// end with a space. Any schema qualification is dropped: only the bare name is
-/// returned, which is what `information_schema` reports.
+/// `keyword` is matched on [`without_comments`], so it must be given lowercase,
+/// with single spaces, and end with a space. A comma-separated list of names —
+/// `DROP TABLE a, b` — yields every name of the list. Any schema qualification
+/// is dropped: only the bare name is returned, which is what
+/// `information_schema` reports.
 fn tables_named_after(sql: &str, keyword: &str) -> Vec<String> {
-    let lowered = sql.to_lowercase();
+    let normalised = without_comments(sql);
     let mut names = Vec::new();
     let mut from = 0;
 
-    while let Some(at) = lowered[from..].find(keyword) {
+    while let Some(at) = normalised[from..].find(keyword) {
         let after = from + at + keyword.len();
-        let mut rest = lowered[after..].trim_start();
+        let mut rest = normalised[after..].trim_start();
         for guard in ["if not exists ", "if exists "] {
             if let Some(stripped) = rest.strip_prefix(guard) {
                 rest = stripped.trim_start();
             }
         }
-        let qualified: String = rest
-            .chars()
-            .take_while(|character| {
-                character.is_ascii_alphanumeric() || *character == '_' || *character == '.'
-            })
-            .collect();
-        if let Some(name) = qualified.rsplit('.').next().filter(|name| !name.is_empty()) {
-            names.push(name.to_owned());
+        loop {
+            let qualified: String = rest
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || *character == '_' || *character == '.'
+                })
+                .collect();
+            if let Some(name) = qualified.rsplit('.').next().filter(|name| !name.is_empty()) {
+                names.push(name.to_owned());
+            }
+            match rest[qualified.len()..].trim_start().strip_prefix(',') {
+                Some(next) if !qualified.is_empty() => rest = next.trim_start(),
+                _ => break,
+            }
         }
         from = after;
     }
@@ -239,16 +310,81 @@ fn tables_named_after(sql: &str, keyword: &str) -> Vec<String> {
 /// would drift away from the schema at the first migration of #10, #13 or #43,
 /// and drift silently.
 fn tables_the_migrations_declare() -> BTreeSet<String> {
+    tables_declared_by(db::MIGRATOR.migrations.iter().map(|m| m.sql.as_ref()))
+}
+
+/// The tables left declared once every script of `scripts` has run, in order.
+fn tables_declared_by<'a>(scripts: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
     let mut declared = BTreeSet::new();
-    for migration in db::MIGRATOR.migrations.iter() {
-        for name in tables_named_after(&migration.sql, "create table ") {
+    for sql in scripts {
+        for name in tables_named_after(sql, "create table ") {
             declared.insert(name);
         }
-        for name in tables_named_after(&migration.sql, "drop table ") {
+        for name in tables_named_after(sql, "drop table ") {
             declared.remove(&name);
         }
     }
     declared
+}
+
+/// The set of `names`, for the assertions on the scan below.
+fn table_set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+// The scan above is what the schema test compares the database against, so a
+// mistake in it shows up there as a disagreement on the tables. These cases pin
+// the shapes a correct migration may legitimately take. Four of them — a table
+// named in a comment, keywords split by other whitespace than one space, a
+// `DROP TABLE` list, a table named in a comment after an apostrophe — were
+// read wrong by the previous scan, which made the schema test fail on a schema
+// that was right. The fifth, comment markers inside a string, passed on it; it
+// guards the string handling added since.
+
+#[test]
+fn the_scan_ignores_a_table_named_in_a_comment() {
+    let sql = "-- a reader could CREATE TABLE ghost (a int) here
+               /* or CREATE TABLE phantom (a int) there */
+               /* nested /* CREATE TABLE inner_ghost */ CREATE TABLE outer_ghost */
+               CREATE TABLE real_one (a int);";
+    assert_eq!(tables_declared_by([sql]), table_set(&["real_one"]));
+}
+
+#[test]
+fn the_scan_reads_keywords_separated_by_any_whitespace() {
+    let sql = "CREATE\n    TABLE spread_out (a int);
+               CREATE  TABLE\tIF  NOT\n EXISTS guarded(a int);
+               CREATE TABLE -- the name comes next
+                   commented_between (a int);";
+    assert_eq!(
+        tables_declared_by([sql]),
+        table_set(&["commented_between", "guarded", "spread_out"])
+    );
+}
+
+#[test]
+fn the_scan_drops_every_table_of_a_drop_list() {
+    let create = "CREATE TABLE a (x int); CREATE TABLE b (x int); CREATE TABLE c (x int);";
+    let drop = "DROP TABLE a, public.b;";
+    assert_eq!(tables_declared_by([create, drop]), table_set(&["c"]));
+}
+
+#[test]
+fn the_scan_does_not_take_comment_markers_in_a_string_for_comments() {
+    let sql = "INSERT INTO t VALUES ('Jus d''orange -- 0 %'); CREATE TABLE kept (a int);
+               INSERT INTO t VALUES ('/* not a comment'); CREATE TABLE also_kept (a int);";
+    assert_eq!(tables_declared_by([sql]), table_set(&["also_kept", "kept"]));
+}
+
+#[test]
+fn the_scan_does_not_take_an_apostrophe_in_a_comment_for_a_string() {
+    // A single apostrophe in the whole script, so that no second one can close
+    // a string wrongly opened by the first. Ending the comment at it would
+    // either read the rest of the line as code (and declare `ghost`) or open a
+    // string running to the end of the script (and lose `after_the_comment`).
+    let sql = "-- the profile's CREATE TABLE ghost (a int) -- CREATE TABLE ghost_too (a int)
+               CREATE TABLE after_the_comment (a int);";
+    assert_eq!(tables_declared_by([sql]), table_set(&["after_the_comment"]));
 }
 
 /// The tables actually present in `public`, minus sqlx's own bookkeeping table.
@@ -1686,4 +1822,244 @@ async fn the_endpoints_answer_on_a_connection_that_owns_shadowing_temporary_tabl
         shadowing, 2,
         "the connection the requests ran on does not own the shadowing tables"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Base library (issue #10)
+// ---------------------------------------------------------------------------
+
+/// SQL selecting the library rows whose search key starts with that of `$1` —
+/// the prefix search the index of the library is built for.
+const LIBRARY_PREFIX_SEARCH: &str = "FROM public.library_item
+     WHERE public.library_item_search_key(name)
+           LIKE public.library_item_search_key($1) || '%'";
+
+/// The names the library search returns for `typed`, in name order.
+async fn library_names_starting_with(pool: &sqlx::PgPool, typed: &str) -> Vec<String> {
+    sqlx::query_scalar(&format!(
+        "SELECT name {LIBRARY_PREFIX_SEARCH} ORDER BY name"
+    ))
+    .bind(typed)
+    .fetch_all(pool)
+    .await
+    .expect("the library search must run")
+}
+
+#[tokio::test]
+async fn the_base_library_is_populated_by_the_migrations() {
+    // SPEC.md §5.4: the library ships with the application. Nothing but
+    // `db::migrate` runs here, so every row found was written by a migration —
+    // not by `db::seed`, which no test calls.
+    let Some(state) = migrated("the_base_library_is_populated_by_the_migrations").await else {
+        return;
+    };
+
+    // The drinks issue #10 names, each looked up by the search a user would
+    // type, so that a name spelt with accents in the data set is still found.
+    // A prefix may also find items of the other category — `gin` finds
+    // « Ginger ale » — hence "at least one of", not "only".
+    for (typed, category) in [
+        ("vodka", "alcohol"),
+        ("gin", "alcohol"),
+        ("rhum", "alcohol"),
+        ("whisky", "alcohol"),
+        ("tequila", "alcohol"),
+        ("biere", "alcohol"),
+        ("vin rouge", "alcohol"),
+        ("vin blanc", "alcohol"),
+        ("champagne", "alcohol"),
+        ("jus d'orange", "soft"),
+        ("coca", "soft"),
+        ("tonic", "soft"),
+        ("jus de citron", "soft"),
+        ("sirop", "soft"),
+        ("eau gazeuse", "soft"),
+    ] {
+        let found: Vec<String> =
+            sqlx::query_scalar(&format!("SELECT category::text {LIBRARY_PREFIX_SEARCH}"))
+                .bind(typed)
+                .fetch_all(&state.pool)
+                .await
+                .expect("the library search must run");
+        assert!(
+            found.iter().any(|found| found == category),
+            "`{typed}` should find a {category} item, found {found:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_soft_is_at_zero_and_every_alcohol_above_it() {
+    // SPEC.md §5.4: soft drinks are "à 0° d'alcool". An alcohol at 0 would be
+    // the converse accident: a degree forgotten in the data set.
+    let Some(state) = migrated("every_soft_is_at_zero_and_every_alcohol_above_it").await else {
+        return;
+    };
+
+    let misfiled: Vec<(String, String, f64)> = sqlx::query_as(
+        "SELECT name, category::text, default_abv_percent FROM public.library_item
+         WHERE (category = 'soft'::public.library_item_category
+                AND default_abv_percent <> 0)
+            OR (category = 'alcohol'::public.library_item_category
+                AND default_abv_percent <= 0)",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .expect("the query must run");
+    assert!(misfiled.is_empty(), "{misfiled:?}");
+}
+
+#[tokio::test]
+async fn searching_biere_finds_biere_whatever_the_accents_and_the_case() {
+    // The acceptance criterion of issue #10: « biere » finds « bière ».
+    let Some(state) =
+        migrated("searching_biere_finds_biere_whatever_the_accents_and_the_case").await
+    else {
+        return;
+    };
+
+    let plain = library_names_starting_with(&state.pool, "biere").await;
+    assert!(
+        plain.iter().any(|name| name.starts_with("Bière")),
+        "`biere` should find a « Bière », found {plain:?}"
+    );
+    for typed in ["bière", "BIERE", "Bière", "BIÈRE"] {
+        assert_eq!(
+            library_names_starting_with(&state.pool, typed).await,
+            plain,
+            "`{typed}` and `biere` should find the same items"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_search_index_serves_the_library_search() {
+    // An index the search predicate cannot use would be decoration. The planner
+    // rightly prefers a sequential scan on a table this small, so it is told not
+    // to, for this transaction only: what is checked is that the index *can*
+    // answer the predicate, which takes both the same expression and an operator
+    // class that supports `LIKE 'prefix%'` under a non-C collation.
+    let Some(state) = migrated("the_search_index_serves_the_library_search").await else {
+        return;
+    };
+
+    let mut tx = state.pool.begin().await.expect("the transaction must open");
+    sqlx::query("SET LOCAL enable_seqscan = off")
+        .execute(&mut *tx)
+        .await
+        .expect("the planner setting must apply");
+    // The value is inlined rather than bound: a generic plan for `$1` could not
+    // turn the `LIKE` into an index range, whatever the index.
+    let plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN SELECT name FROM public.library_item
+         WHERE public.library_item_search_key(name)
+               LIKE public.library_item_search_key('biere') || '%'",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .expect("the plan must be produced");
+    let plan = plan.join("\n");
+    assert!(
+        plan.contains("Index Cond") && plan.contains("library_item_search_key_unique"),
+        "the search does not use the library search index:\n{plan}"
+    );
+}
+
+/// Tries to add `name` to the library inside the caller's transaction, under a
+/// savepoint so that a refusal leaves the transaction usable, and rolls the
+/// write back either way. Returns the constraint that refused it, if any.
+async fn library_refuses(
+    tx: &mut sqlx::PgConnection,
+    name: &str,
+    category: &str,
+) -> Option<String> {
+    sqlx::query("SAVEPOINT library_write")
+        .execute(&mut *tx)
+        .await
+        .expect("the savepoint must be set");
+    let written = sqlx::query(
+        "INSERT INTO public.library_item (id, name, category, default_abv_percent)
+         VALUES ($1, $2, $3::public.library_item_category, 0)",
+    )
+    .bind(api::new_id())
+    .bind(name)
+    .bind(category)
+    .execute(&mut *tx)
+    .await;
+    let refused_by = match written {
+        Ok(_) => None,
+        Err(sqlx::Error::Database(error)) => Some(
+            error
+                .constraint()
+                .unwrap_or_else(|| panic!("`{name}` refused by no constraint: {error}"))
+                .to_owned(),
+        ),
+        Err(error) => panic!("unexpected error writing `{name}`: {error}"),
+    };
+    sqlx::query("ROLLBACK TO SAVEPOINT library_write")
+        .execute(&mut *tx)
+        .await
+        .expect("the savepoint must roll back");
+    refused_by
+}
+
+#[tokio::test]
+async fn a_name_is_unique_across_the_library_whatever_its_accents_case_or_category() {
+    // A library name identifies an item for whoever searches it: the search
+    // shows names, and a drink component copies the name and the degree, never
+    // the category. Two items the search cannot tell apart — « Bière blonde »
+    // and « BIERE BLONDE », or a soft and an alcohol of the same name — would
+    // offer the user two indistinguishable rows with different degrees.
+    let Some(state) =
+        migrated("a_name_is_unique_across_the_library_whatever_its_accents_case_or_category").await
+    else {
+        return;
+    };
+
+    // Everything below is rolled back: the library is shared by every test.
+    let mut tx = state.pool.begin().await.expect("the transaction must open");
+    // The exact name was refused already, by `library_item_lower_name_key` of
+    // the initial migration, which still answers first for it.
+    assert!(
+        library_refuses(&mut tx, "Bière blonde", "alcohol")
+            .await
+            .is_some(),
+        "an exact duplicate must be refused"
+    );
+    // These two were not: their `lower(name)` differs from « bière blonde ».
+    for (name, category) in [("BIERE BLONDE", "alcohol"), ("Biere blonde", "soft")] {
+        assert_eq!(
+            library_refuses(&mut tx, name, category).await.as_deref(),
+            Some("library_item_search_key_unique"),
+            "`{name}` ({category}) should be refused as a duplicate of « Bière blonde »"
+        );
+    }
+    assert_eq!(
+        library_refuses(&mut tx, "Bière de garde", "alcohol").await,
+        None,
+        "a new name must still be accepted"
+    );
+    tx.rollback().await.expect("the transaction must roll back");
+}
+
+#[tokio::test]
+async fn the_library_identifiers_are_uuid_v7() {
+    // The project convention (SPEC.md §10.0): every identifier is a UUID v7,
+    // whose ordering the API uses as its pagination cursor. The library rows
+    // are written by a migration rather than by the application, so their
+    // identifiers are literals of that migration; this is what holds them to
+    // the convention.
+    let Some(state) = migrated("the_library_identifiers_are_uuid_v7").await else {
+        return;
+    };
+
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM public.library_item ORDER BY id")
+        .fetch_all(&state.pool)
+        .await
+        .expect("the query must run");
+    assert!(!ids.is_empty());
+    for id in ids {
+        assert_eq!(id.get_version_num(), 7, "{id} is not a UUID v7");
+        assert_eq!(id.get_variant(), uuid::Variant::RFC4122, "{id}");
+    }
 }

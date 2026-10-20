@@ -195,25 +195,8 @@ pub async fn seed(pool: &PgPool) -> Result<(), sqlx::Error> {
 
     let mut tx = pool.begin().await?;
 
-    // Base library. The real V1 data set is the subject of issue #10; these four
-    // rows only exist to make the seeded drinks realistic.
-    for (name, category, abv) in [
-        ("Vodka", "alcohol", 40.0_f64),
-        ("Gin", "alcohol", 37.5),
-        ("Jus d'orange", "soft", 0.0),
-        ("Coca", "soft", 0.0),
-    ] {
-        sqlx::query(
-            "INSERT INTO library_item (id, name, category, default_abv_percent)
-             VALUES ($1, $2, $3::library_item_category, $4)",
-        )
-        .bind(new_id())
-        .bind(name)
-        .bind(category)
-        .bind(abv)
-        .execute(&mut *tx)
-        .await?;
-    }
+    // No library row here: the base library is written by the migrations
+    // (issue #10), so it is already present in any migrated database.
 
     // Alice: a single settings version, so her whole history uses it.
     let alice = new_id();
@@ -304,7 +287,7 @@ pub async fn seed(pool: &PgPool) -> Result<(), sqlx::Error> {
         },
     )
     .await?;
-    insert_component(&mut tx, cocktail, 0, "Gin", 37.5, 25.0).await?;
+    insert_component(&mut tx, cocktail, 0, "Gin", 40.0, 25.0).await?;
     insert_component(&mut tx, cocktail, 1, "Jus d'orange", 0.0, 75.0).await?;
 
     // A drink outside of any event: the history of a profile is not limited to
