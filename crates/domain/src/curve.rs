@@ -435,6 +435,30 @@ mod tests {
     }
 
     #[test]
+    fn a_later_drink_off_the_grid_counts_from_its_own_start() {
+        // The second drink starts 10 min 17 s after the first, between two
+        // nodes, while the first is still in the blood: from its start on, the
+        // curve is 2 C₀ − β × t, to the second.
+        let second = T0 + 10 * MINUTE + 17;
+        let drinks = [at_once(T0), at_once(second)];
+        assert!(
+            (bac(&drinks, &Trapezoid, second - 1)
+                - (C0 - BETA * (second - 1 - T0) as f64 / 3600.0))
+                .abs()
+                < DERIVED
+        );
+        for elapsed in [0, 1, 43, 60 + 43, 1800] {
+            let at = second + elapsed;
+            let value = bac(&drinks, &Trapezoid, at);
+            let expected = 2.0 * C0 - BETA * (at - T0) as f64 / 3600.0;
+            assert!(
+                (value - expected).abs() < DERIVED,
+                "{elapsed} s after the second drink: {value} instead of {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn the_zero_duration_trapezoid_is_pure_widmark() {
         // §6.4: a = b = 0 is instantaneous ingestion, whatever profile says so.
         let zero = [at_once(T0)];
