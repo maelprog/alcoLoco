@@ -2851,7 +2851,7 @@ async fn cl_quantities_travel_in_cl_and_read_back_to_the_bit() {
     let (_, read) = body_of(state.clone(), &format!("/drinks/{drink}")).await;
     assert_eq!(quantity_bits(&read), entered_bits, "{read}");
 
-    // The alcohol is that of 25 cL, i.e. 250 mL, of beer at 5 %.
+    // A beer entered as 25 cL reads back as 25, in centilitres.
     let (beer, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T22:00:00Z")).await;
     let (_, read) = body_of(state.clone(), &format!("/drinks/{beer}")).await;
     assert_eq!(read["components"][0]["quantity"], 25.0);

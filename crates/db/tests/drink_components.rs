@@ -459,7 +459,7 @@ async fn moving_a_component_into_a_full_drink_in_percent_is_refused() {
 
 #[tokio::test]
 async fn switching_a_drink_to_percent_checks_its_components() {
-    // 200 mL + 100 mL read as percentages would be 300 %.
+    // 200 cL + 100 cL read as percentages would be 300 %.
     let Some(url) = database_url("switching_a_drink_to_percent_checks_its_components") else {
         return;
     };
@@ -635,8 +635,8 @@ async fn two_transactions_cannot_each_add_a_share_that_fits_alone() {
 
 #[tokio::test]
 async fn a_unit_switch_and_a_component_insert_cannot_both_commit() {
-    // One transaction switches a drink of 60 mL to percent, reading 60 as
-    // 60 %; the other adds 50 mL, which a drink in cL takes without a bound.
+    // One transaction switches a drink of 60 cL to percent, reading 60 as
+    // 60 %; the other adds 50 cL, which a drink in cL takes without a bound.
     let Some(url) = database_url("a_unit_switch_and_a_component_insert_cannot_both_commit") else {
         return;
     };
