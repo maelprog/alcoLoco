@@ -4,7 +4,8 @@
     <p>Modifie tes paramètres physiologiques et tes préférences de saisie.</p>
   </header>
 
-  <form (ngSubmit)="saveProfile()">
+  <!--<form (ngSubmit)="saveProfile()">-->
+  <form (ngSubmit)="saveProfile()" novalidate>
     <fieldset>
       <legend>Paramètres physiologiques</legend>
 
@@ -17,9 +18,17 @@
           min="1"
           step="any"
           [ngModel]="weightKg()"
-          (ngModelChange)="weightKg.set($event)"
+          (ngModelChange)="weightKg.set($event); clearFieldError('weightKg')"
+          [class.profile-page__input--invalid]="invalidFields().includes('weightKg')"
+          [attr.aria-invalid]="invalidFields().includes('weightKg')"
+          [attr.aria-describedby]="invalidFields().includes('weightKg') ? 'weightKg-error' : null"
           required
         />
+        @if (invalidFields().includes('weightKg')) {
+          <small id="weightKg-error" class="profile-page__field-error">
+            Saisis un poids supérieur à 0.
+          </small>
+        }
       </div>
 
       <div>
@@ -31,9 +40,17 @@
           min="1"
           step="any"
           [ngModel]="heightCm()"
-          (ngModelChange)="heightCm.set($event)"
+          (ngModelChange)="heightCm.set($event); clearFieldError('heightCm')"
+          [class.profile-page__input--invalid]="invalidFields().includes('heightCm')"
+          [attr.aria-invalid]="invalidFields().includes('heightCm')"
+          [attr.aria-describedby]="invalidFields().includes('heightCm') ? 'heightCm-error' : null"
           required
         />
+        @if (invalidFields().includes('heightCm')) {
+          <small id="heightCm-error" class="profile-page__field-error">
+            Saisis une taille supérieure à 0.
+          </small>
+        }
       </div>
 
       <div>
@@ -42,13 +59,21 @@
           id="sex"
           name="sex"
           [ngModel]="sex()"
-          (ngModelChange)="sex.set($event)"
+          (ngModelChange)="sex.set($event); clearFieldError('sex')"
+          [class.profile-page__input--invalid]="invalidFields().includes('sex')"
+          [attr.aria-invalid]="invalidFields().includes('sex')"
+          [attr.aria-describedby]="invalidFields().includes('sex') ? 'sex-error' : null"
           required
         >
           <option value="">Sélectionner…</option>
           <option value="female">Féminin</option>
           <option value="male">Masculin</option>
         </select>
+        @if (invalidFields().includes('sex')) {
+          <small id="sex-error" class="profile-page__field-error">
+            Sélectionne un sexe.
+          </small>
+        }
       </div>
 
       <div>
@@ -58,9 +83,17 @@
           name="birthDate"
           type="date"
           [ngModel]="birthDate()"
-          (ngModelChange)="birthDate.set($event)"
+          (ngModelChange)="birthDate.set($event); clearFieldError('birthDate')"
+          [class.profile-page__input--invalid]="invalidFields().includes('birthDate')"
+          [attr.aria-invalid]="invalidFields().includes('birthDate')"
+          [attr.aria-describedby]="invalidFields().includes('birthDate') ? 'birthDate-error' : null"
           required
         />
+        @if (invalidFields().includes('birthDate')) {
+          <small id="birthDate-error" class="profile-page__field-error">
+            Saisis une date de naissance valide qui n'est pas dans le futur.
+          </small>
+        }
       </div>
     </fieldset>
 
@@ -89,10 +122,18 @@
           name="ingestionDuration"
           type="number"
           min="0"
-          step="1"
+          step="5"
           [ngModel]="defaultIngestionDuration()"
-          (ngModelChange)="defaultIngestionDuration.set($event)"
+          (ngModelChange)="defaultIngestionDuration.set($event); clearFieldError('ingestionDuration')"
+          [class.profile-page__input--invalid]="invalidFields().includes('ingestionDuration')"
+          [attr.aria-invalid]="invalidFields().includes('ingestionDuration')"
+          [attr.aria-describedby]="invalidFields().includes('ingestionDuration') ? 'ingestionDuration-error' : null"
         />
+        @if (invalidFields().includes('ingestionDuration')) {
+          <small id="ingestionDuration-error" class="profile-page__field-error">
+            Saisis un nombre entier positif ou égal à 0, par paliers de 5 minutes.
+          </small>
+        }
       </div>
 
       <div>
@@ -104,10 +145,18 @@
           name="absorptionDuration"
           type="number"
           min="0"
-          step="1"
+          step="5"
           [ngModel]="defaultAbsorptionDuration()"
-          (ngModelChange)="defaultAbsorptionDuration.set($event)"
+          (ngModelChange)="defaultAbsorptionDuration.set($event); clearFieldError('absorptionDuration')"
+          [class.profile-page__input--invalid]="invalidFields().includes('absorptionDuration')"
+          [attr.aria-invalid]="invalidFields().includes('absorptionDuration')"
+          [attr.aria-describedby]="invalidFields().includes('absorptionDuration') ? 'absorptionDuration-error' : null"
         />
+        @if (invalidFields().includes('absorptionDuration')) {
+          <small id="absorptionDuration-error" class="profile-page__field-error">
+            Saisis un nombre entier positif ou égal à 0, par paliers de 5 minutes.
+          </small>
+        }
       </div>
     </fieldset>
 
@@ -116,13 +165,17 @@
     </p>
 
     @if (errorMessage()) {
-      <p role="alert">{{ errorMessage() }}</p>
+      <p role="alert" class="profile-page__error">
+        {{ errorMessage() }}
+      </p>
     }
 
     @if (successMessage()) {
-      <p role="status">{{ successMessage() }}</p>
+      <p role="status" class="profile-page__success">
+        {{ successMessage() }}
+      </p>
     }
 
-    <button type="submit">Enregistrer les modifications</button>
+    <button type="submit" [disabled]="loading() || saving()">{{ saving() ? 'Enregistrement...' : 'Enregistrer les modifications' }}</button>
   </form>
 </main>
