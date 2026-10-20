@@ -2233,6 +2233,42 @@ async fn an_empty_library_search_walks_the_whole_library_in_its_order() {
 }
 
 #[tokio::test]
+async fn the_library_is_served_in_identifier_order_whatever_its_physical_order() {
+    // The cursor resumes after the identifier of the last item served, so the
+    // pages must be in identifier order. Rows freshly written by a migration
+    // sit in the heap in that order already, which would hide a missing
+    // `ORDER BY`: rewriting a row moves it to the end of the heap. The update
+    // changes no value, so the other tests of this file are not disturbed.
+    let Some(state) =
+        migrated("the_library_is_served_in_identifier_order_whatever_its_physical_order").await
+    else {
+        return;
+    };
+
+    let moved = sqlx::query("UPDATE public.library_item SET name = name WHERE name = 'Vodka'")
+        .execute(&state.pool)
+        .await
+        .expect("the update must run");
+    assert_eq!(
+        moved.rows_affected(),
+        1,
+        "« Vodka » is gone from the library"
+    );
+
+    let expected: Vec<String> =
+        sqlx::query_scalar("SELECT id::text FROM public.library_item ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .expect("the query must run");
+    let walked: Vec<String> = library_walk(&state, "/library/items?limit=7")
+        .await
+        .iter()
+        .map(|item| item["id"].as_str().expect("an item has an id").to_owned())
+        .collect();
+    assert_eq!(walked, expected);
+}
+
+#[tokio::test]
 async fn the_library_search_filters_by_category() {
     let Some(state) = migrated("the_library_search_filters_by_category").await else {
         return;
