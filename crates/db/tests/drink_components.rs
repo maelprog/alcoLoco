@@ -812,3 +812,46 @@ async fn two_transactions_writing_two_drinks_in_opposite_orders_do_not_deadlock(
     assert_eq!(component_count(&pool, low).await, 1);
     assert_eq!(component_count(&pool, high).await, 1);
 }
+
+#[tokio::test]
+async fn the_seed_stores_cl_quantities_in_centilitres() {
+    // `db::seed` refuses a database that holds profiles, so it runs on a
+    // database of its own, created on the same server and dropped afterwards.
+    let Some(url) = database_url("the_seed_stores_cl_quantities_in_centilitres") else {
+        return;
+    };
+    let (server, _) = url
+        .rsplit_once('/')
+        .expect("DATABASE_URL must name a database");
+    let name = format!("seed_{}", Uuid::now_v7().simple());
+    let mut admin = connection(&url).await;
+    run(&mut admin, &format!("CREATE DATABASE {name}"))
+        .await
+        .expect("the seed database must be created");
+
+    let pool = migrated_pool(&format!("{server}/{name}")).await;
+    let seeded = db::seed(&pool).await;
+    let rows: Result<Vec<(String, String, f64)>, sqlx::Error> = sqlx::query_as(
+        "SELECT c.name, d.quantity_unit::text, c.quantity
+           FROM drink_component c JOIN drink d ON d.id = c.drink_id
+          ORDER BY c.name",
+    )
+    .fetch_all(&pool)
+    .await;
+    pool.close().await;
+    run(&mut admin, &format!("DROP DATABASE {name} WITH (FORCE)"))
+        .await
+        .expect("the seed database must be dropped");
+
+    seeded.expect("the seed must apply to an empty database");
+    // A drink in cl stores centilitres, as the API exchanges them (#14): the
+    // beer is 25 cL, i.e. 250 mL, and the vodka 4 cL, i.e. 40 mL.
+    let expected = [
+        ("Bière blonde", "cl", 25.0),
+        ("Gin", "percent", 25.0),
+        ("Jus d'orange", "percent", 75.0),
+        ("Vodka", "cl", 4.0),
+    ]
+    .map(|(name, unit, quantity)| (name.to_owned(), unit.to_owned(), quantity));
+    assert_eq!(rows.expect("the seeded components must read"), expected);
+}
