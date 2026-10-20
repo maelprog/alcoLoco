@@ -1,9 +1,11 @@
-//! The one thing the front and the back have to spell identically.
+//! What the front and the back have to spell identically: the problem
+//! identifiers below, and the pagination bounds at the end of the file.
 //!
 //! `web/src/app/core/api/problem-details.ts` mirrors the problem identifiers of
 //! `crates/api/src/error.rs`. RFC 7807 makes `type` the stable member and the
 //! front branches on it alone — `title` is English prose that may be reworded at
-//! any time — so those six strings are the whole contract between the two sides.
+//! any time — so those six strings are the whole error contract between the two
+//! sides.
 //!
 //! Until this file existed they were **transcribed by hand and guarded by
 //! nothing**. Measured by the verification of PR #46 on 2026-08-21: rewriting
@@ -170,5 +172,43 @@ fn the_prefix_is_read_from_the_backend_and_not_assumed() {
     assert!(
         minted.iter().all(|kind| kind.len() > prefix.len()),
         "an identifier is nothing but the prefix: {minted:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pagination bounds
+// ---------------------------------------------------------------------------
+
+/// The module that mirrors the pagination bounds for the front.
+const TYPESCRIPT_PAGE_SOURCE: &str = include_str!("../../../web/src/app/core/api/page.ts");
+
+/// The value of `export const <name> = <integer>;` in the TypeScript.
+fn typescript_integer(name: &str) -> u16 {
+    let declaration = format!("export const {name} =");
+    let value = between(TYPESCRIPT_PAGE_SOURCE, &declaration, "", ";").trim();
+    value.parse().unwrap_or_else(|_| {
+        panic!("`{name}` is not declared as a plain integer in page.ts: `{value}`")
+    })
+}
+
+#[test]
+fn the_front_pages_within_the_bounds_the_api_enforces() {
+    // `page.ts` copies the two bounds of `crates/api/src/pagination.rs`, and
+    // nothing tied the copy to the original: the verification of PR #46
+    // changed them to 999 and 500 and the front lint and tests stayed green.
+    // A front maximum above the API's sends a `limit` the API answers with a
+    // 400. Compared with the constants the API validates with, not with their
+    // source text, so that a reformatting on the Rust side cannot hide a drift.
+    assert_eq!(
+        typescript_integer("MAX_PAGE_LIMIT"),
+        api::pagination::MAX_LIMIT,
+        "web/src/app/core/api/page.ts and crates/api/src/pagination.rs \
+         no longer agree on the largest page"
+    );
+    assert_eq!(
+        typescript_integer("DEFAULT_PAGE_LIMIT"),
+        api::pagination::DEFAULT_LIMIT,
+        "web/src/app/core/api/page.ts and crates/api/src/pagination.rs \
+         no longer agree on the default page"
     );
 }
