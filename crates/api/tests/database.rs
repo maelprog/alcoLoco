@@ -377,14 +377,13 @@ fn the_scan_does_not_take_comment_markers_in_a_string_for_comments() {
 
 #[test]
 fn the_scan_does_not_take_an_apostrophe_in_a_comment_for_a_string() {
-    let sql = "-- the profile's settings
-               CREATE TABLE after_the_comment (a int);
-               -- it's still read
-               CREATE TABLE after_another (a int);";
-    assert_eq!(
-        tables_declared_by([sql]),
-        table_set(&["after_another", "after_the_comment"])
-    );
+    // A single apostrophe in the whole script, so that no second one can close
+    // a string wrongly opened by the first. Ending the comment at it would
+    // either read the rest of the line as code (and declare `ghost`) or open a
+    // string running to the end of the script (and lose `after_the_comment`).
+    let sql = "-- the profile's CREATE TABLE ghost (a int) -- CREATE TABLE ghost_too (a int)
+               CREATE TABLE after_the_comment (a int);";
+    assert_eq!(tables_declared_by([sql]), table_set(&["after_the_comment"]));
 }
 
 /// The tables actually present in `public`, minus sqlx's own bookkeeping table.
