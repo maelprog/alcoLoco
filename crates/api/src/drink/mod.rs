@@ -1,4 +1,5 @@
-//! Drinks of a profile: recorded, modified, deleted (SPEC.md §4, §5.3, §5.5).
+//! Drinks of a profile: recorded, listed, modified, deleted (SPEC.md §4, §5.3,
+//! §5.5).
 //!
 //! The module is split like [`crate::profile`]: [`model`] holds the payload
 //! types, [`validation`] reads a write, [`store`] holds every statement, and
@@ -12,10 +13,14 @@
 //!   (SPEC.md §5.3);
 //! - a modification merges onto the stored drink and the result is held to
 //!   the rules of a creation; a new composition replaces the whole old one;
+//! - the history lists every drink of the profile, latest ingestion first,
+//!   each with its whole composition, so that mode 3 of SPEC.md §5.3 can
+//!   duplicate one without another request ([`history`]);
 //! - nothing is cached: no alcohol series is stored anywhere, so a write has
 //!   no cache to invalidate, and any later computation reads the drinks as
 //!   they are now.
 
+pub mod history;
 pub mod model;
 pub mod store;
 pub mod validation;
@@ -27,14 +32,18 @@ use axum::response::{IntoResponse, Response};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::extract::{Json as JsonBody, Path};
+use crate::extract::{Json as JsonBody, Path, Query};
 use crate::id::new_id;
+use crate::pagination::{Page, PageQuery};
 use crate::timestamp;
 use crate::{AppState, ProblemDetails};
 
+use history::HistoryQuery;
+
 pub use model::{Component, ComponentRequest, Drink, DrinkPatch, DrinkRequest};
 
-/// Where the drinks of a profile are recorded, in the path syntax of axum 0.8.
+/// Where the drinks of a profile are recorded and listed, in the path syntax
+/// of axum 0.8.
 pub const PROFILE_COLLECTION_PATH: &str = "/profiles/{id}/drinks";
 
 /// Where a single drink is served.
@@ -94,6 +103,45 @@ pub async fn create(
         .headers_mut()
         .insert(header::LOCATION, header_value);
     Ok(response)
+}
+
+/// Lists the history of a profile: every drink, event or not, latest
+/// ingestion first, each with its components.
+#[utoipa::path(
+    get,
+    path = PROFILE_COLLECTION_PATH,
+    tag = "drinks",
+    params(
+        ("id" = Uuid, Path, description = "Identifier of the profile"),
+        HistoryQuery,
+        PageQuery,
+    ),
+    responses(
+        (status = 200, description = "One page of the history, latest ingestion first", body = Page<Drink>),
+        (status = 400, description = "Unusable identifier, `from`, `before`, `event_id`, `limit` or `cursor`", body = ProblemDetails),
+        (status = 404, description = "No profile carries that identifier", body = ProblemDetails),
+    ),
+)]
+pub async fn list(
+    State(state): State<AppState>,
+    Path(profile_id): Path<Uuid>,
+    Query(filter): Query<HistoryQuery>,
+    Query(page): Query<PageQuery>,
+) -> Result<Json<Page<Drink>>, ApiError> {
+    // Both halves are read before either is reported, so that one answer
+    // lists every member a client got wrong.
+    let (filter, request) = match (filter.into_filter(), page.into_parts()) {
+        (Ok(filter), Ok(request)) => (filter, request),
+        (filter, request) => {
+            let mut errors = filter.err().unwrap_or_default();
+            errors.extend(request.err().unwrap_or_default());
+            return Err(ApiError::validation(errors));
+        }
+    };
+    store::history(&state.pool, profile_id, &filter, &request)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("no profile with identifier {profile_id}")))
 }
 
 /// Reads one drink with its components.

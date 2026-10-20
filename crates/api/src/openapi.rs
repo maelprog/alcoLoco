@@ -28,6 +28,7 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         crate::profile::create,
         crate::profile::update,
         crate::library::list,
+        crate::drink::list,
         crate::drink::create,
         crate::drink::read,
         crate::drink::update,
@@ -58,7 +59,7 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         (name = "system", description = "Exploitation: santé du service."),
         (name = "profiles", description = "Profils et paramètres physiologiques versionnés."),
         (name = "library", description = "Bibliothèque de base, en lecture seule."),
-        (name = "drinks", description = "Consommations d'un profil : saisie, modification, suppression."),
+        (name = "drinks", description = "Consommations d'un profil : saisie, historique, modification, suppression."),
     ),
 )]
 struct ApiDoc;
@@ -108,7 +109,7 @@ mod tests {
             (crate::profile::COLLECTION_PATH, &["get", "post"]),
             (crate::profile::ITEM_PATH, &["get", "put"]),
             (crate::library::COLLECTION_PATH, &["get"]),
-            (crate::drink::PROFILE_COLLECTION_PATH, &["post"]),
+            (crate::drink::PROFILE_COLLECTION_PATH, &["get", "post"]),
             (crate::drink::ITEM_PATH, &["get", "patch", "delete"]),
         ] {
             for method in methods {
@@ -134,6 +135,8 @@ mod tests {
             (crate::profile::ITEM_PATH, "put", "409"),
             (crate::library::COLLECTION_PATH, "get", "400"),
             (crate::drink::PROFILE_COLLECTION_PATH, "post", "404"),
+            (crate::drink::PROFILE_COLLECTION_PATH, "get", "400"),
+            (crate::drink::PROFILE_COLLECTION_PATH, "get", "404"),
             (crate::drink::ITEM_PATH, "patch", "400"),
             (crate::drink::ITEM_PATH, "delete", "404"),
         ] {
@@ -175,6 +178,106 @@ mod tests {
         ] {
             assert!(!nullable(member), "`{member}` refuses null: {patch}");
         }
+    }
+
+    /// The paths that serve a [`crate::pagination::Page`].
+    const PAGED_PATHS: [&str; 3] = [
+        crate::profile::COLLECTION_PATH,
+        crate::library::COLLECTION_PATH,
+        crate::drink::PROFILE_COLLECTION_PATH,
+    ];
+
+    /// The query parameter `name` of `GET path`.
+    fn query_parameter(document: &serde_json::Value, path: &str, name: &str) -> serde_json::Value {
+        document["paths"][path]["get"]["parameters"]
+            .as_array()
+            .unwrap_or_else(|| panic!("GET {path} declares no parameter: {document}"))
+            .iter()
+            .find(|parameter| parameter["name"] == name && parameter["in"] == "query")
+            .cloned()
+            .unwrap_or_else(|| panic!("GET {path} does not declare `?{name}=`: {document}"))
+    }
+
+    #[test]
+    fn the_page_size_is_published_as_a_bounded_integer_with_its_default() {
+        // `limit` is read as text, so that `?limit=abc` is a field error like
+        // `?limit=1000`; left to the derive, it was published as a string,
+        // without the bounds a client has to respect. The bounds are compared
+        // with the constants the validation uses, not with numbers written
+        // here.
+        let document = rendered();
+        for path in PAGED_PATHS {
+            let limit = query_parameter(&document, path, "limit");
+            let schema = &limit["schema"];
+            assert_eq!(schema["type"], "integer", "GET {path}: {limit}");
+            assert_eq!(schema["minimum"], 1, "GET {path}: {limit}");
+            assert_eq!(
+                schema["maximum"],
+                crate::pagination::MAX_LIMIT,
+                "GET {path}: {limit}"
+            );
+            assert_eq!(
+                schema["default"],
+                crate::pagination::DEFAULT_LIMIT,
+                "GET {path}: {limit}"
+            );
+            let description = limit["description"].as_str().unwrap_or_default();
+            assert!(
+                !description.contains('['),
+                "GET {path}: a rustdoc link leaked into the description: {limit}"
+            );
+            let cursor = query_parameter(&document, path, "cursor");
+            assert_eq!(cursor["schema"]["type"], "string", "GET {path}: {cursor}");
+        }
+    }
+
+    #[test]
+    fn a_page_always_carries_its_next_cursor() {
+        // `{ "items": [...], "next_cursor": null }` on the last page: the
+        // member is never absent, so the schema requires it and lets it be
+        // null.
+        let document = rendered();
+        for path in PAGED_PATHS {
+            let schema = &document["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"];
+            let page = match schema["$ref"].as_str() {
+                Some(reference) => {
+                    let name = reference.trim_start_matches("#/components/schemas/");
+                    document["components"]["schemas"][name].clone()
+                }
+                None => schema.clone(),
+            };
+            let required: Vec<&str> = page["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("GET {path}: a page requires nothing: {page}"))
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            assert!(
+                required.contains(&"items") && required.contains(&"next_cursor"),
+                "GET {path}: {page}"
+            );
+            let next_cursor = page["properties"]["next_cursor"].to_string();
+            assert!(
+                next_cursor.contains("\"null\"") || next_cursor.contains("\"nullable\":true"),
+                "GET {path}: `next_cursor` is null on the last page: {page}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_history_publishes_its_filters_with_their_formats() {
+        let document = rendered();
+        let path = crate::drink::PROFILE_COLLECTION_PATH;
+        for name in ["from", "before"] {
+            let parameter = query_parameter(&document, path, name);
+            assert_eq!(parameter["schema"]["type"], "string", "{parameter}");
+            assert_eq!(parameter["schema"]["format"], "date-time", "{parameter}");
+            assert_ne!(parameter["required"], true, "{parameter}");
+        }
+        let event = query_parameter(&document, path, "event_id");
+        assert_eq!(event["schema"]["format"], "uuid", "{event}");
+        assert_ne!(event["required"], true, "{event}");
     }
 
     #[test]

@@ -232,7 +232,7 @@ async fn store_list(
     let rows = sqlx::query(SELECT_PAGE)
         .bind(search.text.as_deref())
         .bind(search.category.map(Category::as_sql))
-        .bind(request.cursor)
+        .bind(request.cursor().copied())
         .bind(request.fetch_limit())
         .fetch_all(pool)
         .await?;
@@ -242,7 +242,7 @@ async fn store_list(
         .map(item_from_row)
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(Page::from_rows(items, request, |item| item.id))
+    Ok(Page::from_rows(items, &request, |item| item.id))
 }
 
 /// Reads one row of [`SELECT_PAGE`].

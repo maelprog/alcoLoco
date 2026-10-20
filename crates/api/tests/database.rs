@@ -2924,3 +2924,261 @@ async fn writing_to_an_unknown_profile_or_drink_is_a_404() {
     let answer = send(state, "DELETE", &format!("/drinks/{unknown}"), None).await;
     assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
 }
+
+// ---------------------------------------------------------------------------
+// History of a profile (#15)
+// ---------------------------------------------------------------------------
+
+/// One page of the history of `profile`, the query string appended as given.
+async fn history_page(state: &AppState, profile: Uuid, query: &str) -> Value {
+    let (status, body) = body_of(
+        state.clone(),
+        &format!("/profiles/{profile}/drinks?{query}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{query}: {body}");
+    let members: BTreeSet<&str> = body
+        .as_object()
+        .unwrap_or_else(|| panic!("not an object: {body}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        members,
+        BTreeSet::from(["items", "next_cursor"]),
+        "a page carries its two members, `next_cursor` included: {body}"
+    );
+    body
+}
+
+/// The identifiers of the items of a page.
+fn ids_of(page: &Value) -> Vec<Uuid> {
+    page["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no items[] in {page}"))
+        .iter()
+        .map(|item| {
+            item["id"]
+                .as_str()
+                .expect("an item carries its identifier")
+                .parse()
+                .expect("an identifier is a UUID")
+        })
+        .collect()
+}
+
+/// Walks the whole history of `profile` under `filters`, `limit` drinks at a
+/// time, and answers the identifiers served, in order.
+async fn history_walk(state: &AppState, profile: Uuid, filters: &str, limit: u16) -> Vec<Uuid> {
+    let mut served = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..1000 {
+        let mut query = format!("{filters}&limit={limit}");
+        if let Some(cursor) = &cursor {
+            query.push_str(&format!("&cursor={cursor}"));
+        }
+        let page = history_page(state, profile, &query).await;
+        let ids = ids_of(&page);
+        assert!(ids.len() <= usize::from(limit), "{page}");
+        served.extend(ids);
+        match page["next_cursor"].as_str() {
+            None => return served,
+            Some(next) => cursor = Some(next.to_owned()),
+        }
+    }
+    panic!("the walk never ended: {served:?}")
+}
+
+/// A vodka-orange in percent: two components, so that a composition read
+/// back has an order to keep.
+fn a_vodka_orange(ingested_at: &str) -> Value {
+    serde_json::json!({
+        "name": "Vodka – Jus d'orange",
+        "ingested_at": ingested_at,
+        "quantity_unit": "percent",
+        "volume_total_ml": 250.0,
+        "feeling_rating": 6,
+        "components": [
+            { "name": "Vodka", "abv_percent": 40.0, "quantity": 20.0 },
+            { "name": "Jus d'orange", "abv_percent": 0.0, "quantity": 80.0 },
+        ],
+    })
+}
+
+#[tokio::test]
+async fn the_history_serves_every_drink_of_the_profile_latest_ingestion_first() {
+    // First acceptance criterion: the history is not restricted to the event
+    // in progress. A drink entered from an event, one entered from the
+    // profile, and one entered later for an earlier time are all served, in
+    // ingestion order and not in recording order; the drinks of another
+    // profile are not.
+    let name = "the_history_serves_every_drink_of_the_profile_latest_ingestion_first";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Historique")).await;
+    let (other, _) = create_profile(&state, &a_sound_payload("Voisin")).await;
+    record_drink(&state, other, &a_beer("Bière", "2026-10-17T21:30:00Z")).await;
+    let event = event_with(&state.pool, profile).await;
+
+    let mut from_event = a_beer("Bière blonde", "2026-10-17T21:00:00Z");
+    from_event["event_id"] = Value::from(event.to_string());
+    let (at_21, _) = record_drink(&state, profile, &from_event).await;
+    let (at_23, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T23:00:00Z")).await;
+    let (at_22, recorded) =
+        record_drink(&state, profile, &a_vodka_orange("2026-10-17T22:00:00Z")).await;
+
+    assert_eq!(
+        history_walk(&state, profile, "", 2).await,
+        [at_23, at_22, at_21]
+    );
+
+    // The whole composition travels with each drink, as `GET /drinks/{id}`
+    // serves it: mode 3 duplicates a drink without another request.
+    let page = history_page(&state, profile, "").await;
+    assert!(page["next_cursor"].is_null(), "{page}");
+    assert_eq!(page["items"][1], recorded, "{page}");
+    let (_, read) = body_of(state.clone(), &format!("/drinks/{at_21}")).await;
+    assert_eq!(page["items"][2], read, "{page}");
+    assert_eq!(page["items"][2]["event_id"], event.to_string());
+}
+
+#[tokio::test]
+async fn an_unknown_profile_has_no_history_and_a_new_one_an_empty_one() {
+    let name = "an_unknown_profile_has_no_history_and_a_new_one_an_empty_one";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let answer = send(
+        state.clone(),
+        "GET",
+        &format!("/profiles/{}/drinks", api::new_id()),
+        None,
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
+    assert_eq!(answer.media_type, api::error::PROBLEM_JSON);
+
+    let (profile, _) = create_profile(&state, &a_sound_payload("Sobre")).await;
+    let page = history_page(&state, profile, "").await;
+    assert_eq!(
+        page,
+        serde_json::json!({ "items": [], "next_cursor": null })
+    );
+}
+
+#[tokio::test]
+async fn the_history_walk_is_stable_under_concurrent_writes() {
+    // Second acceptance criterion. Between two pages: a drink is recorded for
+    // a time already walked, another for a time still ahead, and the drink the
+    // cursor names is deleted. Every drink that was there all along is served
+    // exactly once, the one ahead is served, the one behind is not — an
+    // `OFFSET`, or a cursor resolved through the row it names, would fail one
+    // of the three.
+    let name = "the_history_walk_is_stable_under_concurrent_writes";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Concurrence")).await;
+    let mut original = Vec::new();
+    for hour in [23, 22, 21, 20] {
+        let (id, _) = record_drink(
+            &state,
+            profile,
+            &a_beer("Bière", &format!("2026-10-17T{hour}:00:00Z")),
+        )
+        .await;
+        original.push(id);
+    }
+
+    let first = history_page(&state, profile, "limit=2").await;
+    assert_eq!(ids_of(&first), original[..2]);
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("two more drinks follow")
+        .to_owned();
+
+    let (behind, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T23:30:00Z")).await;
+    let (ahead, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T19:00:00Z")).await;
+    let answer = send(
+        state.clone(),
+        "DELETE",
+        &format!("/drinks/{}", original[1]),
+        None,
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+
+    let mut served = ids_of(&first);
+    let mut query = format!("limit=2&cursor={cursor}");
+    loop {
+        let page = history_page(&state, profile, &query).await;
+        served.extend(ids_of(&page));
+        match page["next_cursor"].as_str() {
+            None => break,
+            Some(next) => query = format!("limit=2&cursor={next}"),
+        }
+    }
+    assert_eq!(
+        served,
+        [original[0], original[1], original[2], original[3], ahead],
+        "behind = {behind}"
+    );
+}
+
+#[tokio::test]
+async fn drinks_ingested_at_the_same_instant_are_each_served_once() {
+    // Ties on `ingested_at` are broken by the identifier, latest recorded
+    // first; a cursor on the time alone would skip or repeat one of them.
+    let name = "drinks_ingested_at_the_same_instant_are_each_served_once";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Tournée")).await;
+    let mut recorded = Vec::new();
+    for _ in 0..3 {
+        let (id, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T21:00:00Z")).await;
+        recorded.push(id);
+    }
+    recorded.reverse();
+    assert_eq!(history_walk(&state, profile, "", 1).await, recorded);
+}
+
+#[tokio::test]
+async fn the_history_filters_by_ingestion_time_and_by_event() {
+    let name = "the_history_filters_by_ingestion_time_and_by_event";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Filtres")).await;
+    let event = event_with(&state.pool, profile).await;
+    let (at_20, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T20:00:00Z")).await;
+    let mut payload = a_beer("Bière", "2026-10-17T21:00:00Z");
+    payload["event_id"] = Value::from(event.to_string());
+    let (at_21, _) = record_drink(&state, profile, &payload).await;
+    let (at_22, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T22:00:00Z")).await;
+
+    for (filters, expected) in [
+        // `from` is inclusive, `before` exclusive.
+        ("from=2026-10-17T21:00:00Z", vec![at_22, at_21]),
+        ("before=2026-10-17T21:00:00Z", vec![at_20]),
+        (
+            "from=2026-10-17T20:00:00Z&before=2026-10-17T22:00:00Z",
+            vec![at_21, at_20],
+        ),
+        // An offset names the instant it names.
+        ("from=2026-10-17T23:00:00%2B02:00", vec![at_22, at_21]),
+        (&*format!("event_id={event}"), vec![at_21]),
+        (&*format!("event_id={}", api::new_id()), vec![]),
+        // Earlier than any `timestamptz`: clamped, and therefore no bound,
+        // rather than a 500 from PostgreSQL.
+        ("from=-5000-01-01T00:00:00Z", vec![at_22, at_21, at_20]),
+        ("before=-5000-01-01T00:00:00Z", vec![]),
+    ] {
+        assert_eq!(
+            history_walk(&state, profile, filters, 1).await,
+            expected,
+            "{filters}"
+        );
+    }
+}

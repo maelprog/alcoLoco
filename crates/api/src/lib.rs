@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::http::{Method, Uri};
-use axum::routing::{get, post};
+use axum::routing::get;
 use sqlx::PgPool;
 
 pub mod config;
@@ -91,7 +91,10 @@ pub fn app(state: AppState) -> Router {
             get(profile::list).post(profile::create),
         )
         .route(profile::ITEM_PATH, get(profile::read).put(profile::update))
-        .route(drink::PROFILE_COLLECTION_PATH, post(drink::create))
+        .route(
+            drink::PROFILE_COLLECTION_PATH,
+            get(drink::list).post(drink::create),
+        )
         .route(
             drink::ITEM_PATH,
             get(drink::read).patch(drink::update).delete(drink::delete),
