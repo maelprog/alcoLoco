@@ -27,6 +27,7 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         crate::profile::read,
         crate::profile::create,
         crate::profile::update,
+        crate::library::list,
     ),
     components(schemas(
         crate::error::FieldError,
@@ -34,6 +35,8 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         crate::health::DatabaseStatus,
         crate::health::HealthResponse,
         crate::health::Status,
+        crate::library::Category,
+        crate::library::LibraryItem,
         crate::profile::Profile,
         crate::profile::ProfileRequest,
         crate::profile::ProfileSettings,
@@ -45,6 +48,7 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
     tags(
         (name = "system", description = "Exploitation: santé du service."),
         (name = "profiles", description = "Profils et paramètres physiologiques versionnés."),
+        (name = "library", description = "Bibliothèque de base, en lecture seule."),
     ),
 )]
 struct ApiDoc;
@@ -93,6 +97,7 @@ mod tests {
             ("/health", &["get"][..]),
             (crate::profile::COLLECTION_PATH, &["get", "post"]),
             (crate::profile::ITEM_PATH, &["get", "put"]),
+            (crate::library::COLLECTION_PATH, &["get"]),
         ] {
             for method in methods {
                 assert!(
@@ -115,6 +120,7 @@ mod tests {
             (crate::profile::COLLECTION_PATH, "post", "400"),
             (crate::profile::ITEM_PATH, "get", "404"),
             (crate::profile::ITEM_PATH, "put", "409"),
+            (crate::library::COLLECTION_PATH, "get", "400"),
         ] {
             let schema = &document["paths"][path][method]["responses"][status]["content"]["application/json"]
                 ["schema"];

@@ -4,7 +4,7 @@
 //! single one: configuration, connection pool, the error type and its RFC 7807
 //! rendering, the identifier and timestamp conventions, cursor pagination, and
 //! the generated OpenAPI document. Business routes live in a module of their own
-//! and are mounted on [`app`] — [`profile`] is the first of them.
+//! and are mounted on [`app`]: [`profile`] and [`library`].
 //!
 //! Conventions posed here, to be reused rather than restated:
 //!
@@ -27,6 +27,7 @@ pub mod error;
 pub mod extract;
 pub mod health;
 pub mod id;
+pub mod library;
 pub mod openapi;
 pub mod pagination;
 pub mod profile;
@@ -88,7 +89,8 @@ pub fn app(state: AppState) -> Router {
             profile::COLLECTION_PATH,
             get(profile::list).post(profile::create),
         )
-        .route(profile::ITEM_PATH, get(profile::read).put(profile::update));
+        .route(profile::ITEM_PATH, get(profile::read).put(profile::update))
+        .route(library::COLLECTION_PATH, get(library::list));
 
     if state.config.environment.exposes_openapi() {
         router = router.route(openapi::DOCUMENT_PATH, get(openapi::document));

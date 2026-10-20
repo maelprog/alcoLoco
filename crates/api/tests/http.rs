@@ -237,3 +237,29 @@ async fn a_method_the_route_does_not_serve_answers_a_problem_document() {
     assert_eq!(answer.media_type, PROBLEM_JSON);
     assert_eq!(answer.body["status"], 405);
 }
+
+#[tokio::test]
+async fn an_unusable_library_search_is_refused_before_the_database_is_reached() {
+    // The database of this file is unreachable: a 400 here proves that the
+    // search, the category and the page are validated before any statement
+    // runs, and reported together in one problem document.
+    let answer = call(
+        api::app(state("development")),
+        "GET",
+        "/library/items?q=vod%00ka&category=beer&limit=0",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.media_type, PROBLEM_JSON);
+    let fields: Vec<&str> = answer.body["errors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no errors[] in {}", answer.body))
+        .iter()
+        .map(|error| {
+            error["field"]
+                .as_str()
+                .expect("a field error names its field")
+        })
+        .collect();
+    assert_eq!(fields, vec!["q", "category", "limit"]);
+}

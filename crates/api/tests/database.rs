@@ -2063,3 +2063,266 @@ async fn the_library_identifiers_are_uuid_v7() {
         assert_eq!(id.get_variant(), uuid::Variant::RFC4122, "{id}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Library search endpoint (issue #11)
+// ---------------------------------------------------------------------------
+
+/// Every page of `GET {uri}`, walked by cursor; `uri` carries its own `?`.
+async fn library_walk(state: &AppState, uri: &str) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut next = uri.to_owned();
+    for _ in 0..1000 {
+        let answer = send(state.clone(), "GET", &next, None).await;
+        assert_eq!(answer.status, StatusCode::OK, "{next}: {}", answer.body);
+        items.extend(
+            answer.body["items"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no items[] in {}", answer.body))
+                .iter()
+                .cloned(),
+        );
+        match answer.body["next_cursor"].as_str() {
+            None => return items,
+            Some(cursor) => next = format!("{uri}&cursor={cursor}"),
+        }
+    }
+    panic!("{uri} never reached its last page");
+}
+
+/// The names of `GET /library/items?{query}`, every page of it.
+async fn library_names(state: &AppState, query: &str) -> Vec<String> {
+    library_walk(state, &format!("/library/items?{query}"))
+        .await
+        .iter()
+        .map(|item| {
+            item["name"]
+                .as_str()
+                .expect("an item has a name")
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_library_search_ignores_case_and_accents() {
+    // Acceptance criterion of issue #11.
+    let Some(state) = migrated("the_library_search_ignores_case_and_accents").await else {
+        return;
+    };
+
+    let bieres = vec!["Bière blonde", "Bière blanche", "Bière ambrée"];
+    for typed in ["biere", "BIERE", "bi%C3%A8re", "BI%C3%88RE", "Bi%C3%A8re"] {
+        assert_eq!(
+            library_names(&state, &format!("q={typed}")).await,
+            bieres,
+            "q={typed}"
+        );
+    }
+    for typed in ["cachaca", "CACHA%C3%87A"] {
+        assert_eq!(
+            library_names(&state, &format!("q={typed}")).await,
+            vec!["Cachaça"],
+            "q={typed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_library_search_finds_the_text_anywhere_in_the_name() {
+    let Some(state) = migrated("the_library_search_finds_the_text_anywhere_in_the_name").await
+    else {
+        return;
+    };
+
+    assert_eq!(
+        library_names(&state, "q=orange").await,
+        vec!["Jus d'orange"]
+    );
+    assert_eq!(
+        library_names(&state, "q=blonde").await,
+        vec!["Bière blonde"]
+    );
+    // Anywhere means inside a word too: « ROSE » is in « Vin rosé » and in
+    // « Prosecco ».
+    assert_eq!(
+        library_names(&state, "q=ROSE").await,
+        vec!["Vin rosé", "Prosecco"]
+    );
+    // Surrounding blanks are not part of the text looked for.
+    assert_eq!(
+        library_names(&state, "q=%20%20orange%20").await,
+        vec!["Jus d'orange"]
+    );
+    assert!(library_names(&state, "q=absinthe").await.is_empty());
+}
+
+#[tokio::test]
+async fn like_wildcards_typed_in_the_library_search_are_plain_characters() {
+    // No name of the library holds a `%`, a `_` or a `\`: were the text spliced
+    // into a `LIKE` pattern, the first two would match every name.
+    let Some(state) =
+        migrated("like_wildcards_typed_in_the_library_search_are_plain_characters").await
+    else {
+        return;
+    };
+
+    for typed in ["%25", "_", "%25%25", "%5C", "v_dka", "v%25a"] {
+        assert!(
+            library_names(&state, &format!("q={typed}"))
+                .await
+                .is_empty(),
+            "q={typed} must match nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_empty_library_search_walks_the_whole_library_in_its_order() {
+    // Acceptance criterion of issue #11: an empty request returns a default
+    // list. Absent, empty and blank `q` are the same request.
+    let Some(state) =
+        migrated("an_empty_library_search_walks_the_whole_library_in_its_order").await
+    else {
+        return;
+    };
+
+    let expected: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM public.library_item ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .expect("the query must run");
+    assert!(
+        expected.len() > usize::from(api::pagination::DEFAULT_LIMIT),
+        "the library no longer fills more than one default page; this test \
+         would stop exercising the cursor"
+    );
+
+    // The first page: the default page size, and a cursor to go on.
+    let first = send(state.clone(), "GET", "/library/items", None).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert_eq!(
+        first.body["items"].as_array().map(Vec::len),
+        Some(usize::from(api::pagination::DEFAULT_LIMIT))
+    );
+    assert!(first.body["next_cursor"].is_string(), "{}", first.body);
+
+    for uri in [
+        "/library/items?limit=7",
+        "/library/items?q=&limit=7",
+        "/library/items?q=%20%20&limit=7",
+    ] {
+        let walked: Vec<(Uuid, String)> = library_walk(&state, uri)
+            .await
+            .iter()
+            .map(|item| {
+                (
+                    item["id"]
+                        .as_str()
+                        .and_then(|id| id.parse().ok())
+                        .expect("an item has a UUID"),
+                    item["name"]
+                        .as_str()
+                        .expect("an item has a name")
+                        .to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(walked, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn the_library_search_filters_by_category() {
+    let Some(state) = migrated("the_library_search_filters_by_category").await else {
+        return;
+    };
+
+    for category in ["alcohol", "soft"] {
+        let expected: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM public.library_item WHERE category::text = $1 ORDER BY id",
+        )
+        .bind(category)
+        .fetch_all(&state.pool)
+        .await
+        .expect("the query must run");
+        assert!(!expected.is_empty());
+        let walked = library_walk(
+            &state,
+            &format!("/library/items?category={category}&limit=9"),
+        )
+        .await;
+        assert!(
+            walked.iter().all(|item| item["category"] == category),
+            "category={category} served another category"
+        );
+        let names: Vec<String> = walked
+            .iter()
+            .map(|item| item["name"].as_str().expect("a name").to_owned())
+            .collect();
+        assert_eq!(names, expected, "category={category}");
+    }
+
+    // Combined with a text: `gin` is in « Gin » and in the two gingers.
+    assert_eq!(
+        library_names(&state, "q=gin").await,
+        vec!["Gin", "Ginger ale", "Ginger beer"]
+    );
+    assert_eq!(
+        library_names(&state, "q=gin&category=soft").await,
+        vec!["Ginger ale", "Ginger beer"]
+    );
+    assert_eq!(
+        library_names(&state, "q=gin&category=alcohol").await,
+        vec!["Gin"]
+    );
+}
+
+#[tokio::test]
+async fn a_library_item_carries_its_identifier_name_degree_and_category() {
+    let Some(state) =
+        migrated("a_library_item_carries_its_identifier_name_degree_and_category").await
+    else {
+        return;
+    };
+
+    let answer = send(state.clone(), "GET", "/library/items?q=amaretto", None).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(
+        answer.body,
+        serde_json::json!({
+            "items": [{
+                "id": "01a15889-fa80-700e-bfe7-b45e9cc8d9c7",
+                "name": "Amaretto",
+                "default_abv_percent": 28.0,
+                "category": "alcohol",
+            }],
+            "next_cursor": null,
+        })
+    );
+
+    let soft = send(state, "GET", "/library/items?q=jus%20d'orange", None).await;
+    assert_eq!(soft.body["items"][0]["category"], "soft", "{}", soft.body);
+    assert_eq!(soft.body["items"][0]["default_abv_percent"], 0.0);
+}
+
+#[tokio::test]
+async fn the_library_categories_of_the_api_are_those_of_the_schema() {
+    // A label renamed on one side only would turn a category filter into an
+    // empty list, and a row read back into a 500.
+    let Some(state) = migrated("the_library_categories_of_the_api_are_those_of_the_schema").await
+    else {
+        return;
+    };
+
+    let declared: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(enum_range(NULL::public.library_item_category))::text")
+            .fetch_all(&state.pool)
+            .await
+            .expect("the query must run");
+    let used: Vec<String> = api::library::Category::ALL
+        .iter()
+        .map(|category| category.as_sql().to_owned())
+        .collect();
+    assert_eq!(used, declared);
+}

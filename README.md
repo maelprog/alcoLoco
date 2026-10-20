@@ -170,10 +170,13 @@ Schema facts worth knowing before writing a query:
   either illegal or silently drops the whole enclosing row;
 - durations are integer seconds (`*_duration_seconds`), volumes are millilitres (`*_ml`);
 - the base library is written by a migration, not by the seed. Search it through
-  `library_item_search_key(name)`, which ignores case and accents, as a prefix:
-  `library_item_search_key(name) LIKE library_item_search_key($1) || '%'` — the form its unique
-  index serves. That key relies on the `unaccent` extension, which the migrations install in
-  `public`: the database role must be allowed to `CREATE EXTENSION unaccent`.
+  `library_item_search_key(name)`, which ignores case and accents. `GET /library/items?q=` looks
+  for the text anywhere in the name — `strpos(library_item_search_key(name),
+  library_item_search_key($1)) > 0`, so `%` and `_` are plain characters — and reads the whole
+  table to do it; only a prefix search,
+  `library_item_search_key(name) LIKE library_item_search_key($1) || '%'`, is served by the
+  unique index on that key. That key relies on the `unaccent` extension, which the migrations
+  install in `public`: the database role must be allowed to `CREATE EXTENSION unaccent`.
 
 Every profile is meant to hold **at least one settings version**, and deferred constraint triggers
 enforce that at commit, for a transaction running on its own as well as for concurrent ones
