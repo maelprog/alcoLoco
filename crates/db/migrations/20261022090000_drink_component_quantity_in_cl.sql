@@ -1,7 +1,8 @@
 -- A component quantity of a drink in cL is stored in centilitres (#14).
 --
--- The initial migration declared it in millilitres, but nothing ever wrote it
--- so: the drink API of #14 is the first writer. The API exchanges cL
+-- The initial migration declared it in millilitres, and its only writer outside
+-- the tests so far, the development seed `db::seed`, wrote it so; the seed
+-- is corrected along with this file, in #14. The drink API of #14 exchanges cL
 -- quantities in centilitres (user decision on #14), and storing them in the
 -- unit they travel in is the only way a quantity reads back exactly as it was
 -- written: converting with `x * 10` and back with `/ 10` does not return `x`
