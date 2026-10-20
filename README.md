@@ -69,7 +69,8 @@ marks the difference — dotted is what does not exist yet.
   settings, events, drinks and components, the base library.
 - **`crates/api`** — what every future endpoint shares: configuration, RFC 7807 error rendering,
   UUID v7 identifiers, cursor pagination, the generated OpenAPI document. The routes actually
-  served are `GET /health` and, outside production, `GET /openapi.json`.
+  served are `GET /health`, `GET`/`POST /profiles`, `GET`/`PUT /profiles/{id}`,
+  `GET /library/items` and, outside production, `GET /openapi.json`.
 - **`crates/domain`** — the reference calculation bricks of §6.1 to §6.4. Assembling them into a
   curve (§6.5) is [#16](https://github.com/maelprog/alcoLoco/issues/16), and **no crate depends on
   `domain` yet**: the API does not call it.
