@@ -20,8 +20,11 @@
 -- Both forms of `unaccent` are declared STABLE (`provolatile = 's'` in
 -- `pg_proc`), the two-argument one included: what they return depends on a
 -- text search dictionary, whose rules file and options can change while the
--- server runs, and not on their arguments alone. The one-argument form
--- additionally finds that dictionary through `search_path`.
+-- server runs, and not on their arguments alone. The one-argument form does
+-- not depend on `search_path` for it: it takes the `unaccent` dictionary of
+-- its own schema. Measured on PostgreSQL 16: `public.unaccent('bière')`
+-- returns `biere` with `search_path` set to `pg_catalog`, to `pg_temp,
+-- pg_catalog`, or to the empty string.
 --
 -- Declaring the key below IMMUTABLE, which an index requires, is therefore a
 -- promise this migration makes, not one `unaccent` makes. Its share of the

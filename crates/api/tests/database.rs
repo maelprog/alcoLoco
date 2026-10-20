@@ -334,11 +334,12 @@ fn table_set(names: &[&str]) -> BTreeSet<String> {
 
 // The scan above is what the schema test compares the database against, so a
 // mistake in it shows up there as a disagreement on the tables. These cases pin
-// the shapes a correct migration may legitimately take. Three of them — a
-// table named in a comment, keywords split by other whitespace than one space,
-// a `DROP TABLE` list — were read wrong by the previous scan, which made the
-// schema test fail on a schema that was right; the other two passed on it and
-// guard the string and comment handling added since.
+// the shapes a correct migration may legitimately take. Four of them — a table
+// named in a comment, keywords split by other whitespace than one space, a
+// `DROP TABLE` list, a table named in a comment after an apostrophe — were
+// read wrong by the previous scan, which made the schema test fail on a schema
+// that was right. The fifth, comment markers inside a string, passed on it; it
+// guards the string handling added since.
 
 #[test]
 fn the_scan_ignores_a_table_named_in_a_comment() {
