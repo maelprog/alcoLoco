@@ -5,12 +5,17 @@
 //! tested in isolation and, later, extracted as a standalone service
 //! (see SPEC.md §7 and §9).
 //!
-//! What lives here today are the reference bricks of SPEC.md §6: the ingested
-//! alcohol mass (§6.1), the Watson body water estimate and the resulting `C₀`
-//! (§6.2), the elimination rate (§6.3) and the trapezoidal absorption profile
-//! (§6.4). Assembling them into a curve — the `AbsorptionProfile` abstraction,
-//! the `Σ Rᵢ` superposition of several drinks, the fixed-step forward
-//! integration and its floor at zero (§6.5) — is the job of #16.
+//! This module holds the reference bricks of SPEC.md §6: the ingested alcohol
+//! mass (§6.1), the Watson body water estimate and the resulting `C₀` (§6.2),
+//! the elimination rate (§6.3) and the trapezoidal absorption profile (§6.4).
+//! They are assembled into a curve by two modules:
+//!
+//! * [`absorption`] puts the absorption profile behind the replaceable
+//!   [`absorption::AbsorptionProfile`] trait — the trapezoid is the default,
+//!   not a settled product decision (issue #37);
+//! * [`curve`] superposes the drinks of a profile (`Σ Rᵢ`, with `β` applied
+//!   once to the body), integrates them forward at a fixed step and floors the
+//!   result at zero (§6.5), at one instant or over a series.
 //!
 //! The [`drink`] module holds the drink and its components: their validation
 //! rules, the pure alcohol of a drink whatever its unit, and the name proposed
@@ -19,6 +24,10 @@
 //! The figures pinned by the tests below are the reference cases of #5: every
 //! one of them is derived from the formulas of §6, not copied from a summary.
 
+use std::fmt;
+
+pub mod absorption;
+pub mod curve;
 pub mod drink;
 
 /// Density of ethanol, in grams per millilitre (SPEC.md §6.1).
@@ -54,6 +63,114 @@ pub enum Sex {
     Female,
 }
 
+/// Why the engine refuses its inputs.
+///
+/// The engine answers with an error rather than with a number it knows to be
+/// meaningless: a negative body water would otherwise come back as a negative,
+/// plausible-looking concentration.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EngineError {
+    /// A body water estimate is zero, negative or not finite. Both Watson
+    /// equations reach this for a small enough body, the male one sooner as
+    /// the age grows.
+    NonPositiveBodyWater {
+        /// The estimate, in litres.
+        litres: f64,
+    },
+    /// An ingestion or absorption duration is negative or not finite.
+    InvalidDuration {
+        /// The duration, in hours.
+        hours: f64,
+    },
+    /// An alcohol mass is negative or not finite.
+    InvalidAlcoholMass {
+        /// The mass, in grams.
+        grams: f64,
+    },
+    /// The elimination rate is zero, negative or not finite.
+    InvalidEliminationRate {
+        /// The rate, in grams per litre and per hour.
+        g_per_l_per_h: f64,
+    },
+    /// The sampling step of a series is zero or negative.
+    NonPositiveStep {
+        /// The step, in seconds.
+        seconds: i64,
+    },
+    /// The window of a series ends before it starts.
+    ReversedWindow {
+        /// Start of the window, in seconds.
+        from_seconds: i64,
+        /// End of the window, in seconds.
+        to_seconds: i64,
+    },
+}
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonPositiveBodyWater { litres } => {
+                write!(f, "the body water estimate is not positive: {litres} L")
+            }
+            Self::InvalidDuration { hours } => {
+                write!(f, "a duration is negative or not finite: {hours} h")
+            }
+            Self::InvalidAlcoholMass { grams } => {
+                write!(f, "an alcohol mass is negative or not finite: {grams} g")
+            }
+            Self::InvalidEliminationRate { g_per_l_per_h } => write!(
+                f,
+                "the elimination rate is not positive: {g_per_l_per_h} g/L/h"
+            ),
+            Self::NonPositiveStep { seconds } => {
+                write!(f, "the sampling step is not positive: {seconds} s")
+            }
+            Self::ReversedWindow {
+                from_seconds,
+                to_seconds,
+            } => write!(
+                f,
+                "the window ends before it starts: {from_seconds} > {to_seconds}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
+
+/// A total body water, in litres, known to be finite and strictly positive.
+///
+/// The only way to obtain one is through [`BodyWater::from_litres`] or the
+/// estimates built on it, which refuse any other value: a concentration can
+/// therefore never be computed over a zero or negative volume. The Watson
+/// equations do reach such a volume for a small enough body, and the profile
+/// bounds of the API deliberately do not prevent it (product decision of
+/// 2026-08-23: no anthropometric floor). The guard is here.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct BodyWater(f64);
+
+impl BodyWater {
+    /// Wraps `litres`, refusing zero, negative and non-finite values.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NonPositiveBodyWater`] when `litres` is not a finite,
+    /// strictly positive number.
+    pub fn from_litres(litres: f64) -> Result<Self, EngineError> {
+        if litres.is_finite() && litres > 0.0 {
+            Ok(Self(litres))
+        } else {
+            Err(EngineError::NonPositiveBodyWater { litres })
+        }
+    }
+
+    /// The volume, in litres.
+    #[must_use]
+    pub fn litres(self) -> f64 {
+        self.0
+    }
+}
+
 /// Mass of pure alcohol, in grams, contained in a given volume of a beverage.
 ///
 /// `volume_ml` is the volume of the beverage in millilitres, `abv_percent` its
@@ -83,17 +200,23 @@ pub fn ingested_alcohol_grams(volume_ml: f64, abv_percent: f64) -> f64 {
 /// `age_years` is the age **at the ingestion time** of the drink, derived from
 /// the birth date of the settings version in force (SPEC.md §10.0-K); it is
 /// taken as a real number so that a fraction of a year can be expressed.
-#[must_use]
+///
+/// # Errors
+///
+/// [`EngineError::NonPositiveBodyWater`] when the equation gives zero, a
+/// negative volume or no number at all. Both equations do so for a small
+/// enough body — the male one sooner as the age grows — and the profile bounds
+/// of the API accept such bodies on purpose, so this is where it is refused.
 pub fn watson_total_body_water_litres(
     sex: Sex,
     weight_kg: f64,
     height_cm: f64,
     age_years: f64,
-) -> f64 {
-    match sex {
+) -> Result<BodyWater, EngineError> {
+    BodyWater::from_litres(match sex {
         Sex::Male => 2.447 - 0.09516 * age_years + 0.1074 * height_cm + 0.3362 * weight_kg,
         Sex::Female => -2.097 + 0.1069 * height_cm + 0.2466 * weight_kg,
-    }
+    })
 }
 
 /// Total body water, in litres, implied by the historical Widmark ratios
@@ -102,13 +225,17 @@ pub fn watson_total_body_water_litres(
 /// SPEC.md §6.2 states `r = TBW / (0.806 × M)`, so the body water an `r` stands
 /// for is `TBW = r × M × 0.806`. Feeding it to [`initial_bac_g_per_l`] gives
 /// back exactly Widmark's `C₀ = A / (r × M)`.
-#[must_use]
-pub fn widmark_total_body_water_litres(sex: Sex, weight_kg: f64) -> f64 {
+///
+/// # Errors
+///
+/// [`EngineError::NonPositiveBodyWater`] when `weight_kg` is not a finite,
+/// strictly positive number.
+pub fn widmark_total_body_water_litres(sex: Sex, weight_kg: f64) -> Result<BodyWater, EngineError> {
     let r = match sex {
         Sex::Male => WIDMARK_R_MALE,
         Sex::Female => WIDMARK_R_FEMALE,
     };
-    r * weight_kg * BLOOD_WATER_FRACTION
+    BodyWater::from_litres(r * weight_kg * BLOOD_WATER_FRACTION)
 }
 
 /// Total body water, in litres, for a set of profile parameters.
@@ -118,13 +245,18 @@ pub fn widmark_total_body_water_litres(sex: Sex, weight_kg: f64) -> f64 {
 /// The fallback condition is stated by the spec on *either* input, so a missing
 /// age triggers it for women too, even though the female Watson equation would
 /// not have used that age.
-#[must_use]
+///
+/// # Errors
+///
+/// [`EngineError::NonPositiveBodyWater`] when the estimate retained is not
+/// strictly positive. A non-positive Watson estimate is **not** replaced by the
+/// Widmark fallback, which SPEC.md §6.2 reserves to a missing input.
 pub fn total_body_water_litres(
     sex: Sex,
     weight_kg: f64,
     height_cm: Option<f64>,
     age_years: Option<f64>,
-) -> f64 {
+) -> Result<BodyWater, EngineError> {
     match (height_cm, age_years) {
         (Some(height_cm), Some(age_years)) => {
             watson_total_body_water_litres(sex, weight_kg, height_cm, age_years)
@@ -134,23 +266,27 @@ pub fn total_body_water_litres(
 }
 
 /// Blood alcohol concentration, in grams per litre, produced by `alcohol_grams`
-/// spread over `total_body_water_litres` of body water (SPEC.md §6.2).
+/// spread over `body_water` (SPEC.md §6.2).
 ///
 /// `C₀ = 0.806 × A / TBW`. The function is linear in `alcohol_grams`, which is
-/// what makes the `C₀` of several simultaneous drinks the sum of theirs.
+/// what makes the `C₀` of several simultaneous drinks the sum of theirs. Taking
+/// a [`BodyWater`] rather than a bare number is what keeps a zero or negative
+/// volume out of the division.
 #[must_use]
-pub fn initial_bac_g_per_l(alcohol_grams: f64, total_body_water_litres: f64) -> f64 {
-    BLOOD_WATER_FRACTION * alcohol_grams / total_body_water_litres
+pub fn initial_bac_g_per_l(alcohol_grams: f64, body_water: BodyWater) -> f64 {
+    BLOOD_WATER_FRACTION * alcohol_grams / body_water.litres()
 }
 
 /// Time, in hours, needed to eliminate `bac_g_per_l` at
 /// `elimination_rate_g_per_l_per_h` (SPEC.md §6.3).
 ///
-/// Elimination is zero-order, so this is simply `C / β`. It is measured from
-/// the moment the concentration is `bac_g_per_l`; for a single drink whose
-/// alcohol is fully absorbed before sobriety, the whole tail is `C₀ − β × t`
-/// and the drink is back to zero at `C₀ / β` after its ingestion time, whatever
-/// the absorption profile.
+/// Elimination is zero-order, so this is simply `C / β`, measured from the
+/// moment the concentration is `bac_g_per_l`. For a single drink taken at once
+/// (pure Widmark) the whole curve is `C₀ − β × t`, back to zero at `C₀ / β`
+/// after the ingestion time. With a spread absorption it is not: the floor at
+/// zero of SPEC.md §6.3 holds the curve at zero while the first fractions
+/// appear slower than `β` eliminates them, and that elimination is never
+/// charged. The whole curve is [`curve::bac_at`]'s.
 ///
 /// The rate is a parameter so that tests can vary it, but the value used by the
 /// application is [`ELIMINATION_RATE_G_PER_L_PER_H`], and it is applied **once**
@@ -158,6 +294,15 @@ pub fn initial_bac_g_per_l(alcohol_grams: f64, total_body_water_litres: f64) -> 
 #[must_use]
 pub fn hours_until_sober(bac_g_per_l: f64, elimination_rate_g_per_l_per_h: f64) -> f64 {
     bac_g_per_l / elimination_rate_g_per_l_per_h
+}
+
+/// Refuses an ingestion or absorption duration that is negative or not finite.
+pub(crate) fn check_duration(hours: f64) -> Result<f64, EngineError> {
+    if hours.is_finite() && hours >= 0.0 {
+        Ok(hours)
+    } else {
+        Err(EngineError::InvalidDuration { hours })
+    }
 }
 
 /// Rate `R(τ)`, in grams per hour, at which the alcohol of one drink appears in
@@ -188,15 +333,30 @@ pub fn hours_until_sober(bac_g_per_l: f64, elimination_rate_g_per_l_per_h: f64) 
 ///
 /// This profile is the **default implementation**, not a settled product
 /// decision: it is to be confronted with the other candidates before the V1
-/// release (SPEC.md §10.1, issue #37).
-#[must_use]
+/// release (SPEC.md §10.1, issue #37). The engine reaches it through
+/// [`absorption::Trapezoid`].
+///
+/// # Errors
+///
+/// [`EngineError::InvalidDuration`] when either duration is negative or not
+/// finite: such a duration has no meaning, and the rate would otherwise come
+/// back as a silent `0`.
 pub fn absorption_rate_g_per_h(
     alcohol_grams: f64,
     ingestion_hours: f64,
     absorption_hours: f64,
     elapsed_hours: f64,
-) -> f64 {
-    let (a, b, tau) = (ingestion_hours, absorption_hours, elapsed_hours);
+) -> Result<f64, EngineError> {
+    Ok(trapezoid_rate(
+        alcohol_grams,
+        check_duration(ingestion_hours)?,
+        check_duration(absorption_hours)?,
+        elapsed_hours,
+    ))
+}
+
+/// [`absorption_rate_g_per_h`] on durations already known to be valid.
+fn trapezoid_rate(alcohol_grams: f64, a: f64, b: f64, tau: f64) -> f64 {
     if a == 0.0 && b == 0.0 {
         // Dirac impulse: the whole dose appears at once. See the note above.
         return if tau == 0.0 { f64::INFINITY } else { 0.0 };
@@ -227,16 +387,29 @@ pub fn absorption_rate_g_per_h(
 /// `a = b = 0`, where it steps from `0` to `A` at `τ = 0`.
 ///
 /// This is the quantity a curve needs: `κ × absorbed(τ)` is the concentration
-/// the drink has contributed so far. The fixed-step integration of several
-/// drinks and the floor at zero belong to #16.
-#[must_use]
+/// the drink has contributed so far. [`curve`] integrates its increments over
+/// the drinks of a profile, with the floor at zero.
+///
+/// # Errors
+///
+/// [`EngineError::InvalidDuration`] when either duration is negative or not
+/// finite, as for [`absorption_rate_g_per_h`].
 pub fn absorbed_alcohol_grams(
     alcohol_grams: f64,
     ingestion_hours: f64,
     absorption_hours: f64,
     elapsed_hours: f64,
-) -> f64 {
-    let (a, b, tau) = (ingestion_hours, absorption_hours, elapsed_hours);
+) -> Result<f64, EngineError> {
+    Ok(trapezoid_absorbed(
+        alcohol_grams,
+        check_duration(ingestion_hours)?,
+        check_duration(absorption_hours)?,
+        elapsed_hours,
+    ))
+}
+
+/// [`absorbed_alcohol_grams`] on durations already known to be valid.
+pub(crate) fn trapezoid_absorbed(alcohol_grams: f64, a: f64, b: f64, tau: f64) -> f64 {
     if tau < 0.0 {
         return 0.0;
     }
@@ -298,17 +471,51 @@ mod tests {
         ingested_alcohol_grams(REF_VOLUME_ML, REF_ABV_PERCENT)
     }
 
-    fn ref_body_water_litres() -> f64 {
+    fn ref_body_water_litres() -> BodyWater {
         watson_total_body_water_litres(Sex::Male, REF_WEIGHT_KG, REF_HEIGHT_CM, REF_AGE_YEARS)
+            .expect("the reference man has a positive body water")
+    }
+
+    /// [`super::absorption_rate_g_per_h`] on durations the tests know to be
+    /// valid; its refusals are tested on their own, below.
+    fn absorption_rate_g_per_h(
+        alcohol_grams: f64,
+        ingestion_hours: f64,
+        absorption_hours: f64,
+        elapsed_hours: f64,
+    ) -> f64 {
+        super::absorption_rate_g_per_h(
+            alcohol_grams,
+            ingestion_hours,
+            absorption_hours,
+            elapsed_hours,
+        )
+        .expect("valid durations")
+    }
+
+    /// [`super::absorbed_alcohol_grams`] on durations the tests know to be
+    /// valid; its refusals are tested on their own, below.
+    fn absorbed_alcohol_grams(
+        alcohol_grams: f64,
+        ingestion_hours: f64,
+        absorption_hours: f64,
+        elapsed_hours: f64,
+    ) -> f64 {
+        super::absorbed_alcohol_grams(
+            alcohol_grams,
+            ingestion_hours,
+            absorption_hours,
+            elapsed_hours,
+        )
+        .expect("valid durations")
     }
 
     /// Concentration of the reference drink alone, `τ` hours after its
     /// ingestion: `κ × absorbed(τ) − β × τ`.
     ///
     /// This composition belongs to the test, not to the crate: it is the
-    /// closed-form single-drink curve, valid while the concentration stays
-    /// positive. The superposition of several drinks, the forward integration
-    /// and the floor at zero are #16's.
+    /// closed-form single-drink curve, without the floor at zero of §6.3. The
+    /// curve the engine draws, floor included, is `curve::bac_at`'s.
     fn ref_bac_at(ingestion_hours: f64, absorption_hours: f64, elapsed_hours: f64) -> f64 {
         let absorbed = absorbed_alcohol_grams(
             ref_alcohol_grams(),
@@ -372,7 +579,7 @@ mod tests {
     fn watson_body_water_of_the_reference_man() {
         // 2.447 − 0.09516 × 30 + 0.1074 × 180 + 0.3362 × 80
         //   = 2.447 − 2.8548 + 19.332 + 26.896 = 45.8202 L
-        let tbw = ref_body_water_litres();
+        let tbw = ref_body_water_litres().litres();
         assert!((tbw - 45.8202).abs() < DERIVED, "unexpected TBW: {tbw}");
         // §10.1 quotes 45.82 L for this template.
         assert!(
@@ -385,23 +592,25 @@ mod tests {
     fn watson_uses_the_published_age_coefficient_not_the_transposed_variant() {
         // One year of age removes exactly the age coefficient from the male
         // equation, which pins it without depending on the other terms.
-        let at_30 =
-            watson_total_body_water_litres(Sex::Male, REF_WEIGHT_KG, REF_HEIGHT_CM, REF_AGE_YEARS);
+        let at_30 = ref_body_water_litres().litres();
         let at_31 = watson_total_body_water_litres(
             Sex::Male,
             REF_WEIGHT_KG,
             REF_HEIGHT_CM,
             REF_AGE_YEARS + 1.0,
-        );
+        )
+        .expect("positive")
+        .litres();
         assert!(
             (at_30 - at_31 - 0.09516).abs() < DERIVED,
             "age coefficient is not 0.09516: {}",
             at_30 - at_31
         );
         // The 0.09156 variant of consumer calculators would give 45.9282 L on
-        // this template, and 0.346 g/L instead of 0.347 g/L.
+        // this template, and 0.346 g/L instead of 0.347 g/L: exactly
+        // (0.09516 − 0.09156) × 30 = 0.108 L more than the published value.
         assert!(
-            (at_30 - 45.9282).abs() > 0.1,
+            (45.9282 - at_30 - 0.108).abs() < DERIVED,
             "the transposed 0.09156 variant has crept in: {at_30}"
         );
     }
@@ -410,14 +619,20 @@ mod tests {
     fn watson_body_water_of_a_woman() {
         // −2.097 + 0.1069 × 165 + 0.2466 × 65
         //   = −2.097 + 17.6385 + 16.029 = 31.5705 L
-        let tbw = watson_total_body_water_litres(Sex::Female, 65.0, 165.0, 30.0);
+        let tbw = watson_total_body_water_litres(Sex::Female, 65.0, 165.0, 30.0)
+            .expect("positive")
+            .litres();
         assert!((tbw - 31.5705).abs() < DERIVED, "unexpected TBW: {tbw}");
     }
 
     #[test]
     fn the_female_watson_equation_has_no_age_term() {
-        let young = watson_total_body_water_litres(Sex::Female, 65.0, 165.0, 20.0);
-        let older = watson_total_body_water_litres(Sex::Female, 65.0, 165.0, 60.0);
+        let young = watson_total_body_water_litres(Sex::Female, 65.0, 165.0, 20.0)
+            .expect("positive")
+            .litres();
+        let older = watson_total_body_water_litres(Sex::Female, 65.0, 165.0, 60.0)
+            .expect("positive")
+            .litres();
         assert!(
             (young - older).abs() < DERIVED,
             "age changed the female estimate: {young} vs {older}"
@@ -431,22 +646,24 @@ mod tests {
             REF_WEIGHT_KG,
             Some(REF_HEIGHT_CM),
             Some(REF_AGE_YEARS),
-        );
+        )
+        .expect("positive")
+        .litres();
         assert!((tbw - 45.8202).abs() < DERIVED, "unexpected TBW: {tbw}");
     }
 
     #[test]
     fn a_missing_height_falls_back_on_the_widmark_ratios() {
         // TBW = r × M × 0.806, so that C₀ = 0.806 × A / TBW = A / (r × M).
-        let man = total_body_water_litres(Sex::Male, 80.0, None, Some(30.0));
+        let man = total_body_water_litres(Sex::Male, 80.0, None, Some(30.0)).expect("positive");
         assert!(
-            (man - 0.68 * 80.0 * 0.806).abs() < DERIVED,
-            "male fallback: {man}"
+            (man.litres() - 0.68 * 80.0 * 0.806).abs() < DERIVED,
+            "male fallback: {man:?}"
         );
-        let woman = total_body_water_litres(Sex::Female, 60.0, None, Some(30.0));
+        let woman = total_body_water_litres(Sex::Female, 60.0, None, Some(30.0)).expect("positive");
         assert!(
-            (woman - 0.55 * 60.0 * 0.806).abs() < DERIVED,
-            "female fallback: {woman}"
+            (woman.litres() - 0.55 * 60.0 * 0.806).abs() < DERIVED,
+            "female fallback: {woman:?}"
         );
 
         // And the resulting concentration is exactly Widmark's A / (r × M).
@@ -462,12 +679,16 @@ mod tests {
     fn a_missing_age_falls_back_on_the_widmark_ratios() {
         // SPEC.md §6.2 states the fallback on either missing input, so it also
         // fires for a woman, whose Watson equation would not have used the age.
-        let man = total_body_water_litres(Sex::Male, 80.0, Some(180.0), None);
+        let man = total_body_water_litres(Sex::Male, 80.0, Some(180.0), None)
+            .expect("positive")
+            .litres();
         assert!(
             (man - WIDMARK_R_MALE * 80.0 * BLOOD_WATER_FRACTION).abs() < DERIVED,
             "male fallback: {man}"
         );
-        let woman = total_body_water_litres(Sex::Female, 65.0, Some(165.0), None);
+        let woman = total_body_water_litres(Sex::Female, 65.0, Some(165.0), None)
+            .expect("positive")
+            .litres();
         assert!(
             (woman - WIDMARK_R_FEMALE * 65.0 * BLOOD_WATER_FRACTION).abs() < DERIVED,
             "female fallback: {woman}"
@@ -538,7 +759,7 @@ mod tests {
         ];
 
         for (sex, weight, height, age, volume, abv, expected) in cases {
-            let tbw = watson_total_body_water_litres(sex, weight, height, age);
+            let tbw = watson_total_body_water_litres(sex, weight, height, age).expect("positive");
             let bac = initial_bac_g_per_l(ingested_alcohol_grams(volume, abv), tbw);
             assert!(
                 (bac - expected).abs() < DERIVED,
@@ -638,9 +859,9 @@ mod tests {
     fn no_elimination_debt_is_carried_over_to_a_later_drink() {
         // §6.3: the concentration is floored at zero, so nothing is owed once
         // sober. The floored integration that shows this on a whole curve is
-        // #16's; what the bricks laid here can show is that the sobering time
-        // of a drink depends on its own C₀ alone — the idle hours since the
-        // previous drink are neither credited nor charged.
+        // tested in `curve`; what the bricks of this module can show is that
+        // the sobering time of a drink depends on its own C₀ alone — the idle
+        // hours since the previous drink are neither credited nor charged.
         let bac = initial_bac_g_per_l(ref_alcohol_grams(), ref_body_water_litres());
         let alone = hours_until_sober(bac, ELIMINATION_RATE_G_PER_L_PER_H);
 
@@ -842,6 +1063,106 @@ mod tests {
         assert!(
             (absorbed - grams / 2.0).abs() < DERIVED,
             "at the apex: {absorbed} g of {grams} g"
+        );
+    }
+
+    // ----- Refusals: nothing meaningless reaches a concentration ------------
+
+    #[test]
+    fn a_non_positive_body_water_is_refused_rather_than_divided_by() {
+        // The corner measured on #6: a body of 0.5 kg and 1 cm, male, 30.6
+        // years old, accepted by the profile bounds on purpose, gives
+        // 2.447 − 0.09516 × 30.6 + 0.1074 + 0.1681 = −0.189 396 L.
+        match watson_total_body_water_litres(Sex::Male, 0.5, 1.0, 30.6) {
+            Err(EngineError::NonPositiveBodyWater { litres }) => assert!(
+                (litres - -0.189_396).abs() < DERIVED,
+                "unexpected estimate: {litres}"
+            ),
+            other => panic!("a negative body water went through: {other:?}"),
+        }
+        // The female equation has no age term but a negative constant: a small
+        // enough body is refused at any age.
+        assert!(matches!(
+            watson_total_body_water_litres(Sex::Female, 0.5, 1.0, 20.0),
+            Err(EngineError::NonPositiveBodyWater { .. })
+        ));
+        // The fallback is no escape: it is reserved to a missing input.
+        assert!(matches!(
+            total_body_water_litres(Sex::Male, 0.5, Some(1.0), Some(30.6)),
+            Err(EngineError::NonPositiveBodyWater { .. })
+        ));
+        assert!(matches!(
+            widmark_total_body_water_litres(Sex::Male, 0.0),
+            Err(EngineError::NonPositiveBodyWater { .. })
+        ));
+        for litres in [0.0, -0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                BodyWater::from_litres(litres).is_err(),
+                "{litres} L was accepted"
+            );
+        }
+        // While the same body a few years younger is still a body.
+        let younger = watson_total_body_water_litres(Sex::Male, 0.5, 1.0, 25.0)
+            .expect("positive at 25 years");
+        assert!(initial_bac_g_per_l(9.8625, younger) > 0.0);
+    }
+
+    #[test]
+    fn a_negative_duration_is_refused_rather_than_read_as_no_absorption() {
+        let grams = ref_alcohol_grams();
+        assert_eq!(
+            super::absorption_rate_g_per_h(grams, -1.0, 0.5, 0.1),
+            Err(EngineError::InvalidDuration { hours: -1.0 })
+        );
+        assert_eq!(
+            super::absorption_rate_g_per_h(grams, 0.5, -1.0, 0.1),
+            Err(EngineError::InvalidDuration { hours: -1.0 })
+        );
+        assert_eq!(
+            super::absorbed_alcohol_grams(grams, -1.0, 0.5, 0.1),
+            Err(EngineError::InvalidDuration { hours: -1.0 })
+        );
+        assert_eq!(
+            super::absorbed_alcohol_grams(grams, 0.5, -1.0, 0.1),
+            Err(EngineError::InvalidDuration { hours: -1.0 })
+        );
+        for hours in [f64::NAN, f64::INFINITY] {
+            assert!(super::absorption_rate_g_per_h(grams, hours, 0.5, 0.1).is_err());
+            assert!(super::absorbed_alcohol_grams(grams, 0.5, hours, 0.1).is_err());
+        }
+    }
+
+    // ----- §6.4 — the absorbed mass along each branch -----------------------
+
+    #[test]
+    fn the_absorbed_mass_runs_along_the_plateau() {
+        // A = 19.725 g, a = 1/3 h, b = 1/2 h: m = 1/3, M = 1/2. On the plateau
+        // the absorbed mass is the whole rise, A × m / (2M) = 6.575 g, plus
+        // A / M per hour since m:
+        //   τ = 0.40 h → 6.575 + 39.45 × (0.40 − 1/3) = 9.205 g
+        //   τ = 0.45 h → 6.575 + 39.45 × (0.45 − 1/3) = 11.1775 g
+        let grams = ref_alcohol_grams();
+        let absorbed =
+            |tau| absorbed_alcohol_grams(grams, REF_INGESTION_HOURS, REF_ABSORPTION_HOURS, tau);
+        assert!((absorbed(0.4) - 9.205).abs() < DERIVED, "{}", absorbed(0.4));
+        assert!(
+            (absorbed(0.45) - 11.1775).abs() < DERIVED,
+            "{}",
+            absorbed(0.45)
+        );
+        // The plateau meets the rise at τ = m and the fall at τ = M.
+        assert!(
+            (absorbed(REF_INGESTION_HOURS) - 6.575).abs() < DERIVED,
+            "at m: {}",
+            absorbed(REF_INGESTION_HOURS)
+        );
+        let fall_at_big_m = grams
+            - grams * REF_INGESTION_HOURS * REF_INGESTION_HOURS
+                / (2.0 * REF_INGESTION_HOURS * REF_ABSORPTION_HOURS);
+        assert!(
+            (absorbed(REF_ABSORPTION_HOURS - 1e-15) - fall_at_big_m).abs() < 1e-9,
+            "at M: {} vs {fall_at_big_m}",
+            absorbed(REF_ABSORPTION_HOURS - 1e-15)
         );
     }
 
