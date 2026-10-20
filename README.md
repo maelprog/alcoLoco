@@ -168,7 +168,12 @@ Schema facts worth knowing before writing a query:
   `SELECT * FROM profile_settings_at($1, $2)`, or `LEFT JOIN LATERAL … ON true` when the enclosing
   row must survive an empty result. The scalar form `(profile_settings_at($1, $2)).weight_kg` is
   either illegal or silently drops the whole enclosing row;
-- durations are integer seconds (`*_duration_seconds`), volumes are millilitres (`*_ml`).
+- durations are integer seconds (`*_duration_seconds`), volumes are millilitres (`*_ml`);
+- the base library is written by a migration, not by the seed. Search it through
+  `library_item_search_key(name)`, which ignores case and accents, as a prefix:
+  `library_item_search_key(name) LIKE library_item_search_key($1) || '%'` — the form its unique
+  index serves. That key relies on the `unaccent` extension, which the migrations install in
+  `public`: the database role must be allowed to `CREATE EXTENSION unaccent`.
 
 Every profile is meant to hold **at least one settings version**, and deferred constraint triggers
 enforce that at commit, for a transaction running on its own as well as for concurrent ones
