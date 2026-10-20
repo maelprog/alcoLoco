@@ -369,10 +369,7 @@ fn the_scan_drops_every_table_of_a_drop_list() {
 fn the_scan_does_not_take_comment_markers_in_a_string_for_comments() {
     let sql = "INSERT INTO t VALUES ('Jus d''orange -- 0 %'); CREATE TABLE kept (a int);
                INSERT INTO t VALUES ('/* not a comment'); CREATE TABLE also_kept (a int);";
-    assert_eq!(
-        tables_declared_by([sql]),
-        table_set(&["also_kept", "kept"])
-    );
+    assert_eq!(tables_declared_by([sql]), table_set(&["also_kept", "kept"]));
 }
 
 #[test]
@@ -1836,11 +1833,13 @@ const LIBRARY_PREFIX_SEARCH: &str = "FROM public.library_item
 
 /// The names the library search returns for `typed`, in name order.
 async fn library_names_starting_with(pool: &sqlx::PgPool, typed: &str) -> Vec<String> {
-    sqlx::query_scalar(&format!("SELECT name {LIBRARY_PREFIX_SEARCH} ORDER BY name"))
-        .bind(typed)
-        .fetch_all(pool)
-        .await
-        .expect("the library search must run")
+    sqlx::query_scalar(&format!(
+        "SELECT name {LIBRARY_PREFIX_SEARCH} ORDER BY name"
+    ))
+    .bind(typed)
+    .fetch_all(pool)
+    .await
+    .expect("the library search must run")
 }
 
 #[tokio::test]
@@ -2009,8 +2008,7 @@ async fn a_name_is_unique_across_the_library_whatever_its_accents_case_or_catego
     // and « BIERE BLONDE », or a soft and an alcohol of the same name — would
     // offer the user two indistinguishable rows with different degrees.
     let Some(state) =
-        migrated("a_name_is_unique_across_the_library_whatever_its_accents_case_or_category")
-            .await
+        migrated("a_name_is_unique_across_the_library_whatever_its_accents_case_or_category").await
     else {
         return;
     };
