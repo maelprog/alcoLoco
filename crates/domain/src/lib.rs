@@ -12,8 +12,14 @@
 //! the `Σ Rᵢ` superposition of several drinks, the fixed-step forward
 //! integration and its floor at zero (§6.5) — is the job of #16.
 //!
+//! The [`drink`] module holds the drink and its components: their validation
+//! rules, the pure alcohol of a drink whatever its unit, and the name proposed
+//! for it (SPEC.md §4, §5.3).
+//!
 //! The figures pinned by the tests below are the reference cases of #5: every
 //! one of them is derived from the formulas of §6, not copied from a summary.
+
+pub mod drink;
 
 /// Density of ethanol, in grams per millilitre (SPEC.md §6.1).
 pub const ETHANOL_DENSITY_G_PER_ML: f64 = 0.789;
