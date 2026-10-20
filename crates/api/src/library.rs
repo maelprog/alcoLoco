@@ -184,17 +184,11 @@ pub async fn list(
 /// Validates the search and the page together, so that one answer lists every
 /// member a client got wrong.
 fn validate(search: SearchQuery, page: PageQuery) -> Result<(Search, PageRequest), ApiError> {
-    let search = search.into_search();
-    let page = page.into_request();
-    match (search, page) {
+    match (search.into_search(), page.into_parts()) {
         (Ok(search), Ok(page)) => Ok((search, page)),
         (search, page) => {
             let mut errors = search.err().unwrap_or_default();
-            match page {
-                Ok(_) => {}
-                Err(ApiError::Validation(page_errors)) => errors.extend(page_errors),
-                Err(other) => return Err(other),
-            }
+            errors.extend(page.err().unwrap_or_default());
             Err(ApiError::validation(errors))
         }
     }
