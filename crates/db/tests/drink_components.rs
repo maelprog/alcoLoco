@@ -703,3 +703,111 @@ async fn concurrent_writes_on_different_drinks_do_not_interfere() {
         }
     }
 }
+
+async fn backend_pid(conn: &mut PgConnection) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(conn)
+        .await
+        .expect("the pid must be readable")
+}
+
+/// Waits, on the server clock, until every backend of `pids` is blocked on a
+/// heavyweight lock. Returns whether they all got there within about 5 s.
+async fn wait_until_blocked(pool: &PgPool, pids: &[i32]) -> bool {
+    for _ in 0..500 {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE pid = ANY($1) AND wait_event_type = 'Lock'",
+        )
+        .bind(pids)
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_activity must be readable");
+        if usize::try_from(blocked).ok() == Some(pids.len()) {
+            return true;
+        }
+        sqlx::query("SELECT pg_sleep(0.01)")
+            .execute(pool)
+            .await
+            .expect("pg_sleep");
+    }
+    false
+}
+
+#[tokio::test]
+async fn two_transactions_writing_two_drinks_in_opposite_orders_do_not_deadlock() {
+    // T1 writes drink `low` then `high`, T2 `high` then `low`: their checks
+    // fire at COMMIT in that event order. A third connection holds the guard
+    // row of `low` until both COMMITs wait behind it. Written in event order,
+    // T2 would by then hold `high` and wait for `low`, and T1 would take `low`
+    // once released and wait for `high`: a deadlock (40P01). Written in id
+    // order, both wait for `low` first and simply queue.
+    let name = "two_transactions_writing_two_drinks_in_opposite_orders_do_not_deadlock";
+    let Some(url) = database_url(name) else {
+        return;
+    };
+    let pool = migrated_pool(&url).await;
+    let profile = profile(&pool).await;
+    let (one, one_components) = drink_with(&url, profile, "cl", None, &[40.0, 40.0, 40.0]).await;
+    let (two, two_components) = drink_with(&url, profile, "cl", None, &[40.0, 40.0, 40.0]).await;
+    let ((low, low_c), (high, high_c)) = if one < two {
+        ((one, one_components), (two, two_components))
+    } else {
+        ((two, two_components), (one, one_components))
+    };
+    let delete = |id: Uuid| format!("DELETE FROM drink_component WHERE id = '{id}';");
+
+    let mut a = connection(&url).await;
+    let mut b = connection(&url).await;
+    let pids = [backend_pid(&mut a).await, backend_pid(&mut b).await];
+    run(&mut a, "BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await
+        .expect("BEGIN");
+    run(&mut b, "BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await
+        .expect("BEGIN");
+    run(
+        &mut a,
+        &format!("{}{}", delete(low_c[0]), delete(high_c[0])),
+    )
+    .await
+    .expect("T1 writes low then high");
+    run(
+        &mut b,
+        &format!("{}{}", delete(high_c[1]), delete(low_c[1])),
+    )
+    .await
+    .expect("T2 writes high then low");
+
+    let mut holder = connection(&url).await;
+    run(&mut holder, "BEGIN").await.expect("BEGIN");
+    run(
+        &mut holder,
+        &format!("SELECT public.write_drink_component_guard('{low}')"),
+    )
+    .await
+    .expect("the holder must write the guard row");
+
+    let commit_a = tokio::spawn(async move { run(&mut a, "COMMIT").await });
+    let commit_b = tokio::spawn(async move { run(&mut b, "COMMIT").await });
+    let both_blocked = wait_until_blocked(&pool, &pids).await;
+    run(&mut holder, "COMMIT")
+        .await
+        .expect("the holder commits");
+    let outcomes = [
+        commit_a.await.expect("task a"),
+        commit_b.await.expect("task b"),
+    ];
+
+    assert!(both_blocked, "both COMMITs must queue behind the holder");
+    for (who, outcome) in ["T1", "T2"].iter().zip(&outcomes) {
+        if let Err(error) = outcome {
+            panic!(
+                "{who} must commit, got SQLSTATE {:?}: {error}",
+                sqlstate(error)
+            );
+        }
+    }
+    assert_eq!(component_count(&pool, low).await, 1);
+    assert_eq!(component_count(&pool, high).await, 1);
+}
