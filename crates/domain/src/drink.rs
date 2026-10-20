@@ -34,6 +34,10 @@ pub const NAME_SEPARATOR: &str = " – ";
 /// order of its own.
 pub const PERCENT_SUM_TOLERANCE: f64 = 1e-9;
 
+/// Longest ingestion or absorption duration, in seconds: the largest value
+/// of the `integer` columns that store both in the database.
+pub const MAX_DURATION_SECONDS: i64 = i32::MAX as i64;
+
 /// Unit in which the quantities of every component of one drink are expressed
 /// (SPEC.md §5.3). Chosen per drink, so every component of a drink shares it.
 ///
@@ -125,6 +129,10 @@ pub enum DrinkError {
     NegativeIngestionDuration,
     /// The absorption duration is zero or negative.
     NonPositiveAbsorptionDuration,
+    /// The ingestion duration exceeds [`MAX_DURATION_SECONDS`].
+    IngestionDurationTooLong,
+    /// The absorption duration exceeds [`MAX_DURATION_SECONDS`].
+    AbsorptionDurationTooLong,
     /// A component breaks one of its own rules.
     Component {
         /// Position of the component, from 0, in the order of addition.
@@ -145,8 +153,12 @@ impl DrinkError {
             Self::MissingVolumeTotal
             | Self::VolumeTotalNotAllowed
             | Self::NonPositiveVolumeTotal => "volume_total_ml".to_owned(),
-            Self::NegativeIngestionDuration => "ingestion_duration_seconds".to_owned(),
-            Self::NonPositiveAbsorptionDuration => "absorption_duration_seconds".to_owned(),
+            Self::NegativeIngestionDuration | Self::IngestionDurationTooLong => {
+                "ingestion_duration_seconds".to_owned()
+            }
+            Self::NonPositiveAbsorptionDuration | Self::AbsorptionDurationTooLong => {
+                "absorption_duration_seconds".to_owned()
+            }
             Self::Component { index, rule } => {
                 let field = match rule {
                     ComponentRule::BlankName => "name",
@@ -183,6 +195,14 @@ impl fmt::Display for DrinkError {
             Self::NonPositiveAbsorptionDuration => {
                 f.write_str("the absorption duration must be greater than zero")
             }
+            Self::IngestionDurationTooLong => write!(
+                f,
+                "the ingestion duration may not exceed {MAX_DURATION_SECONDS} seconds"
+            ),
+            Self::AbsorptionDurationTooLong => write!(
+                f,
+                "the absorption duration may not exceed {MAX_DURATION_SECONDS} seconds"
+            ),
             Self::Component { index, rule } => {
                 let rule = match rule {
                     ComponentRule::BlankName => "needs a name",
@@ -229,8 +249,14 @@ impl DrinkDraft {
         if self.ingestion_duration_seconds < 0 {
             errors.push(DrinkError::NegativeIngestionDuration);
         }
+        if self.ingestion_duration_seconds > MAX_DURATION_SECONDS {
+            errors.push(DrinkError::IngestionDurationTooLong);
+        }
         if self.absorption_duration_seconds <= 0 {
             errors.push(DrinkError::NonPositiveAbsorptionDuration);
+        }
+        if self.absorption_duration_seconds > MAX_DURATION_SECONDS {
+            errors.push(DrinkError::AbsorptionDurationTooLong);
         }
 
         let mut quantities_valid = true;
@@ -700,6 +726,30 @@ mod tests {
     }
 
     #[test]
+    fn durations_beyond_what_the_database_stores_are_refused() {
+        // The columns are `integer`: one second more than `i32::MAX` would
+        // pass here and fail in the database with 22003.
+        let mut draft = screwdriver_cl();
+        draft.ingestion_duration_seconds = i64::from(i32::MAX) + 1;
+        draft.absorption_duration_seconds = i64::from(i32::MAX) + 1;
+        let errors = errors_of(draft);
+        assert_eq!(
+            errors,
+            vec![
+                DrinkError::IngestionDurationTooLong,
+                DrinkError::AbsorptionDurationTooLong
+            ]
+        );
+        assert_eq!(errors[0].field(), "ingestion_duration_seconds");
+        assert_eq!(errors[1].field(), "absorption_duration_seconds");
+
+        let mut draft = screwdriver_cl();
+        draft.ingestion_duration_seconds = i64::from(i32::MAX);
+        draft.absorption_duration_seconds = i64::from(i32::MAX);
+        assert!(draft.validate().is_ok());
+    }
+
+    #[test]
     fn a_degree_outside_0_to_100_is_refused() {
         for abv in [-0.1, 100.1, f64::NAN, f64::INFINITY] {
             let mut draft = screwdriver_cl();
@@ -815,6 +865,8 @@ mod tests {
             DrinkError::PercentSumAbove100 { sum: 120.0 },
             DrinkError::NegativeIngestionDuration,
             DrinkError::NonPositiveAbsorptionDuration,
+            DrinkError::IngestionDurationTooLong,
+            DrinkError::AbsorptionDurationTooLong,
             DrinkError::Component {
                 index: 0,
                 rule: ComponentRule::BlankName,
