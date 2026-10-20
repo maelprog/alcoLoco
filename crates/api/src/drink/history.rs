@@ -68,16 +68,25 @@ fn blank_to_none(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-/// Reads an instant, clamped to the earliest one a `timestamptz` holds.
+/// Reads an instant, rounded up to the microsecond and clamped to the
+/// earliest one a `timestamptz` holds.
 ///
-/// `chrono` reads instants PostgreSQL refuses, with a 500. Clamping filters
-/// exactly what was asked: no drink is ingested earlier than
-/// [`earliest_ingested_at`], so a bound below it keeps — or, for `before`,
-/// leaves out — the same drinks as that bound.
+/// Both keep the filter exact. A `timestamptz` holds microseconds, and a finer
+/// bound would reach PostgreSQL truncated: half a microsecond after a drink,
+/// `from` would keep it and `before` leave it out. Rounded up, the bound keeps
+/// — under `from` — or leaves out — under `before` — exactly the stored
+/// instants it did. `chrono` also reads instants PostgreSQL refuses, with a
+/// 500; no drink is ingested earlier than [`earliest_ingested_at`], so a
+/// bound below it filters the same drinks as that bound.
 fn instant(text: &str) -> Option<Timestamp> {
-    text.parse::<Timestamp>()
-        .ok()
-        .map(|at| at.max(earliest_ingested_at()))
+    let at = text.parse::<Timestamp>().ok()?;
+    let below_a_microsecond = i64::from(at.timestamp_subsec_nanos() % 1_000);
+    let at = if below_a_microsecond == 0 {
+        at
+    } else {
+        at.checked_add_signed(chrono::TimeDelta::nanoseconds(1_000 - below_a_microsecond))?
+    };
+    Some(at.max(earliest_ingested_at()))
 }
 
 impl HistoryQuery {
@@ -269,6 +278,39 @@ mod tests {
             .into_filter()
             .expect("must validate");
         assert_eq!(filter.before, Some(earliest_ingested_at()));
+    }
+
+    #[test]
+    fn a_bound_finer_than_the_microsecond_is_rounded_up_to_the_next_one() {
+        // The database stores microseconds and the bound reaches it truncated
+        // to them. Rounded up instead, `from` still keeps exactly the drinks
+        // at or after it, and `before` exactly those before it.
+        let filter = query(
+            Some("2026-08-21T21:00:00.0000005Z"),
+            Some("2026-08-21T22:00:00.0000005Z"),
+            None,
+        )
+        .into_filter()
+        .expect("must validate");
+        assert_eq!(filter.from, Some(at("2026-08-21T21:00:00.000001Z")));
+        assert_eq!(filter.before, Some(at("2026-08-21T22:00:00.000001Z")));
+
+        let whole = query(Some("2026-08-21T21:00:00.000001Z"), None, None)
+            .into_filter()
+            .expect("must validate");
+        assert_eq!(whole.from, Some(at("2026-08-21T21:00:00.000001Z")));
+    }
+
+    #[test]
+    fn a_range_holding_no_microsecond_is_a_field_error() {
+        let errors = query(
+            Some("2026-08-21T21:00:00.0000001Z"),
+            Some("2026-08-21T21:00:00.0000002Z"),
+            None,
+        )
+        .into_filter()
+        .expect_err("must fail");
+        assert_eq!(fields(&errors), ["before"]);
     }
 
     #[test]

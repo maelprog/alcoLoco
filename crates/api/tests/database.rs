@@ -3182,3 +3182,40 @@ async fn the_history_filters_by_ingestion_time_and_by_event() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_bound_finer_than_the_microsecond_keeps_its_inclusive_and_exclusive_sides() {
+    // A `timestamptz` holds microseconds. Truncated on the way to PostgreSQL,
+    // a bound half a microsecond after a drink served it under `from` and
+    // left it out under `before` — the reverse of what each bound says.
+    let name = "a_bound_finer_than_the_microsecond_keeps_its_inclusive_and_exclusive_sides";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Nanoseconde")).await;
+    let (drink, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T21:00:00Z")).await;
+
+    assert_eq!(
+        history_walk(&state, profile, "from=2026-10-17T21:00:00.0000005Z", 1).await,
+        Vec::<Uuid>::new(),
+        "the drink is earlier than `from`"
+    );
+    assert_eq!(
+        history_walk(&state, profile, "before=2026-10-17T21:00:00.0000005Z", 1).await,
+        [drink],
+        "the drink is earlier than `before`"
+    );
+
+    let answer = send(
+        state,
+        "GET",
+        &format!(
+            "/profiles/{profile}/drinks?from=2026-10-17T21:00:00.0000001Z\
+             &before=2026-10-17T21:00:00.0000002Z"
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "before");
+}
