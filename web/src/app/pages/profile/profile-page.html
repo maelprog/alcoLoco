@@ -1,0 +1,181 @@
+<main class="profile-page">
+  <header>
+    <h1>Mon profil</h1>
+    <p>Modifie tes paramètres physiologiques et tes préférences de saisie.</p>
+  </header>
+
+  <!--<form (ngSubmit)="saveProfile()">-->
+  <form (ngSubmit)="saveProfile()" novalidate>
+    <fieldset>
+      <legend>Paramètres physiologiques</legend>
+
+      <div>
+        <label for="weightKg">Poids (kg) *</label>
+        <input
+          id="weightKg"
+          name="weightKg"
+          type="number"
+          min="1"
+          step="any"
+          [ngModel]="weightKg()"
+          (ngModelChange)="weightKg.set($event); clearFieldError('weightKg')"
+          [class.profile-page__input--invalid]="invalidFields().includes('weightKg')"
+          [attr.aria-invalid]="invalidFields().includes('weightKg')"
+          [attr.aria-describedby]="invalidFields().includes('weightKg') ? 'weightKg-error' : null"
+          required
+        />
+        @if (invalidFields().includes('weightKg')) {
+          <small id="weightKg-error" class="profile-page__field-error">
+            Saisis un poids supérieur à 0.
+          </small>
+        }
+      </div>
+
+      <div>
+        <label for="heightCm">Taille (cm) *</label>
+        <input
+          id="heightCm"
+          name="heightCm"
+          type="number"
+          min="1"
+          step="any"
+          [ngModel]="heightCm()"
+          (ngModelChange)="heightCm.set($event); clearFieldError('heightCm')"
+          [class.profile-page__input--invalid]="invalidFields().includes('heightCm')"
+          [attr.aria-invalid]="invalidFields().includes('heightCm')"
+          [attr.aria-describedby]="invalidFields().includes('heightCm') ? 'heightCm-error' : null"
+          required
+        />
+        @if (invalidFields().includes('heightCm')) {
+          <small id="heightCm-error" class="profile-page__field-error">
+            Saisis une taille supérieure à 0.
+          </small>
+        }
+      </div>
+
+      <div>
+        <label for="sex">Sexe *</label>
+        <select
+          id="sex"
+          name="sex"
+          [ngModel]="sex()"
+          (ngModelChange)="sex.set($event); clearFieldError('sex')"
+          [class.profile-page__input--invalid]="invalidFields().includes('sex')"
+          [attr.aria-invalid]="invalidFields().includes('sex')"
+          [attr.aria-describedby]="invalidFields().includes('sex') ? 'sex-error' : null"
+          required
+        >
+          <option value="">Sélectionner…</option>
+          <option value="female">Féminin</option>
+          <option value="male">Masculin</option>
+        </select>
+        @if (invalidFields().includes('sex')) {
+          <small id="sex-error" class="profile-page__field-error">
+            Sélectionne un sexe.
+          </small>
+        }
+      </div>
+
+      <div>
+        <label for="birthDate">Date de naissance *</label>
+        <input
+          id="birthDate"
+          name="birthDate"
+          type="date"
+          [ngModel]="birthDate()"
+          (ngModelChange)="birthDate.set($event); clearFieldError('birthDate')"
+          [class.profile-page__input--invalid]="invalidFields().includes('birthDate')"
+          [attr.aria-invalid]="invalidFields().includes('birthDate')"
+          [attr.aria-describedby]="invalidFields().includes('birthDate') ? 'birthDate-error' : null"
+          required
+        />
+        @if (invalidFields().includes('birthDate')) {
+          <small id="birthDate-error" class="profile-page__field-error">
+            Saisis une date de naissance valide qui n'est pas dans le futur.
+          </small>
+        }
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Préférences de saisie</legend>
+
+      <div>
+        <label for="defaultUnit">Unité par défaut</label>
+        <select
+          id="defaultUnit"
+          name="defaultUnit"
+          [ngModel]="defaultUnit()"
+          (ngModelChange)="defaultUnit.set($event)"
+        >
+          <option value="cl">Volume (cL)</option>
+          <option value="percent">Pourcentage (%)</option>
+        </select>
+      </div>
+
+      <div>
+        <label for="ingestionDuration">
+          Durée d'ingestion par défaut (minutes)
+        </label>
+        <input
+          id="ingestionDuration"
+          name="ingestionDuration"
+          type="number"
+          min="0"
+          step="5"
+          [ngModel]="defaultIngestionDuration()"
+          (ngModelChange)="defaultIngestionDuration.set($event); clearFieldError('ingestionDuration')"
+          [class.profile-page__input--invalid]="invalidFields().includes('ingestionDuration')"
+          [attr.aria-invalid]="invalidFields().includes('ingestionDuration')"
+          [attr.aria-describedby]="invalidFields().includes('ingestionDuration') ? 'ingestionDuration-error' : null"
+        />
+        @if (invalidFields().includes('ingestionDuration')) {
+          <small id="ingestionDuration-error" class="profile-page__field-error">
+            Saisis un nombre entier positif ou égal à 0, par paliers de 5 minutes.
+          </small>
+        }
+      </div>
+
+      <div>
+        <label for="absorptionDuration">
+          Durée d'absorption par défaut (minutes)
+        </label>
+        <input
+          id="absorptionDuration"
+          name="absorptionDuration"
+          type="number"
+          min="0"
+          step="5"
+          [ngModel]="defaultAbsorptionDuration()"
+          (ngModelChange)="defaultAbsorptionDuration.set($event); clearFieldError('absorptionDuration')"
+          [class.profile-page__input--invalid]="invalidFields().includes('absorptionDuration')"
+          [attr.aria-invalid]="invalidFields().includes('absorptionDuration')"
+          [attr.aria-describedby]="invalidFields().includes('absorptionDuration') ? 'absorptionDuration-error' : null"
+        />
+        @if (invalidFields().includes('absorptionDuration')) {
+          <small id="absorptionDuration-error" class="profile-page__field-error">
+            Saisis un nombre entier positif ou égal à 0, par paliers de 5 minutes.
+          </small>
+        }
+      </div>
+    </fieldset>
+
+    <p class="profile-page__notice">
+      Les modifications de tes paramètres ne réécrivent pas les courbes passées.
+    </p>
+
+    @if (errorMessage()) {
+      <p role="alert" class="profile-page__error">
+        {{ errorMessage() }}
+      </p>
+    }
+
+    @if (successMessage()) {
+      <p role="status" class="profile-page__success">
+        {{ successMessage() }}
+      </p>
+    }
+
+    <button type="submit" [disabled]="loading() || saving()">{{ saving() ? 'Enregistrement...' : 'Enregistrer les modifications' }}</button>
+  </form>
+</main>
