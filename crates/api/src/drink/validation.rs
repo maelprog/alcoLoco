@@ -567,6 +567,25 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_patch_keeps_the_total_volume_of_a_drink_in_percent() {
+        // The stored volume is the only thing that makes the shares
+        // computable: dropping it would turn a rename into a refusal.
+        let mut in_percent = stored();
+        in_percent.quantity_unit = QuantityUnit::Percent;
+        in_percent.volume_total_ml = Some(200.0);
+        in_percent.components[0].quantity = 20.0;
+        in_percent.components[1].quantity = 80.0;
+        let valid = DrinkPatch {
+            name: Some("Vodka orange".to_owned()),
+            ..DrinkPatch::default()
+        }
+        .merge_onto(in_percent)
+        .expect("valid");
+        assert_eq!(valid.drink.unit(), domain::drink::QuantityUnit::Percent);
+        assert_eq!(valid.drink.entered_volume_total_ml(), Some(200.0));
+    }
+
+    #[test]
     fn new_components_replace_the_whole_composition() {
         let valid = DrinkPatch {
             components: Some(vec![component("Vodka", 40.0, 50.0)]),
