@@ -3184,6 +3184,22 @@ async fn the_history_filters_by_ingestion_time_and_by_event() {
 }
 
 #[tokio::test]
+async fn a_cursor_after_the_year_9999_is_passed_back_as_it_was_received() {
+    // `history_walk` puts the cursor in the URL unencoded, as a client may.
+    // Rendered as an RFC 3339 instant, a cursor from the year 10000 starts
+    // with `+`, read back as a space: the next page was a 400.
+    let name = "a_cursor_after_the_year_9999_is_passed_back_as_it_was_received";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Futur")).await;
+    let (now, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T21:00:00Z")).await;
+    let (later, _) =
+        record_drink(&state, profile, &a_beer("Bière", "+10000-01-01T00:00:00Z")).await;
+    assert_eq!(history_walk(&state, profile, "", 1).await, [later, now]);
+}
+
+#[tokio::test]
 async fn a_bound_finer_than_the_microsecond_keeps_its_inclusive_and_exclusive_sides() {
     // A `timestamptz` holds microseconds. Truncated on the way to PostgreSQL,
     // a bound half a microsecond after a drink served it under `from` and

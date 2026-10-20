@@ -21,7 +21,6 @@
 //! the rows still to come: it lands either before the cursor — already walked,
 //! never served twice — or after it, served in its place.
 
-use chrono::SecondsFormat;
 use utoipa::IntoParams;
 use uuid::Uuid;
 
@@ -146,14 +145,20 @@ pub struct HistoryCursor {
     pub id: Uuid,
 }
 
-/// Separates the two members of a rendered cursor. Neither an RFC 3339
-/// instant in UTC nor a hyphenated UUID contains it.
+/// Separates the two members of a rendered cursor. Neither a signed integer
+/// nor a hyphenated UUID contains it.
 const CURSOR_SEPARATOR: char = '_';
 
+/// A cursor is rendered `<microseconds since the Unix epoch>_<identifier>`:
+/// digits, `-`, `_` and hexadecimal only, all of them unreserved in RFC 3986,
+/// so that a client may put it in a URL as it received it. An RFC 3339 instant
+/// would not do: from the year 10000 on it starts with `+`, which a query
+/// string reads as a space. Microseconds are the precision of a
+/// `timestamptz`, so the instant read back is the instant stored, to the bit.
 impl Cursor for HistoryCursor {
     fn parse(text: &str) -> Option<Self> {
-        let (at, id) = text.split_once(CURSOR_SEPARATOR)?;
-        let ingested_at = at.parse::<Timestamp>().ok()?;
+        let (micros, id) = text.split_once(CURSOR_SEPARATOR)?;
+        let ingested_at = Timestamp::from_timestamp_micros(micros.parse().ok()?)?;
         // Rendered by the API, a cursor never lies outside what the database
         // holds; one that does was forged, and would be a 500.
         if ingested_at < earliest_ingested_at() {
@@ -166,12 +171,9 @@ impl Cursor for HistoryCursor {
     }
 
     fn render(&self) -> String {
-        // Microseconds: the precision of a `timestamptz`, so that the instant
-        // read back is the instant stored, to the bit.
         format!(
             "{}{CURSOR_SEPARATOR}{}",
-            self.ingested_at
-                .to_rfc3339_opts(SecondsFormat::Micros, true),
+            self.ingested_at.timestamp_micros(),
             self.id
         )
     }
@@ -322,7 +324,7 @@ mod tests {
         let text = cursor.render();
         assert_eq!(
             text,
-            format!("2026-08-20T21:04:05.123456Z_{}", cursor.id),
+            format!("1787259845123456_{}", cursor.id),
             "the rendering is what clients are handed"
         );
         assert_eq!(HistoryCursor::parse(&text), Some(cursor));
@@ -338,14 +340,44 @@ mod tests {
     }
 
     #[test]
+    fn a_cursor_is_safe_in_a_query_string_whatever_the_year() {
+        // A client is handed the cursor and may put it in a URL as it is. An
+        // RFC 3339 instant from the year 10000 on starts with `+`, which a
+        // query string reads as a space. Only the unreserved characters of
+        // RFC 3986 are safe unencoded.
+        for ingested_at in [
+            earliest_ingested_at(),
+            at("1969-12-31T23:59:59.999999Z"),
+            at("2026-08-20T21:04:05.123456Z"),
+            at("+10000-01-01T00:00:00Z"),
+            at("+262142-12-31T23:59:59.999999Z"),
+        ] {
+            let cursor = HistoryCursor {
+                ingested_at,
+                id: crate::id::new_id(),
+            };
+            let text = cursor.render();
+            assert!(
+                text.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)),
+                "{ingested_at}: {text}"
+            );
+            assert_eq!(HistoryCursor::parse(&text), Some(cursor), "{text}");
+        }
+    }
+
+    #[test]
     fn a_text_that_is_not_a_rendered_cursor_is_refused() {
         let id = crate::id::new_id();
+        let too_early = earliest_ingested_at().timestamp_micros() - 1;
         for text in [
             id.to_string(),
-            "2026-08-20T21:04:05Z".to_owned(),
+            "1787259845123456".to_owned(),
             format!("yesterday_{id}"),
-            "2026-08-20T21:04:05Z_nope".to_owned(),
-            format!("-5000-01-01T00:00:00Z_{id}"),
+            format!("2026-08-20T21:04:05Z_{id}"),
+            "1787259845123456_nope".to_owned(),
+            format!("{too_early}_{id}"),
+            format!("{}_{id}", i64::MAX),
         ] {
             assert_eq!(HistoryCursor::parse(&text), None, "{text}");
         }
