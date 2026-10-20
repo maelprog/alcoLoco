@@ -28,8 +28,17 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         crate::profile::create,
         crate::profile::update,
         crate::library::list,
+        crate::drink::create,
+        crate::drink::read,
+        crate::drink::update,
+        crate::drink::delete,
     ),
     components(schemas(
+        crate::drink::Component,
+        crate::drink::ComponentRequest,
+        crate::drink::Drink,
+        crate::drink::DrinkPatch,
+        crate::drink::DrinkRequest,
         crate::error::FieldError,
         crate::error::ProblemDetails,
         crate::health::DatabaseStatus,
@@ -49,6 +58,7 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         (name = "system", description = "Exploitation: santé du service."),
         (name = "profiles", description = "Profils et paramètres physiologiques versionnés."),
         (name = "library", description = "Bibliothèque de base, en lecture seule."),
+        (name = "drinks", description = "Consommations d'un profil : saisie, modification, suppression."),
     ),
 )]
 struct ApiDoc;
@@ -98,6 +108,8 @@ mod tests {
             (crate::profile::COLLECTION_PATH, &["get", "post"]),
             (crate::profile::ITEM_PATH, &["get", "put"]),
             (crate::library::COLLECTION_PATH, &["get"]),
+            (crate::drink::PROFILE_COLLECTION_PATH, &["post"]),
+            (crate::drink::ITEM_PATH, &["get", "patch", "delete"]),
         ] {
             for method in methods {
                 assert!(
@@ -121,6 +133,9 @@ mod tests {
             (crate::profile::ITEM_PATH, "get", "404"),
             (crate::profile::ITEM_PATH, "put", "409"),
             (crate::library::COLLECTION_PATH, "get", "400"),
+            (crate::drink::PROFILE_COLLECTION_PATH, "post", "404"),
+            (crate::drink::ITEM_PATH, "patch", "400"),
+            (crate::drink::ITEM_PATH, "delete", "404"),
         ] {
             let schema = &document["paths"][path][method]["responses"][status]["content"]["application/json"]
                 ["schema"];

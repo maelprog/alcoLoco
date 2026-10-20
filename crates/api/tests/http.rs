@@ -263,3 +263,22 @@ async fn an_unusable_library_search_is_refused_before_the_database_is_reached() 
         .collect();
     assert_eq!(fields, vec!["q", "category", "limit"]);
 }
+
+#[tokio::test]
+async fn an_unusable_drink_identifier_is_refused_before_the_database_is_reached() {
+    // 400 and not 404: the identifier is unusable, which is different from
+    // naming a drink that does not exist. The database is unreachable here.
+    for method in ["GET", "PATCH", "DELETE"] {
+        let answer = call(api::app(state("development")), method, "/drinks/not-a-uuid").await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{method}");
+        assert_eq!(answer.media_type, PROBLEM_JSON, "{method}");
+    }
+    let answer = call(
+        api::app(state("development")),
+        "POST",
+        "/profiles/not-a-uuid/drinks",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer.media_type, PROBLEM_JSON);
+}
