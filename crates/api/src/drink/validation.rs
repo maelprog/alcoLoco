@@ -24,6 +24,19 @@ pub const FEELING_RATING_MIN: i64 = 1;
 /// Highest feeling rating (SPEC.md §5.9), as the schema's `CHECK` spells it.
 pub const FEELING_RATING_MAX: i64 = 10;
 
+/// The earliest instant a `timestamptz` holds: 4714-11-24 00:00:00 UTC BC,
+/// that is year −4713 in the proleptic Gregorian calendar `chrono` counts in.
+/// `chrono` reads earlier instants, which PostgreSQL then refuses with a
+/// 500; the database test `an_ingestion_time_is_held_to_what_the_database_stores`
+/// ties this value to the live server, in both directions.
+#[must_use]
+pub fn earliest_ingested_at() -> Timestamp {
+    chrono::NaiveDate::from_ymd_opt(-4713, 11, 24)
+        .and_then(|day| day.and_hms_opt(0, 0, 0))
+        .expect("a real instant")
+        .and_utc()
+}
+
 /// The input preferences of a profile a creation falls back on (SPEC.md §5.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Defaults {
@@ -122,6 +135,14 @@ impl DrinkRequest {
             errors.push(FieldError::new("quantity_unit", "is required"));
         }
 
+        let ingested_at = self.ingested_at.unwrap_or(now);
+        if ingested_at < earliest_ingested_at() {
+            errors.push(FieldError::new(
+                "ingested_at",
+                format!("must not be earlier than {}", earliest_ingested_at()),
+            ));
+        }
+
         let mut components = Vec::new();
         let mut complete = true;
         for (index, component) in self.components.unwrap_or_default().into_iter().enumerate() {
@@ -182,7 +203,7 @@ impl DrinkRequest {
         match drink {
             Some(drink) if errors.is_empty() => Ok(ValidDrink {
                 event_id: self.event_id,
-                ingested_at: self.ingested_at.unwrap_or(now),
+                ingested_at,
                 feeling_rating,
                 drink,
             }),
@@ -501,6 +522,38 @@ mod tests {
                 ["feeling_rating"],
                 "{rating}"
             );
+        }
+    }
+
+    #[test]
+    fn an_ingestion_time_before_what_the_database_stores_is_a_field_error() {
+        let earliest = earliest_ingested_at();
+        let valid = DrinkRequest {
+            ingested_at: Some(earliest),
+            ..a_beer()
+        }
+        .validate(DEFAULTS, now())
+        .expect("the earliest storable instant is valid");
+        assert_eq!(valid.ingested_at, earliest);
+
+        for too_early in [
+            earliest - chrono::Duration::microseconds(1),
+            "-5000-01-01T00:00:00Z".parse().expect("chrono reads it"),
+        ] {
+            let request = DrinkRequest {
+                ingested_at: Some(too_early),
+                ..a_beer()
+            };
+            assert_eq!(
+                fields_of(request.validate(DEFAULTS, now())),
+                ["ingested_at"],
+                "{too_early}"
+            );
+            let patch = DrinkPatch {
+                ingested_at: Some(too_early),
+                ..DrinkPatch::default()
+            };
+            assert_eq!(fields_of(patch.merge_onto(stored())), ["ingested_at"]);
         }
     }
 

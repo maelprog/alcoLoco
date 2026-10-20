@@ -2745,6 +2745,48 @@ async fn an_invalid_write_is_a_400_and_leaves_the_stored_drink_alone() {
 }
 
 #[tokio::test]
+async fn an_ingestion_time_is_held_to_what_the_database_stores() {
+    // Ties `earliest_ingested_at` to the live server in both directions: the
+    // bound itself is stored and read back unchanged, one microsecond earlier
+    // is a field error and not the 500 PostgreSQL would answer.
+    let name = "an_ingestion_time_is_held_to_what_the_database_stores";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Préhistoire")).await;
+    let earliest = api::drink::validation::earliest_ingested_at();
+    let rendered = serde_json::to_value(earliest).expect("must serialise");
+
+    let mut payload = a_beer("Bière", "unused");
+    payload["ingested_at"] = rendered.clone();
+    let (drink, body) = record_drink(&state, profile, &payload).await;
+    assert_eq!(body["ingested_at"], rendered);
+
+    payload["ingested_at"] = serde_json::to_value(earliest - chrono::Duration::microseconds(1))
+        .expect("must serialise");
+    let answer = send(
+        state.clone(),
+        "POST",
+        &format!("/profiles/{profile}/drinks"),
+        Some(payload),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "ingested_at");
+
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(serde_json::json!({ "ingested_at": "-5000-01-01T00:00:00Z" })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "ingested_at");
+    assert_eq!(history_of(&state.pool, profile).await, vec![drink]);
+}
+
+#[tokio::test]
 async fn writing_to_an_unknown_profile_or_drink_is_a_404() {
     let Some(state) = migrated("writing_to_an_unknown_profile_or_drink_is_a_404").await else {
         return;
