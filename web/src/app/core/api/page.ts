@@ -5,7 +5,11 @@ import { HttpParams } from '@angular/common/http';
  *
  * A request carries `?limit=&cursor=`, an answer carries
  * `{ "items": [...], "next_cursor": <string|null> }`. There is no offset and no
- * total: the cursor is the identifier of the last item of the previous page.
+ * total: the cursor is opaque, the `next_cursor` of the previous page passed
+ * back as it was received.
+ *
+ * The two bounds below are compared with the API's by
+ * `crates/api/tests/front_contract.rs`.
  */
 
 /** Page size the API uses when the request does not ask for one. */
@@ -26,7 +30,7 @@ export interface Page<T> {
 export interface PageRequest {
   /** Number of items wanted, within `1..=MAX_PAGE_LIMIT`. */
   limit?: number;
-  /** Cursor returned as `next_cursor` by the previous page. */
+  /** Cursor returned as `next_cursor` by the previous page, unchanged. */
   cursor?: string | null;
 }
 

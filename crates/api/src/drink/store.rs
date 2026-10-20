@@ -17,8 +17,10 @@ use uuid::Uuid;
 
 use crate::error::{ApiError, FieldError};
 use crate::id::new_id;
+use crate::pagination::{Page, PageRequest};
 use crate::profile::QuantityUnit;
 
+use super::history::{HistoryCursor, HistoryFilter};
 use super::model::{Component, Drink};
 use super::validation::{Defaults, ValidDrink};
 
@@ -79,6 +81,48 @@ const SELECT_COMPONENTS: &str = "
     FROM public.drink_component
     WHERE drink_id = $1
     ORDER BY sort_order
+";
+
+/// Makes the reads of one history page see one snapshot: the profile, the
+/// drinks and their components as they all stood at the same instant, so that
+/// a drink modified meanwhile is never served with the components of another
+/// version of itself.
+const SNAPSHOT_READ: &str = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY";
+
+/// Whether a profile exists, so that an unknown one is told from an empty
+/// history.
+const SELECT_PROFILE_EXISTS: &str = "SELECT 1 FROM public.profile WHERE id = $1";
+
+/// One page of the history of profile `$1`, latest ingestion first.
+///
+/// `$2` and `$3` bound `ingested_at` (inclusive, exclusive), `$4` keeps one
+/// event, and `($5, $6)` is the cursor: the page resumes strictly after it in
+/// the order of the `ORDER BY`. Every one of them may be null, and is then no
+/// filter; they are cast because a bound `None` arrives as an untyped null.
+/// The row comparison is what makes the order total and the walk stable: see
+/// `super::history`.
+const SELECT_HISTORY_PAGE: &str = "
+    SELECT d.id, d.profile_id, d.event_id, d.name, d.ingested_at,
+           d.ingestion_duration_seconds, d.absorption_duration_seconds,
+           d.quantity_unit::pg_catalog.text AS quantity_unit,
+           d.volume_total_ml, d.feeling_rating, d.created_at, d.updated_at
+    FROM public.drink AS d
+    WHERE d.profile_id = $1
+      AND ($2::pg_catalog.timestamptz IS NULL OR d.ingested_at >= $2::pg_catalog.timestamptz)
+      AND ($3::pg_catalog.timestamptz IS NULL OR d.ingested_at < $3::pg_catalog.timestamptz)
+      AND ($4::pg_catalog.uuid IS NULL OR d.event_id = $4::pg_catalog.uuid)
+      AND ($5::pg_catalog.timestamptz IS NULL
+           OR (d.ingested_at, d.id) < ($5::pg_catalog.timestamptz, $6::pg_catalog.uuid))
+    ORDER BY d.ingested_at DESC, d.id DESC
+    LIMIT $7
+";
+
+/// The components of several drinks, each in the order they were added.
+const SELECT_COMPONENTS_OF: &str = "
+    SELECT drink_id, name, abv_percent, quantity
+    FROM public.drink_component
+    WHERE drink_id = ANY($1::pg_catalog.uuid[])
+    ORDER BY drink_id, sort_order
 ";
 
 /// Every member of a drink but its identity and its profile.
@@ -212,6 +256,77 @@ pub async fn read(pool: &PgPool, id: Uuid) -> Result<Option<Drink>, ApiError> {
     let drink = fetch(&mut tx, SELECT_DRINK, id).await?;
     tx.commit().await?;
     Ok(drink)
+}
+
+/// Reads one page of the history of a profile, each drink with its
+/// components, or nothing when no profile carries that identifier.
+///
+/// # Errors
+///
+/// Fails when a query cannot be run or a row cannot be read.
+pub async fn history(
+    pool: &PgPool,
+    profile_id: Uuid,
+    filter: &HistoryFilter,
+    request: &PageRequest<HistoryCursor>,
+) -> Result<Option<Page<Drink>>, ApiError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(SNAPSHOT_READ).execute(&mut *tx).await?;
+
+    if sqlx::query(SELECT_PROFILE_EXISTS)
+        .bind(profile_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+
+    let cursor = request.cursor();
+    let rows = sqlx::query(SELECT_HISTORY_PAGE)
+        .bind(profile_id)
+        .bind(filter.from)
+        .bind(filter.before)
+        .bind(filter.event_id)
+        .bind(cursor.map(|cursor| cursor.ingested_at))
+        .bind(cursor.map(|cursor| cursor.id))
+        .bind(request.fetch_limit())
+        .fetch_all(&mut *tx)
+        .await?;
+
+    let ids: Vec<Uuid> = rows
+        .iter()
+        .map(|row| row.try_get("id"))
+        .collect::<Result<_, _>>()?;
+    let mut components: std::collections::HashMap<Uuid, Vec<Component>> =
+        std::collections::HashMap::with_capacity(ids.len());
+    for row in sqlx::query(SELECT_COMPONENTS_OF)
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?
+    {
+        components
+            .entry(row.try_get("drink_id")?)
+            .or_default()
+            .push(Component {
+                name: row.try_get("name")?,
+                abv_percent: row.try_get("abv_percent")?,
+                quantity: row.try_get("quantity")?,
+            });
+    }
+    tx.commit().await?;
+
+    let drinks = rows
+        .iter()
+        .zip(ids)
+        .map(|(row, id)| drink_from_row(row, components.remove(&id).unwrap_or_default()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(Page::from_rows(drinks, request, |drink| {
+        HistoryCursor {
+            ingested_at: drink.ingested_at,
+            id: drink.id,
+        }
+    })))
 }
 
 /// What a write found, so that the handler can answer the right status.
@@ -376,6 +491,10 @@ mod tests {
             SELECT_DRINK,
             SELECT_DRINK_FOR_UPDATE,
             SELECT_COMPONENTS,
+            SNAPSHOT_READ,
+            SELECT_PROFILE_EXISTS,
+            SELECT_HISTORY_PAGE,
+            SELECT_COMPONENTS_OF,
             UPDATE_DRINK,
             DELETE_COMPONENTS,
             DELETE_DRINK,

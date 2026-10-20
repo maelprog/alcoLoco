@@ -214,7 +214,7 @@ fn settings_from_row(row: &PgRow) -> Result<Option<ProfileSettings>, ApiError> {
 /// Fails when the query cannot be run or a row cannot be read.
 pub async fn list(pool: &PgPool, request: PageRequest) -> Result<Page<Profile>, ApiError> {
     let rows = sqlx::query(SELECT_PAGE)
-        .bind(request.cursor)
+        .bind(request.cursor().copied())
         .bind(request.fetch_limit())
         .fetch_all(pool)
         .await?;
@@ -224,7 +224,7 @@ pub async fn list(pool: &PgPool, request: PageRequest) -> Result<Page<Profile>, 
         .map(profile_from_row)
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(Page::from_rows(profiles, request, |profile| profile.id))
+    Ok(Page::from_rows(profiles, &request, |profile| profile.id))
 }
 
 /// Reads one profile, or nothing when no profile carries that identifier.

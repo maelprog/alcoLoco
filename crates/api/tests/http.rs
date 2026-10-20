@@ -282,3 +282,42 @@ async fn an_unusable_drink_identifier_is_refused_before_the_database_is_reached(
     assert_eq!(answer.status, StatusCode::BAD_REQUEST);
     assert_eq!(answer.media_type, PROBLEM_JSON);
 }
+
+#[tokio::test]
+async fn an_unusable_history_query_is_refused_before_the_database_is_reached() {
+    // Same reasoning as the library search: the database is unreachable, so a
+    // 400 proves every filter and the page are validated before any statement
+    // runs, and reported together.
+    let profile = api::new_id();
+    let answer = call(
+        api::app(state("development")),
+        "GET",
+        &format!(
+            "/profiles/{profile}/drinks?from=yesterday&before=2026-13-01T00:00:00Z\
+             &event_id=soiree&limit=0&cursor=nope"
+        ),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.media_type, PROBLEM_JSON);
+    let fields: Vec<&str> = answer.body["errors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no errors[] in {}", answer.body))
+        .iter()
+        .map(|error| {
+            error["field"]
+                .as_str()
+                .expect("a field error names its field")
+        })
+        .collect();
+    assert_eq!(fields, ["from", "before", "event_id", "limit", "cursor"]);
+
+    let answer = call(
+        api::app(state("development")),
+        "GET",
+        "/profiles/not-a-uuid/drinks",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.media_type, PROBLEM_JSON);
+}
