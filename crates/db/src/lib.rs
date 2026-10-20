@@ -257,7 +257,7 @@ pub async fn seed(pool: &PgPool) -> Result<(), sqlx::Error> {
     }
 
     // A drink measured in cL: the total volume is derived from the components,
-    // hence left NULL.
+    // hence left NULL. Its quantities are in centilitres, as the API stores them.
     let beer = insert_drink(
         &mut tx,
         &DrinkSeed {
@@ -271,7 +271,7 @@ pub async fn seed(pool: &PgPool) -> Result<(), sqlx::Error> {
         },
     )
     .await?;
-    insert_component(&mut tx, beer, 0, "Bière blonde", 5.0, 250.0).await?;
+    insert_component(&mut tx, beer, 0, "Bière blonde", 5.0, 25.0).await?;
 
     // A drink measured in % of its total volume: the total volume is mandatory.
     let cocktail = insert_drink(
@@ -305,7 +305,7 @@ pub async fn seed(pool: &PgPool) -> Result<(), sqlx::Error> {
         },
     )
     .await?;
-    insert_component(&mut tx, shot, 0, "Vodka", 40.0, 40.0).await?;
+    insert_component(&mut tx, shot, 0, "Vodka", 40.0, 4.0).await?;
 
     tx.commit().await
 }

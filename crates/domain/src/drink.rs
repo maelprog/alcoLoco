@@ -12,8 +12,9 @@
 //! cL / % choice of the user decides how a component quantity is *expressed*:
 //! with [`QuantityUnit::Cl`] it is a volume (in millilitres, the unit the cL
 //! entry is converted to), with [`QuantityUnit::Percent`] a share of the total
-//! volume of the drink. This is exactly the meaning of
-//! `drink_component.quantity`.
+//! volume of the drink. `drink_component.quantity` stores the cL case in
+//! centilitres, as entered (migration `20261022090000`): its reader
+//! multiplies it by 10 before it reaches this module.
 
 use std::fmt;
 

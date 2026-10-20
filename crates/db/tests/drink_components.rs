@@ -233,7 +233,8 @@ async fn a_drink_with_components_commits_in_both_units() {
     let pool = migrated_pool(&url).await;
     let profile = profile(&pool).await;
 
-    // cL quantities are millilitres: 300 mL in total is no percentage.
+    // cL quantities are volumes (centilitres since migration 20261022090000):
+    // 300 in total is no percentage.
     let (cl, _) = drink_with(&url, profile, "cl", None, &[200.0, 100.0]).await;
     assert_eq!(component_count(&pool, cl).await, 2);
 
@@ -458,7 +459,7 @@ async fn moving_a_component_into_a_full_drink_in_percent_is_refused() {
 
 #[tokio::test]
 async fn switching_a_drink_to_percent_checks_its_components() {
-    // 200 mL + 100 mL read as percentages would be 300 %.
+    // 200 cL + 100 cL read as percentages would be 300 %.
     let Some(url) = database_url("switching_a_drink_to_percent_checks_its_components") else {
         return;
     };
@@ -634,8 +635,8 @@ async fn two_transactions_cannot_each_add_a_share_that_fits_alone() {
 
 #[tokio::test]
 async fn a_unit_switch_and_a_component_insert_cannot_both_commit() {
-    // One transaction switches a drink of 60 mL to percent, reading 60 as
-    // 60 %; the other adds 50 mL, which a drink in cL takes without a bound.
+    // One transaction switches a drink of 60 cL to percent, reading 60 as
+    // 60 %; the other adds 50 cL, which a drink in cL takes without a bound.
     let Some(url) = database_url("a_unit_switch_and_a_component_insert_cannot_both_commit") else {
         return;
     };
@@ -810,4 +811,47 @@ async fn two_transactions_writing_two_drinks_in_opposite_orders_do_not_deadlock(
     }
     assert_eq!(component_count(&pool, low).await, 1);
     assert_eq!(component_count(&pool, high).await, 1);
+}
+
+#[tokio::test]
+async fn the_seed_stores_cl_quantities_in_centilitres() {
+    // `db::seed` refuses a database that holds profiles, so it runs on a
+    // database of its own, created on the same server and dropped afterwards.
+    let Some(url) = database_url("the_seed_stores_cl_quantities_in_centilitres") else {
+        return;
+    };
+    let (server, _) = url
+        .rsplit_once('/')
+        .expect("DATABASE_URL must name a database");
+    let name = format!("seed_{}", Uuid::now_v7().simple());
+    let mut admin = connection(&url).await;
+    run(&mut admin, &format!("CREATE DATABASE {name}"))
+        .await
+        .expect("the seed database must be created");
+
+    let pool = migrated_pool(&format!("{server}/{name}")).await;
+    let seeded = db::seed(&pool).await;
+    let rows: Result<Vec<(String, String, f64)>, sqlx::Error> = sqlx::query_as(
+        "SELECT c.name, d.quantity_unit::text, c.quantity
+           FROM drink_component c JOIN drink d ON d.id = c.drink_id
+          ORDER BY c.name",
+    )
+    .fetch_all(&pool)
+    .await;
+    pool.close().await;
+    run(&mut admin, &format!("DROP DATABASE {name} WITH (FORCE)"))
+        .await
+        .expect("the seed database must be dropped");
+
+    seeded.expect("the seed must apply to an empty database");
+    // A drink in cl stores centilitres, as the API exchanges them (#14): the
+    // beer is 25 cL, i.e. 250 mL, and the vodka 4 cL, i.e. 40 mL.
+    let expected = [
+        ("Bière blonde", "cl", 25.0),
+        ("Gin", "percent", 25.0),
+        ("Jus d'orange", "percent", 75.0),
+        ("Vodka", "cl", 4.0),
+    ]
+    .map(|(name, unit, quantity)| (name.to_owned(), unit.to_owned(), quantity));
+    assert_eq!(rows.expect("the seeded components must read"), expected);
 }

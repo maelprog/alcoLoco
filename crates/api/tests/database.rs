@@ -2362,3 +2362,565 @@ async fn the_library_categories_of_the_api_are_those_of_the_schema() {
         .collect();
     assert_eq!(used, declared);
 }
+
+// ---------------------------------------------------------------------------
+// Drinks (#14)
+// ---------------------------------------------------------------------------
+
+/// A 25 cL beer at 5 %, as a creation payload; the unit is the only member a
+/// creation cannot do without beside the name and the components.
+fn a_beer(name: &str, ingested_at: &str) -> Value {
+    serde_json::json!({
+        "name": name,
+        "ingested_at": ingested_at,
+        "quantity_unit": "cl",
+        "components": [{ "name": name, "abv_percent": 5.0, "quantity": 25.0 }],
+    })
+}
+
+/// Records a drink through the API and answers its identifier and body.
+async fn record_drink(state: &AppState, profile: Uuid, payload: &Value) -> (Uuid, Value) {
+    let answer = send(
+        state.clone(),
+        "POST",
+        &format!("/profiles/{profile}/drinks"),
+        Some(payload.clone()),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::CREATED, "{}", answer.body);
+    let id: Uuid = answer.body["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no identifier in {}", answer.body))
+        .parse()
+        .expect("the identifier must be a UUID");
+    assert_eq!(answer.location.as_deref(), Some(&*format!("/drinks/{id}")));
+    (id, answer.body)
+}
+
+/// Creates an event the profile takes part in, straight in the database: the
+/// event endpoints are #18's.
+async fn event_with(pool: &sqlx::PgPool, profile: Uuid) -> Uuid {
+    let event = api::new_id();
+    sqlx::query("INSERT INTO public.event (id, name, starts_at) VALUES ($1, 'Soirée', now())")
+        .bind(event)
+        .execute(pool)
+        .await
+        .expect("the event must be written");
+    sqlx::query("INSERT INTO public.event_participant (event_id, profile_id) VALUES ($1, $2)")
+        .bind(event)
+        .bind(profile)
+        .execute(pool)
+        .await
+        .expect("the participant must be written");
+    event
+}
+
+/// The drinks of a profile's history, as stored, oldest identifier first.
+async fn history_of(pool: &sqlx::PgPool, profile: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar("SELECT id FROM public.drink WHERE profile_id = $1 ORDER BY id")
+        .bind(profile)
+        .fetch_all(pool)
+        .await
+        .expect("the history must be readable")
+}
+
+async fn component_count(pool: &sqlx::PgPool, drink: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM public.drink_component WHERE drink_id = $1")
+        .bind(drink)
+        .fetch_one(pool)
+        .await
+        .expect("the count must run")
+}
+
+/// Sum, over the whole stored history of a profile, of the alcohol level each
+/// drink brings once absorbed, before elimination — read back through the API
+/// and computed with the settings in force at each ingestion time.
+///
+/// The engine of #16 does not exist yet; this is the part of its input a
+/// write of #14 decides, and the part that has to lose a deleted drink.
+async fn alcohol_of_history(state: &AppState, profile: Uuid) -> f64 {
+    let mut total = 0.0;
+    for id in history_of(&state.pool, profile).await {
+        let (status, body) = body_of(state.clone(), &format!("/drinks/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let drink: api::drink::Drink = serde_json::from_value(body).expect("a drink");
+        let valid = domain::drink::DrinkDraft {
+            name: drink.name.clone(),
+            unit: drink.quantity_unit.into(),
+            volume_total_ml: drink.volume_total_ml,
+            ingestion_duration_seconds: drink.ingestion_duration_seconds.into(),
+            absorption_duration_seconds: drink.absorption_duration_seconds.into(),
+            components: drink
+                .components
+                .iter()
+                .map(|c| domain::drink::ComponentDraft {
+                    name: c.name.clone(),
+                    abv_percent: c.abv_percent,
+                    // cL on the wire, millilitres in the domain.
+                    quantity: match drink.quantity_unit {
+                        api::profile::QuantityUnit::Cl => c.quantity * 10.0,
+                        api::profile::QuantityUnit::Percent => c.quantity,
+                    },
+                })
+                .collect(),
+        }
+        .validate()
+        .expect("a stored drink is valid");
+        let settings = api::profile::store::settings_at(&state.pool, profile, drink.ingested_at)
+            .await
+            .expect("the lookup must run")
+            .expect("a profile always has an applicable version");
+        let age_days = (drink.ingested_at.date_naive() - settings.birth_date).num_days();
+        let age_years = f64::from(i32::try_from(age_days).expect("fits")) / 365.2425;
+        let sex = match settings.sex {
+            api::profile::Sex::Male => domain::Sex::Male,
+            api::profile::Sex::Female => domain::Sex::Female,
+        };
+        let water = domain::watson_total_body_water_litres(
+            sex,
+            settings.weight_kg,
+            settings.height_cm,
+            age_years,
+        );
+        total += domain::initial_bac_g_per_l(valid.pure_alcohol_grams(), water);
+    }
+    total
+}
+
+#[tokio::test]
+async fn a_drink_entered_from_an_event_is_in_the_history_of_the_profile() {
+    // First acceptance criterion of #14.
+    let name = "a_drink_entered_from_an_event_is_in_the_history_of_the_profile";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Soirée")).await;
+    let event = event_with(&state.pool, profile).await;
+
+    let mut payload = a_beer("Bière blonde", "2026-10-17T21:00:00Z");
+    payload["event_id"] = Value::from(event.to_string());
+    let (from_event, body) = record_drink(&state, profile, &payload).await;
+    assert_eq!(body["event_id"], event.to_string());
+    assert_eq!(body["profile_id"], profile.to_string());
+
+    let (from_profile, body) =
+        record_drink(&state, profile, &a_beer("Bière", "2026-10-17T22:00:00Z")).await;
+    assert!(body["event_id"].is_null(), "{body}");
+
+    assert_eq!(
+        history_of(&state.pool, profile).await,
+        vec![from_event, from_profile]
+    );
+}
+
+#[tokio::test]
+async fn a_drink_may_not_name_an_event_its_profile_is_not_part_of() {
+    let name = "a_drink_may_not_name_an_event_its_profile_is_not_part_of";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Absent")).await;
+    let (other, _) = create_profile(&state, &a_sound_payload("Présent")).await;
+    let event = event_with(&state.pool, other).await;
+
+    for event_id in [event, api::new_id()] {
+        let mut payload = a_beer("Bière", "2026-10-17T21:00:00Z");
+        payload["event_id"] = Value::from(event_id.to_string());
+        let answer = send(
+            state.clone(),
+            "POST",
+            &format!("/profiles/{profile}/drinks"),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+        assert_eq!(answer.body["errors"][0]["field"], "event_id");
+    }
+    assert!(history_of(&state.pool, profile).await.is_empty());
+
+    // Nor be moved to one by a modification.
+    let (drink, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T21:00:00Z")).await;
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(serde_json::json!({ "event_id": event.to_string() })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "event_id");
+}
+
+#[tokio::test]
+async fn a_drink_takes_its_missing_time_and_durations_from_now_and_the_profile() {
+    let name = "a_drink_takes_its_missing_time_and_durations_from_now_and_the_profile";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let mut profile_payload = a_sound_payload("Défauts");
+    profile_payload["default_ingestion_duration_seconds"] = Value::from(420);
+    profile_payload["default_absorption_duration_seconds"] = Value::from(3000);
+    let (profile, _) = create_profile(&state, &profile_payload).await;
+
+    let mut payload = a_beer("Bière", "unused");
+    payload
+        .as_object_mut()
+        .expect("an object")
+        .remove("ingested_at");
+    let before = api::timestamp::now();
+    let (_, body) = record_drink(&state, profile, &payload).await;
+    let after = api::timestamp::now();
+
+    let ingested_at: api::Timestamp = body["ingested_at"]
+        .as_str()
+        .expect("an instant")
+        .parse()
+        .expect("ISO 8601");
+    // `timestamptz` keeps microseconds: the stored instant may sit up to one
+    // microsecond below the one taken by the handler.
+    assert!(
+        ingested_at >= before - chrono::Duration::microseconds(1) && ingested_at <= after,
+        "{ingested_at} is not the instant of the request ({before} .. {after})"
+    );
+    assert_eq!(body["ingestion_duration_seconds"], 420);
+    assert_eq!(body["absorption_duration_seconds"], 3000);
+    assert!(body["feeling_rating"].is_null(), "{body}");
+}
+
+#[tokio::test]
+async fn a_deleted_drink_no_longer_counts_in_the_alcohol_of_the_profile() {
+    // Second acceptance criterion of #14, on the input a recomputation reads.
+    let name = "a_deleted_drink_no_longer_counts_in_the_alcohol_of_the_profile";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Deux bières")).await;
+
+    let (kept, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T21:00:00Z")).await;
+    let alone = alcohol_of_history(&state, profile).await;
+    assert!(alone > 0.0, "{alone}");
+
+    let mut stronger = a_beer("Triple", "2026-10-17T21:30:00Z");
+    stronger["components"][0]["abv_percent"] = Value::from(9.0);
+    let (deleted, _) = record_drink(&state, profile, &stronger).await;
+    let both = alcohol_of_history(&state, profile).await;
+    assert!(both > alone + 1e-6, "{both} vs {alone}");
+
+    let answer = send(state.clone(), "DELETE", &format!("/drinks/{deleted}"), None).await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+
+    assert_eq!(history_of(&state.pool, profile).await, vec![kept]);
+    assert_eq!(component_count(&state.pool, deleted).await, 0);
+    assert_eq!(
+        alcohol_of_history(&state, profile).await.to_bits(),
+        alone.to_bits()
+    );
+
+    let again = send(state.clone(), "DELETE", &format!("/drinks/{deleted}"), None).await;
+    assert_eq!(again.status, StatusCode::NOT_FOUND, "{}", again.body);
+    let (status, _) = body_of(state, &format!("/drinks/{deleted}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_modification_rewrites_what_it_names_and_keeps_the_rest() {
+    let name = "a_modification_rewrites_what_it_names_and_keeps_the_rest";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Mixologie")).await;
+    let event = event_with(&state.pool, profile).await;
+    let mut payload = serde_json::json!({
+        "name": "Vodka – Jus d'orange",
+        "ingested_at": "2026-10-17T21:00:00Z",
+        "quantity_unit": "cl",
+        "feeling_rating": 3,
+        "event_id": event.to_string(),
+        "components": [
+            { "name": "Vodka", "abv_percent": 40.0, "quantity": 4.0 },
+            { "name": "Jus d'orange", "abv_percent": 0.0, "quantity": 16.0 },
+        ],
+    });
+    let (drink, created) = record_drink(&state, profile, &payload).await;
+
+    // Name and time only: the composition, the rating and the event stay.
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(serde_json::json!({
+            "name": "Screwdriver",
+            "ingested_at": "2026-10-17T21:30:00Z",
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["name"], "Screwdriver");
+    assert_eq!(answer.body["ingested_at"], "2026-10-17T21:30:00Z");
+    for kept in ["components", "feeling_rating", "event_id", "created_at"] {
+        assert_eq!(answer.body[kept], created[kept], "{kept}");
+    }
+
+    // A new composition in percent replaces the whole old one; null clears.
+    payload = serde_json::json!({
+        "quantity_unit": "percent",
+        "volume_total_ml": 200.0,
+        "feeling_rating": null,
+        "event_id": null,
+        "components": [
+            { "name": "Gin", "abv_percent": 40.0, "quantity": 25.0 },
+            { "name": "Tonic", "abv_percent": 0.0, "quantity": 70.0 },
+            { "name": "Citron", "abv_percent": 0.0, "quantity": 5.0 },
+        ],
+    });
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(payload),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["quantity_unit"], "percent");
+    assert_eq!(answer.body["volume_total_ml"], 200.0);
+    assert!(answer.body["feeling_rating"].is_null(), "{}", answer.body);
+    assert!(answer.body["event_id"].is_null(), "{}", answer.body);
+    let names: Vec<&str> = answer.body["components"]
+        .as_array()
+        .expect("components")
+        .iter()
+        .map(|c| c["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(names, ["Gin", "Tonic", "Citron"]);
+    assert_eq!(component_count(&state.pool, drink).await, 3);
+    assert_eq!(answer.body["name"], "Screwdriver");
+
+    let (status, read) = body_of(state, &format!("/drinks/{drink}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read, answer.body);
+}
+
+#[tokio::test]
+async fn an_invalid_write_is_a_400_and_leaves_the_stored_drink_alone() {
+    let name = "an_invalid_write_is_a_400_and_leaves_the_stored_drink_alone";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Refus")).await;
+    let (drink, created) =
+        record_drink(&state, profile, &a_beer("Bière", "2026-10-17T21:00:00Z")).await;
+
+    // Shares above 100 %: refused by the API before the database check.
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(serde_json::json!({
+            "quantity_unit": "percent",
+            "volume_total_ml": 200.0,
+            "components": [
+                { "name": "Gin", "abv_percent": 40.0, "quantity": 60.0 },
+                { "name": "Tonic", "abv_percent": 0.0, "quantity": 50.0 },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "components");
+
+    let (_, read) = body_of(state.clone(), &format!("/drinks/{drink}")).await;
+    assert_eq!(read, created);
+
+    // `null` on a member that cannot be cleared.
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(serde_json::json!({ "name": null, "components": null })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    let mut fields: Vec<&str> = answer.body["errors"]
+        .as_array()
+        .expect("errors")
+        .iter()
+        .map(|e| e["field"].as_str().expect("a field"))
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(fields, ["components", "name"]);
+    let (_, read) = body_of(state.clone(), &format!("/drinks/{drink}")).await;
+    assert_eq!(read, created);
+
+    // A creation in percent without its total volume.
+    let answer = send(
+        state.clone(),
+        "POST",
+        &format!("/profiles/{profile}/drinks"),
+        Some(serde_json::json!({
+            "name": "Gin tonic",
+            "quantity_unit": "percent",
+            "components": [{ "name": "Gin", "abv_percent": 40.0, "quantity": 25.0 }],
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "volume_total_ml");
+    assert_eq!(history_of(&state.pool, profile).await, vec![drink]);
+}
+
+#[tokio::test]
+async fn an_ingestion_time_is_held_to_what_the_database_stores() {
+    // Ties `earliest_ingested_at` to the live server in both directions. The
+    // two instants are written out, not derived from the constant: the
+    // earliest instant a `timestamptz` holds must be accepted, stored and
+    // read back unchanged — a stricter bound refuses it here — and the
+    // microsecond before it must be a field error — a looser bound lets it
+    // reach PostgreSQL, which answers it with a 500.
+    let name = "an_ingestion_time_is_held_to_what_the_database_stores";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Préhistoire")).await;
+    let earliest = "-4713-11-24T00:00:00Z";
+    let just_before = "-4713-11-23T23:59:59.999999Z";
+
+    let mut payload = a_beer("Bière", "unused");
+    payload["ingested_at"] = Value::from(earliest);
+    let (drink, body) = record_drink(&state, profile, &payload).await;
+    assert_eq!(body["ingested_at"], earliest);
+    let (_, read) = body_of(state.clone(), &format!("/drinks/{drink}")).await;
+    assert_eq!(read["ingested_at"], earliest);
+
+    payload["ingested_at"] = Value::from(just_before);
+    let answer = send(
+        state.clone(),
+        "POST",
+        &format!("/profiles/{profile}/drinks"),
+        Some(payload),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "ingested_at");
+
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(serde_json::json!({ "ingested_at": "-5000-01-01T00:00:00Z" })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "ingested_at");
+    assert_eq!(history_of(&state.pool, profile).await, vec![drink]);
+}
+
+/// The quantities of a drink body, as bit patterns.
+fn quantity_bits(body: &Value) -> Vec<u64> {
+    body["components"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no components in {body}"))
+        .iter()
+        .map(|c| c["quantity"].as_f64().expect("a number").to_bits())
+        .collect()
+}
+
+#[tokio::test]
+async fn cl_quantities_travel_in_cl_and_read_back_to_the_bit() {
+    // User decision on #14: a quantity in `cl` is centilitres on the wire,
+    // both ways. 839.48 and 117.217 are values `x * 10 / 10` does not give
+    // back: a storage in millilitres would serve them back changed.
+    let name = "cl_quantities_travel_in_cl_and_read_back_to_the_bit";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Centilitres")).await;
+    let entered = [839.48_f64, 0.1, 117.217];
+    let entered_bits: Vec<u64> = entered.iter().map(|q| q.to_bits()).collect();
+    let components: Vec<Value> = entered
+        .iter()
+        .map(|q| serde_json::json!({ "name": "Bière", "abv_percent": 5.0, "quantity": q }))
+        .collect();
+    let payload = serde_json::json!({
+        "name": "Bières",
+        "ingested_at": "2026-10-17T21:00:00Z",
+        "quantity_unit": "cl",
+        "components": components,
+    });
+    let (drink, body) = record_drink(&state, profile, &payload).await;
+    assert_eq!(quantity_bits(&body), entered_bits, "{body}");
+    let (_, read) = body_of(state.clone(), &format!("/drinks/{drink}")).await;
+    assert_eq!(quantity_bits(&read), entered_bits, "{read}");
+
+    // A beer entered as 25 cL reads back as 25, in centilitres.
+    let (beer, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T22:00:00Z")).await;
+    let (_, read) = body_of(state.clone(), &format!("/drinks/{beer}")).await;
+    assert_eq!(read["components"][0]["quantity"], 25.0);
+
+    // cL to percent, then back to cL: `volume_total_ml: null` is what clears
+    // the total a drink in cL may not carry.
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(serde_json::json!({
+            "quantity_unit": "percent",
+            "volume_total_ml": 300.0,
+            "components": [{ "name": "Bière", "abv_percent": 5.0, "quantity": 33.3 }],
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(quantity_bits(&answer.body), [33.3_f64.to_bits()]);
+
+    let back = [12.34_f64, 839.48];
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(serde_json::json!({
+            "quantity_unit": "cl",
+            "volume_total_ml": null,
+            "components": back
+                .iter()
+                .map(|q| serde_json::json!({ "name": "Bière", "abv_percent": 5.0, "quantity": q }))
+                .collect::<Vec<_>>(),
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["quantity_unit"], "cl");
+    assert!(answer.body["volume_total_ml"].is_null(), "{}", answer.body);
+    let back_bits: Vec<u64> = back.iter().map(|q| q.to_bits()).collect();
+    assert_eq!(quantity_bits(&answer.body), back_bits);
+    let (_, read) = body_of(state, &format!("/drinks/{drink}")).await;
+    assert_eq!(quantity_bits(&read), back_bits, "{read}");
+}
+
+#[tokio::test]
+async fn writing_to_an_unknown_profile_or_drink_is_a_404() {
+    let Some(state) = migrated("writing_to_an_unknown_profile_or_drink_is_a_404").await else {
+        return;
+    };
+    let unknown = api::new_id();
+    let answer = send(
+        state.clone(),
+        "POST",
+        &format!("/profiles/{unknown}/drinks"),
+        Some(a_beer("Bière", "2026-10-17T21:00:00Z")),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
+    assert_eq!(answer.media_type, api::error::PROBLEM_JSON);
+
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{unknown}"),
+        Some(serde_json::json!({ "name": "Bière" })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
+
+    let answer = send(state, "DELETE", &format!("/drinks/{unknown}"), None).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
+}

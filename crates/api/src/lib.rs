@@ -4,7 +4,7 @@
 //! single one: configuration, connection pool, the error type and its RFC 7807
 //! rendering, the identifier and timestamp conventions, cursor pagination, and
 //! the generated OpenAPI document. Business routes live in a module of their own
-//! and are mounted on [`app`]: [`profile`] and [`library`].
+//! and are mounted on [`app`]: [`profile`], [`drink`] and [`library`].
 //!
 //! Conventions posed here, to be reused rather than restated:
 //!
@@ -19,10 +19,11 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::http::{Method, Uri};
-use axum::routing::get;
+use axum::routing::{get, post};
 use sqlx::PgPool;
 
 pub mod config;
+pub mod drink;
 pub mod error;
 pub mod extract;
 pub mod health;
@@ -90,6 +91,11 @@ pub fn app(state: AppState) -> Router {
             get(profile::list).post(profile::create),
         )
         .route(profile::ITEM_PATH, get(profile::read).put(profile::update))
+        .route(drink::PROFILE_COLLECTION_PATH, post(drink::create))
+        .route(
+            drink::ITEM_PATH,
+            get(drink::read).patch(drink::update).delete(drink::delete),
+        )
         .route(library::COLLECTION_PATH, get(library::list));
 
     if state.config.environment.exposes_openapi() {
