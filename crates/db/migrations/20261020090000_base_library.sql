@@ -17,15 +17,20 @@
 -- it is marked trusted since PostgreSQL 13, so a role holding CREATE on the
 -- database may install it without being superuser.
 --
--- `unaccent` itself is only STABLE, because its one-argument form looks its
--- dictionary up through `search_path`. The two-argument form names the
--- dictionary, and the SQL-standard body below binds every name when the
--- function is created, so that no later `search_path` — `pg_temp` included —
--- can change what the key resolves to. That is what makes declaring it
--- IMMUTABLE, and therefore indexing it, honest. What remains outside that
--- promise is the content of the dictionary file and the collation `lower`
--- runs under: changing either on a live server calls for a REINDEX of the
--- index below, like any expression index over text.
+-- Both forms of `unaccent` are declared STABLE (`provolatile = 's'` in
+-- `pg_proc`), the two-argument one included: what they return depends on a
+-- text search dictionary, whose rules file and options can change while the
+-- server runs, and not on their arguments alone. The one-argument form
+-- additionally finds that dictionary through `search_path`.
+--
+-- Declaring the key below IMMUTABLE, which an index requires, is therefore a
+-- promise this migration makes, not one `unaccent` makes. Its share of the
+-- promise: the key names its dictionary, and the SQL-standard body binds every
+-- name when the function is created, so no later `search_path` — `pg_temp`
+-- included — changes what it resolves to. What it cannot promise is that the
+-- dictionary's rules and the collation `lower` runs under stay as they are:
+-- changing either on a live server calls for a REINDEX of the index below,
+-- like any expression index over text.
 
 CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA public;
 
