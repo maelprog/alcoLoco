@@ -287,7 +287,7 @@ pub async fn seed(pool: &PgPool) -> Result<(), sqlx::Error> {
         },
     )
     .await?;
-    insert_component(&mut tx, cocktail, 0, "Gin", 37.5, 25.0).await?;
+    insert_component(&mut tx, cocktail, 0, "Gin", 40.0, 25.0).await?;
     insert_component(&mut tx, cocktail, 1, "Jus d'orange", 0.0, 75.0).await?;
 
     // A drink outside of any event: the history of a profile is not limited to
