@@ -233,7 +233,8 @@ async fn a_drink_with_components_commits_in_both_units() {
     let pool = migrated_pool(&url).await;
     let profile = profile(&pool).await;
 
-    // cL quantities are millilitres: 300 mL in total is no percentage.
+    // cL quantities are volumes (centilitres since migration 20261022090000):
+    // 300 in total is no percentage.
     let (cl, _) = drink_with(&url, profile, "cl", None, &[200.0, 100.0]).await;
     assert_eq!(component_count(&pool, cl).await, 2);
 

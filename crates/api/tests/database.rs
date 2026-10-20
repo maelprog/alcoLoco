@@ -2374,7 +2374,7 @@ fn a_beer(name: &str, ingested_at: &str) -> Value {
         "name": name,
         "ingested_at": ingested_at,
         "quantity_unit": "cl",
-        "components": [{ "name": name, "abv_percent": 5.0, "quantity": 250.0 }],
+        "components": [{ "name": name, "abv_percent": 5.0, "quantity": 25.0 }],
     })
 }
 
@@ -2456,7 +2456,11 @@ async fn alcohol_of_history(state: &AppState, profile: Uuid) -> f64 {
                 .map(|c| domain::drink::ComponentDraft {
                     name: c.name.clone(),
                     abv_percent: c.abv_percent,
-                    quantity: c.quantity,
+                    // cL on the wire, millilitres in the domain.
+                    quantity: match drink.quantity_unit {
+                        api::profile::QuantityUnit::Cl => c.quantity * 10.0,
+                        api::profile::QuantityUnit::Percent => c.quantity,
+                    },
                 })
                 .collect(),
         }
@@ -2633,8 +2637,8 @@ async fn a_modification_rewrites_what_it_names_and_keeps_the_rest() {
         "feeling_rating": 3,
         "event_id": event.to_string(),
         "components": [
-            { "name": "Vodka", "abv_percent": 40.0, "quantity": 40.0 },
-            { "name": "Jus d'orange", "abv_percent": 0.0, "quantity": 160.0 },
+            { "name": "Vodka", "abv_percent": 40.0, "quantity": 4.0 },
+            { "name": "Jus d'orange", "abv_percent": 0.0, "quantity": 16.0 },
         ],
     });
     let (drink, created) = record_drink(&state, profile, &payload).await;
@@ -2804,6 +2808,88 @@ async fn an_ingestion_time_is_held_to_what_the_database_stores() {
     assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
     assert_eq!(answer.body["errors"][0]["field"], "ingested_at");
     assert_eq!(history_of(&state.pool, profile).await, vec![drink]);
+}
+
+/// The quantities of a drink body, as bit patterns.
+fn quantity_bits(body: &Value) -> Vec<u64> {
+    body["components"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no components in {body}"))
+        .iter()
+        .map(|c| c["quantity"].as_f64().expect("a number").to_bits())
+        .collect()
+}
+
+#[tokio::test]
+async fn cl_quantities_travel_in_cl_and_read_back_to_the_bit() {
+    // User decision on #14: a quantity in `cl` is centilitres on the wire,
+    // both ways. 839.48 and 117.217 are values `x * 10 / 10` does not give
+    // back: a storage in millilitres would serve them back changed.
+    let name = "cl_quantities_travel_in_cl_and_read_back_to_the_bit";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Centilitres")).await;
+    let entered = [839.48_f64, 0.1, 117.217];
+    let entered_bits: Vec<u64> = entered.iter().map(|q| q.to_bits()).collect();
+    let components: Vec<Value> = entered
+        .iter()
+        .map(|q| serde_json::json!({ "name": "Bière", "abv_percent": 5.0, "quantity": q }))
+        .collect();
+    let payload = serde_json::json!({
+        "name": "Bières",
+        "ingested_at": "2026-10-17T21:00:00Z",
+        "quantity_unit": "cl",
+        "components": components,
+    });
+    let (drink, body) = record_drink(&state, profile, &payload).await;
+    assert_eq!(quantity_bits(&body), entered_bits, "{body}");
+    let (_, read) = body_of(state.clone(), &format!("/drinks/{drink}")).await;
+    assert_eq!(quantity_bits(&read), entered_bits, "{read}");
+
+    // The alcohol is that of 25 cL, i.e. 250 mL, of beer at 5 %.
+    let (beer, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T22:00:00Z")).await;
+    let (_, read) = body_of(state.clone(), &format!("/drinks/{beer}")).await;
+    assert_eq!(read["components"][0]["quantity"], 25.0);
+
+    // cL to percent, then back to cL: `volume_total_ml: null` is what clears
+    // the total a drink in cL may not carry.
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(serde_json::json!({
+            "quantity_unit": "percent",
+            "volume_total_ml": 300.0,
+            "components": [{ "name": "Bière", "abv_percent": 5.0, "quantity": 33.3 }],
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(quantity_bits(&answer.body), [33.3_f64.to_bits()]);
+
+    let back = [12.34_f64, 839.48];
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(serde_json::json!({
+            "quantity_unit": "cl",
+            "volume_total_ml": null,
+            "components": back
+                .iter()
+                .map(|q| serde_json::json!({ "name": "Bière", "abv_percent": 5.0, "quantity": q }))
+                .collect::<Vec<_>>(),
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["quantity_unit"], "cl");
+    assert!(answer.body["volume_total_ml"].is_null(), "{}", answer.body);
+    let back_bits: Vec<u64> = back.iter().map(|q| q.to_bits()).collect();
+    assert_eq!(quantity_bits(&answer.body), back_bits);
+    let (_, read) = body_of(state, &format!("/drinks/{drink}")).await;
+    assert_eq!(quantity_bits(&read), back_bits, "{read}");
 }
 
 #[tokio::test]

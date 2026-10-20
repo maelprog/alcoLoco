@@ -1,11 +1,14 @@
 //! Payload types of the drink endpoints.
 //!
 //! A drink travels with its components, in the order they were added, and
-//! with the members of the `drink` table spelled as its columns. Quantities
-//! follow `drink_component.quantity`: **millilitres** when the drink is in
-//! `cl` — the cL the user types are converted by the client, the same way
-//! `volume_total_ml` is a volume in millilitres — and a **percentage of
-//! `volume_total_ml`** when it is in `percent` (SPEC.md §5.3, §10.0-A).
+//! with the members of the `drink` table spelled as its columns. A component
+//! quantity is in **centilitres** when the drink is in `cl` — the unit the
+//! user types — and a **percentage of `volume_total_ml`** when it is in
+//! `percent` (SPEC.md §5.3, §10.0-A). It is stored exactly as it travels
+//! (migration `20261022090000`), so what a client writes is what it reads
+//! back, to the bit; the conversion to millilitres, the unit of the domain,
+//! happens only where the rules of a drink are applied
+//! ([`super::validation`]). `volume_total_ml` stays in millilitres.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
@@ -21,7 +24,7 @@ pub struct Component {
     pub name: String,
     /// Alcohol by volume, in percent, between 0 and 100.
     pub abv_percent: f64,
-    /// Millilitres when the drink is in `cl`, percent of `volume_total_ml`
+    /// Centilitres when the drink is in `cl`, percent of `volume_total_ml`
     /// when it is in `percent`.
     pub quantity: f64,
 }
@@ -70,7 +73,7 @@ pub struct ComponentRequest {
     pub name: Option<String>,
     /// Alcohol by volume, in percent.
     pub abv_percent: Option<f64>,
-    /// Millilitres in `cl`, percent of `volume_total_ml` in `percent`.
+    /// Centilitres in `cl`, percent of `volume_total_ml` in `percent`.
     pub quantity: Option<f64>,
 }
 

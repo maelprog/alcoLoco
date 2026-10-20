@@ -55,9 +55,20 @@ pub struct ValidDrink {
     pub ingested_at: Timestamp,
     /// Feeling rating, within the scale.
     pub feeling_rating: Option<i16>,
-    /// The drink itself, validated by the domain.
+    /// The drink itself, validated by the domain, its quantities in the
+    /// domain's units: millilitres in cL, percent in percent.
     pub drink: domain::drink::Drink,
+    /// The component quantities as the request expressed them — centilitres
+    /// in cL, percent in percent — in the order of the components. They are
+    /// what is stored and served back, so that a quantity round-trips to the
+    /// bit: `x * 10 / 10` does not give `x` back for every `f64` (839.48 does
+    /// not), so the millilitres of [`ValidDrink::drink`] cannot stand in.
+    pub quantities: Vec<f64>,
 }
+
+/// Millilitres in a centilitre: a cL quantity reaches the domain, which
+/// counts volumes in millilitres, multiplied by this.
+pub const ML_PER_CL: f64 = 10.0;
 
 impl From<QuantityUnit> for domain::drink::QuantityUnit {
     fn from(unit: QuantityUnit) -> Self {
@@ -186,6 +197,7 @@ impl DrinkRequest {
         // The rules of the domain are only meaningful on a complete drink: the
         // unit decides how every quantity reads, and a component missing a
         // member has nothing to check yet.
+        let quantities: Vec<f64> = components.iter().map(|c| c.quantity).collect();
         let drink = match unit {
             Some(unit) if complete => DrinkDraft {
                 name: name.unwrap_or_default(),
@@ -197,7 +209,16 @@ impl DrinkRequest {
                 absorption_duration_seconds: self
                     .absorption_duration_seconds
                     .unwrap_or_else(|| i64::from(defaults.absorption_duration_seconds)),
-                components,
+                components: components
+                    .into_iter()
+                    .map(|component| ComponentDraft {
+                        quantity: match unit {
+                            QuantityUnit::Cl => component.quantity * ML_PER_CL,
+                            QuantityUnit::Percent => component.quantity,
+                        },
+                        ..component
+                    })
+                    .collect(),
             }
             .validate()
             .map_err(|refused| {
@@ -219,6 +240,7 @@ impl DrinkRequest {
                 ingested_at,
                 feeling_rating,
                 drink,
+                quantities,
             }),
             _ => Err(ApiError::validation(errors)),
         }
@@ -254,8 +276,8 @@ impl DrinkPatch {
 
         let unit_changes = quantity_unit.is_some_and(|unit| unit != stored.quantity_unit);
         if unit_changes && !components_sent && !refused.iter().any(|e| e.field == "components") {
-            // The stored quantities read differently in the other unit: 40 mL
-            // of vodka would become 40 % of the drink, silently.
+            // The stored quantities read differently in the other unit: 4 cL
+            // of vodka would become 4 % of the drink, silently.
             refused.push(FieldError::new(
                 "components",
                 "must be sent again when quantity_unit changes",
@@ -334,7 +356,7 @@ mod tests {
         DrinkRequest {
             name: Some("Bière blonde".to_owned()),
             quantity_unit: Some(QuantityUnit::Cl),
-            components: Some(vec![component("Bière blonde", 5.0, 250.0)]),
+            components: Some(vec![component("Bière blonde", 5.0, 25.0)]),
             ..DrinkRequest::default()
         }
     }
@@ -694,6 +716,87 @@ mod tests {
     }
 
     #[test]
+    fn moving_a_drink_from_percent_to_cl_takes_a_null_total_volume() {
+        let mut in_percent = stored();
+        in_percent.quantity_unit = QuantityUnit::Percent;
+        in_percent.volume_total_ml = Some(200.0);
+        in_percent.components[0].quantity = 20.0;
+        in_percent.components[1].quantity = 80.0;
+        let to_cl = |volume_total_ml| DrinkPatch {
+            quantity_unit: Some(Some(QuantityUnit::Cl)),
+            volume_total_ml,
+            components: Some(Some(vec![component("Vodka", 40.0, 4.0)])),
+            ..DrinkPatch::default()
+        };
+
+        let valid = to_cl(Some(None))
+            .merge_onto(in_percent.clone())
+            .expect("null clears the total a drink in cL may not carry");
+        assert_eq!(valid.drink.unit(), domain::drink::QuantityUnit::Cl);
+        assert_eq!(valid.drink.entered_volume_total_ml(), None);
+        assert_eq!(valid.quantities, [4.0]);
+        assert_eq!(valid.drink.component_volumes_ml(), [40.0]);
+
+        // Absent, the stored total stays, and a drink in cL refuses it.
+        assert_eq!(
+            fields_of(to_cl(None).merge_onto(in_percent)),
+            ["volume_total_ml"]
+        );
+    }
+
+    #[test]
+    fn a_cl_quantity_reaches_the_domain_in_millilitres() {
+        // The user decision on #14: cL on the wire. The domain counts in
+        // millilitres, so 25 cL of beer at 5 % is 250 mL of it.
+        let valid = a_beer().validate(DEFAULTS, now()).expect("valid");
+        assert_eq!(valid.drink.component_volumes_ml(), [250.0]);
+        assert_eq!(
+            valid.drink.pure_alcohol_grams().to_bits(),
+            domain::ingested_alcohol_grams(250.0, 5.0).to_bits()
+        );
+        assert_eq!(valid.quantities, [25.0]);
+
+        // A share is a share: nothing is converted in percent.
+        let valid = DrinkRequest {
+            quantity_unit: Some(QuantityUnit::Percent),
+            volume_total_ml: Some(200.0),
+            components: Some(vec![
+                component("Gin", 40.0, 25.0),
+                component("Tonic", 0.0, 75.0),
+            ]),
+            ..a_beer()
+        }
+        .validate(DEFAULTS, now())
+        .expect("valid");
+        assert_eq!(valid.drink.component_volumes_ml(), [50.0, 150.0]);
+        assert_eq!(valid.quantities, [25.0, 75.0]);
+    }
+
+    #[test]
+    fn the_quantities_stored_are_the_ones_entered_to_the_bit() {
+        // 839.48 * 10 / 10 is not 839.48 in f64: storing the millilitres
+        // would serve back a different number than the one written.
+        assert_ne!(
+            (839.48_f64 * ML_PER_CL / ML_PER_CL).to_bits(),
+            839.48_f64.to_bits()
+        );
+        let entered = [839.48, 0.1, 117.217];
+        let valid = DrinkRequest {
+            components: Some(
+                entered
+                    .iter()
+                    .map(|quantity| component("Bière", 5.0, *quantity))
+                    .collect(),
+            ),
+            ..a_beer()
+        }
+        .validate(DEFAULTS, now())
+        .expect("valid");
+        let bits = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&valid.quantities), bits(&entered));
+    }
+
+    #[test]
     fn new_components_replace_the_whole_composition() {
         let valid = DrinkPatch {
             components: Some(Some(vec![component("Vodka", 40.0, 50.0)])),
@@ -702,7 +805,7 @@ mod tests {
         .merge_onto(stored())
         .expect("valid");
         assert_eq!(component_names(&valid), ["Vodka"]);
-        assert_eq!(valid.drink.components()[0].quantity, 50.0);
+        assert_eq!(valid.quantities, [50.0]);
     }
 
     #[test]
@@ -720,7 +823,7 @@ mod tests {
 
     #[test]
     fn changing_the_unit_requires_the_components_again() {
-        // A stored 40 mL of vodka would silently become 40 % of the drink.
+        // A stored 40 cL of vodka would silently become 40 % of the drink.
         // The quantities are chosen to be valid shares too (40 + 50 ≤ 100),
         // so that only this rule can refuse them.
         let mut small = stored();

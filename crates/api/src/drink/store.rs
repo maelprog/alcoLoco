@@ -177,7 +177,15 @@ async fn insert_components(
     drink_id: Uuid,
     valid: &ValidDrink,
 ) -> Result<(), ApiError> {
-    for (position, component) in valid.drink.components().iter().enumerate() {
+    // The quantities as entered, not the domain's millilitres: see
+    // `ValidDrink::quantities`.
+    for (position, (component, quantity)) in valid
+        .drink
+        .components()
+        .iter()
+        .zip(&valid.quantities)
+        .enumerate()
+    {
         let sort_order = i32::try_from(position)
             .map_err(|_| ApiError::internal("more components than an integer counts"))?;
         sqlx::query(INSERT_COMPONENT)
@@ -186,7 +194,7 @@ async fn insert_components(
             .bind(sort_order)
             .bind(&component.name)
             .bind(component.abv_percent)
-            .bind(component.quantity)
+            .bind(*quantity)
             .execute(&mut **tx)
             .await
             .map_err(as_api_error)?;
