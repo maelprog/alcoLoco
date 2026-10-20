@@ -201,32 +201,103 @@ async fn version_count(pool: &sqlx::PgPool, profile: Uuid) -> i64 {
         .expect("the count must run")
 }
 
+/// `sql` lowercased, with its `--` and `/* */` comments removed (block comments
+/// nest, as in PostgreSQL) and every run of whitespace collapsed to one space.
+///
+/// Single-quoted strings and double-quoted identifiers are copied as they are,
+/// so that a `--` or a `/*` inside a literal is not taken for a comment. Dollar
+/// quotes are not recognised: a function body is scanned like the rest of the
+/// file, which is right for its comments and its own quoted strings. What this
+/// does not handle is an `E'…\'…'` string, whose backslash-escaped quote would
+/// end the literal early; no migration writes one.
+fn without_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+
+    while let Some(character) = chars.next() {
+        match character {
+            '-' if chars.peek() == Some(&'-') => {
+                for skipped in chars.by_ref() {
+                    if skipped == '\n' {
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut depth = 1;
+                while depth > 0 {
+                    match chars.next() {
+                        Some('/') if chars.peek() == Some(&'*') => {
+                            chars.next();
+                            depth += 1;
+                        }
+                        Some('*') if chars.peek() == Some(&'/') => {
+                            chars.next();
+                            depth -= 1;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                out.push(' ');
+            }
+            '\'' | '"' => {
+                // A doubled quote inside a literal closes it and reopens it at
+                // once, which copies the same characters.
+                out.push(character);
+                for inner in chars.by_ref() {
+                    out.push(inner);
+                    if inner == character {
+                        break;
+                    }
+                }
+            }
+            _ => out.push(character),
+        }
+    }
+
+    out.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Names a `CREATE TABLE` / `DROP TABLE` statement of `sql` acts on.
 ///
-/// `keyword` is matched on a lowercased copy, so it must be given lowercase and
-/// end with a space. Any schema qualification is dropped: only the bare name is
-/// returned, which is what `information_schema` reports.
+/// `keyword` is matched on [`without_comments`], so it must be given lowercase,
+/// with single spaces, and end with a space. A comma-separated list of names —
+/// `DROP TABLE a, b` — yields every name of the list. Any schema qualification
+/// is dropped: only the bare name is returned, which is what
+/// `information_schema` reports.
 fn tables_named_after(sql: &str, keyword: &str) -> Vec<String> {
-    let lowered = sql.to_lowercase();
+    let normalised = without_comments(sql);
     let mut names = Vec::new();
     let mut from = 0;
 
-    while let Some(at) = lowered[from..].find(keyword) {
+    while let Some(at) = normalised[from..].find(keyword) {
         let after = from + at + keyword.len();
-        let mut rest = lowered[after..].trim_start();
+        let mut rest = normalised[after..].trim_start();
         for guard in ["if not exists ", "if exists "] {
             if let Some(stripped) = rest.strip_prefix(guard) {
                 rest = stripped.trim_start();
             }
         }
-        let qualified: String = rest
-            .chars()
-            .take_while(|character| {
-                character.is_ascii_alphanumeric() || *character == '_' || *character == '.'
-            })
-            .collect();
-        if let Some(name) = qualified.rsplit('.').next().filter(|name| !name.is_empty()) {
-            names.push(name.to_owned());
+        loop {
+            let qualified: String = rest
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || *character == '_' || *character == '.'
+                })
+                .collect();
+            if let Some(name) = qualified.rsplit('.').next().filter(|name| !name.is_empty()) {
+                names.push(name.to_owned());
+            }
+            match rest[qualified.len()..].trim_start().strip_prefix(',') {
+                Some(next) if !qualified.is_empty() => rest = next.trim_start(),
+                _ => break,
+            }
         }
         from = after;
     }
@@ -239,16 +310,81 @@ fn tables_named_after(sql: &str, keyword: &str) -> Vec<String> {
 /// would drift away from the schema at the first migration of #10, #13 or #43,
 /// and drift silently.
 fn tables_the_migrations_declare() -> BTreeSet<String> {
+    tables_declared_by(db::MIGRATOR.migrations.iter().map(|m| m.sql.as_ref()))
+}
+
+/// The tables left declared once every script of `scripts` has run, in order.
+fn tables_declared_by<'a>(scripts: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
     let mut declared = BTreeSet::new();
-    for migration in db::MIGRATOR.migrations.iter() {
-        for name in tables_named_after(&migration.sql, "create table ") {
+    for sql in scripts {
+        for name in tables_named_after(sql, "create table ") {
             declared.insert(name);
         }
-        for name in tables_named_after(&migration.sql, "drop table ") {
+        for name in tables_named_after(sql, "drop table ") {
             declared.remove(&name);
         }
     }
     declared
+}
+
+/// The set of `names`, for the assertions on the scan below.
+fn table_set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+// The scan above is what the schema test compares the database against, so a
+// mistake in it shows up there as a disagreement on the tables. These cases pin
+// the shapes a correct migration may legitimately take; each one used to make
+// the schema test fail on a schema that was right.
+
+#[test]
+fn the_scan_ignores_a_table_named_in_a_comment() {
+    let sql = "-- a reader could CREATE TABLE ghost (a int) here
+               /* or CREATE TABLE phantom (a int) there */
+               /* nested /* CREATE TABLE inner_ghost */ CREATE TABLE outer_ghost */
+               CREATE TABLE real_one (a int);";
+    assert_eq!(tables_declared_by([sql]), table_set(&["real_one"]));
+}
+
+#[test]
+fn the_scan_reads_keywords_separated_by_any_whitespace() {
+    let sql = "CREATE\n    TABLE spread_out (a int);
+               CREATE  TABLE\tIF  NOT\n EXISTS guarded(a int);
+               CREATE TABLE -- the name comes next
+                   commented_between (a int);";
+    assert_eq!(
+        tables_declared_by([sql]),
+        table_set(&["commented_between", "guarded", "spread_out"])
+    );
+}
+
+#[test]
+fn the_scan_drops_every_table_of_a_drop_list() {
+    let create = "CREATE TABLE a (x int); CREATE TABLE b (x int); CREATE TABLE c (x int);";
+    let drop = "DROP TABLE a, public.b;";
+    assert_eq!(tables_declared_by([create, drop]), table_set(&["c"]));
+}
+
+#[test]
+fn the_scan_does_not_take_comment_markers_in_a_string_for_comments() {
+    let sql = "INSERT INTO t VALUES ('Jus d''orange -- 0 %'); CREATE TABLE kept (a int);
+               INSERT INTO t VALUES ('/* not a comment'); CREATE TABLE also_kept (a int);";
+    assert_eq!(
+        tables_declared_by([sql]),
+        table_set(&["also_kept", "kept"])
+    );
+}
+
+#[test]
+fn the_scan_does_not_take_an_apostrophe_in_a_comment_for_a_string() {
+    let sql = "-- the profile's settings
+               CREATE TABLE after_the_comment (a int);
+               -- it's still read
+               CREATE TABLE after_another (a int);";
+    assert_eq!(
+        tables_declared_by([sql]),
+        table_set(&["after_another", "after_the_comment"])
+    );
 }
 
 /// The tables actually present in `public`, minus sqlx's own bookkeeping table.
