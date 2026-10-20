@@ -59,8 +59,14 @@ COMMENT ON FUNCTION public.library_item_search_key(pg_catalog.text) IS
 -- same entry, to the search, as « Vodka » and « vodka ». The index enforcing it
 -- is also the search index. `text_pattern_ops` is what lets it answer the
 -- prefix search `key LIKE 'biere%'` under the database's non-C collation; the
--- default operator class would only serve equality there. The initial
--- `library_item_lower_name_key` stays as it is: it is now implied by this one.
+-- default operator class would only serve equality there.
+--
+-- The initial `library_item_lower_name_key` stays, and it is not redundant
+-- with this one: neither index implies the other. `unaccent` maps some
+-- characters to a letter that `lower` alone would not reach, and the reverse.
+-- The ångström sign (U+212B) and « å » have the same `lower()`, « å », but
+-- different keys here — « å » for the first, « a » for the second. That pair
+-- is refused by the initial index only.
 
 CREATE UNIQUE INDEX library_item_search_key_unique
     ON public.library_item (public.library_item_search_key(name) pg_catalog.text_pattern_ops);
