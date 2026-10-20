@@ -92,6 +92,19 @@ fn text(errors: &mut Vec<FieldError>, field: &str, value: Option<String>) -> Opt
     Some(value.trim().to_owned())
 }
 
+/// Reads a `PATCH` member that cannot be cleared: absent is `None`, an
+/// explicit `null` is reported and read as absent.
+fn not_null<T>(errors: &mut Vec<FieldError>, field: &str, value: Option<Option<T>>) -> Option<T> {
+    match value {
+        Some(None) => {
+            errors.push(FieldError::new(field, "must not be null"));
+            None
+        }
+        Some(Some(value)) => Some(value),
+        None => None,
+    }
+}
+
 impl ComponentRequest {
     /// Reads a component, prefixing every field with its position. `None` when
     /// a member is missing or unusable; the rules of the domain run afterwards.
@@ -220,10 +233,34 @@ impl DrinkPatch {
     ///
     /// Returns a validation failure listing each member that cannot be used.
     pub fn merge_onto(self, stored: Drink) -> Result<ValidDrink, ApiError> {
-        let unit_changes = self
-            .quantity_unit
-            .is_some_and(|unit| unit != stored.quantity_unit);
-        let components_missing = unit_changes && self.components.is_none();
+        // A `null` on a member that cannot be cleared is refused; the member
+        // is then read as absent, so that the rest is still reported.
+        let mut refused = Vec::new();
+        let name = not_null(&mut refused, "name", self.name);
+        let ingested_at = not_null(&mut refused, "ingested_at", self.ingested_at);
+        let ingestion = not_null(
+            &mut refused,
+            "ingestion_duration_seconds",
+            self.ingestion_duration_seconds,
+        );
+        let absorption = not_null(
+            &mut refused,
+            "absorption_duration_seconds",
+            self.absorption_duration_seconds,
+        );
+        let quantity_unit = not_null(&mut refused, "quantity_unit", self.quantity_unit);
+        let components_sent = matches!(self.components, Some(Some(_)));
+        let components = not_null(&mut refused, "components", self.components);
+
+        let unit_changes = quantity_unit.is_some_and(|unit| unit != stored.quantity_unit);
+        if unit_changes && !components_sent && !refused.iter().any(|e| e.field == "components") {
+            // The stored quantities read differently in the other unit: 40 mL
+            // of vodka would become 40 % of the drink, silently.
+            refused.push(FieldError::new(
+                "components",
+                "must be sent again when quantity_unit changes",
+            ));
+        }
 
         let defaults = Defaults {
             ingestion_duration_seconds: stored.ingestion_duration_seconds,
@@ -231,16 +268,16 @@ impl DrinkPatch {
         };
         let merged = DrinkRequest {
             event_id: self.event_id.unwrap_or(stored.event_id),
-            name: Some(self.name.unwrap_or(stored.name)),
-            ingested_at: Some(self.ingested_at.unwrap_or(stored.ingested_at)),
-            ingestion_duration_seconds: self.ingestion_duration_seconds,
-            absorption_duration_seconds: self.absorption_duration_seconds,
-            quantity_unit: Some(self.quantity_unit.unwrap_or(stored.quantity_unit)),
+            name: Some(name.unwrap_or(stored.name)),
+            ingested_at: Some(ingested_at.unwrap_or(stored.ingested_at)),
+            ingestion_duration_seconds: ingestion,
+            absorption_duration_seconds: absorption,
+            quantity_unit: Some(quantity_unit.unwrap_or(stored.quantity_unit)),
             volume_total_ml: self.volume_total_ml.unwrap_or(stored.volume_total_ml),
             feeling_rating: self
                 .feeling_rating
                 .unwrap_or(stored.feeling_rating.map(i64::from)),
-            components: Some(self.components.unwrap_or_else(|| {
+            components: Some(components.unwrap_or_else(|| {
                 stored
                     .components
                     .into_iter()
@@ -250,23 +287,23 @@ impl DrinkPatch {
         };
         let result = merged.validate(defaults, stored.ingested_at);
 
-        if !components_missing {
+        if refused.is_empty() {
             return result;
         }
-        // The stored quantities read differently in the other unit: 40 mL of
-        // vodka would become 40 % of the drink, silently. What the domain
-        // found wrong with them in that reading is beside the point.
-        let mut errors = match result {
+        // What the rules find wrong with a member already refused here — the
+        // stored components read in the other unit, say — is beside the point.
+        let mut errors: Vec<FieldError> = match result {
             Err(ApiError::Validation(errors)) => errors
                 .into_iter()
-                .filter(|error| !error.field.starts_with("components"))
+                .filter(|error| {
+                    !refused
+                        .iter()
+                        .any(|mine| error.field.starts_with(&mine.field))
+                })
                 .collect(),
             _ => Vec::new(),
         };
-        errors.push(FieldError::new(
-            "components",
-            "must be sent again when quantity_unit changes",
-        ));
+        errors.extend(refused);
         Err(ApiError::validation(errors))
     }
 }
@@ -550,7 +587,7 @@ mod tests {
                 "{too_early}"
             );
             let patch = DrinkPatch {
-                ingested_at: Some(too_early),
+                ingested_at: Some(Some(too_early)),
                 ..DrinkPatch::default()
             };
             assert_eq!(fields_of(patch.merge_onto(stored())), ["ingested_at"]);
@@ -604,9 +641,9 @@ mod tests {
     fn a_patch_changes_only_what_it_names() {
         let at: Timestamp = "2026-10-19T22:30:00Z".parse().expect("a real instant");
         let valid = DrinkPatch {
-            name: Some("Vodka orange".to_owned()),
-            ingested_at: Some(at),
-            absorption_duration_seconds: Some(600),
+            name: Some(Some("Vodka orange".to_owned())),
+            ingested_at: Some(Some(at)),
+            absorption_duration_seconds: Some(Some(600)),
             ..DrinkPatch::default()
         }
         .merge_onto(stored())
@@ -620,6 +657,24 @@ mod tests {
     }
 
     #[test]
+    fn a_null_on_a_member_that_cannot_be_cleared_is_a_field_error() {
+        // Read as "absent", it would answer 200 on a request asking for a
+        // drink without a name or without a time, and keep the old value.
+        for member in [
+            "name",
+            "ingested_at",
+            "ingestion_duration_seconds",
+            "absorption_duration_seconds",
+            "quantity_unit",
+            "components",
+        ] {
+            let patch: DrinkPatch =
+                serde_json::from_str(&format!(r#"{{"{member}":null}}"#)).expect("must parse");
+            assert_eq!(fields_of(patch.merge_onto(stored())), [member], "{member}");
+        }
+    }
+
+    #[test]
     fn a_partial_patch_keeps_the_total_volume_of_a_drink_in_percent() {
         // The stored volume is the only thing that makes the shares
         // computable: dropping it would turn a rename into a refusal.
@@ -629,7 +684,7 @@ mod tests {
         in_percent.components[0].quantity = 20.0;
         in_percent.components[1].quantity = 80.0;
         let valid = DrinkPatch {
-            name: Some("Vodka orange".to_owned()),
+            name: Some(Some("Vodka orange".to_owned())),
             ..DrinkPatch::default()
         }
         .merge_onto(in_percent)
@@ -641,7 +696,7 @@ mod tests {
     #[test]
     fn new_components_replace_the_whole_composition() {
         let valid = DrinkPatch {
-            components: Some(vec![component("Vodka", 40.0, 50.0)]),
+            components: Some(Some(vec![component("Vodka", 40.0, 50.0)])),
             ..DrinkPatch::default()
         }
         .merge_onto(stored())
@@ -671,7 +726,7 @@ mod tests {
         let mut small = stored();
         small.components[1].quantity = 50.0;
         let patch = DrinkPatch {
-            quantity_unit: Some(QuantityUnit::Percent),
+            quantity_unit: Some(Some(QuantityUnit::Percent)),
             volume_total_ml: Some(Some(200.0)),
             ..DrinkPatch::default()
         };
@@ -681,12 +736,12 @@ mod tests {
         assert_eq!(fields_of(patch.merge_onto(stored())), ["components"]);
 
         let valid = DrinkPatch {
-            quantity_unit: Some(QuantityUnit::Percent),
+            quantity_unit: Some(Some(QuantityUnit::Percent)),
             volume_total_ml: Some(Some(200.0)),
-            components: Some(vec![
+            components: Some(Some(vec![
                 component("Vodka", 40.0, 20.0),
                 component("Jus d'orange", 0.0, 80.0),
-            ]),
+            ])),
             ..DrinkPatch::default()
         }
         .merge_onto(stored())
@@ -696,7 +751,7 @@ mod tests {
 
         // Naming the unit already stored is no change.
         DrinkPatch {
-            quantity_unit: Some(QuantityUnit::Cl),
+            quantity_unit: Some(Some(QuantityUnit::Cl)),
             ..DrinkPatch::default()
         }
         .merge_onto(stored())
@@ -707,7 +762,7 @@ mod tests {
     fn a_patch_is_held_to_the_rules_of_a_creation() {
         let patch = DrinkPatch {
             volume_total_ml: Some(Some(200.0)),
-            name: Some(" ".to_owned()),
+            name: Some(Some(" ".to_owned())),
             feeling_rating: Some(Some(11)),
             ..DrinkPatch::default()
         };

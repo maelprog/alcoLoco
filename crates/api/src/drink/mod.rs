@@ -134,7 +134,7 @@ pub async fn update(
     Path(id): Path<Uuid>,
     JsonBody(patch): JsonBody<DrinkPatch>,
 ) -> Result<Json<Drink>, ApiError> {
-    let replace_components = patch.components.is_some();
+    let replace_components = matches!(patch.components, Some(Some(_)));
     let outcome = store::update(&state.pool, id, replace_components, |stored| {
         patch.merge_onto(stored)
     })

@@ -114,29 +114,39 @@ pub struct DrinkRequest {
 
 /// A drink modification, as it arrives on `PATCH /drinks/{id}`.
 ///
-/// An absent member keeps the stored value. The three nullable members —
-/// `event_id`, `volume_total_ml`, `feeling_rating` — tell an absent member
-/// from an explicit `null`, which clears the stored value. `components`, when
-/// present, replaces the whole composition; it has to be present when
-/// `quantity_unit` changes, since the stored quantities mean something else
-/// in the other unit.
+/// An absent member keeps the stored value. Every member tells an absent
+/// member from an explicit `null`: on the three nullable members —
+/// `event_id`, `volume_total_ml`, `feeling_rating` — `null` clears the stored
+/// value; on any other it is refused, field by field, since those members
+/// cannot be cleared. `components`, when present, replaces the whole
+/// composition; it has to be present when `quantity_unit` changes, since the
+/// stored quantities mean something else in the other unit.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, ToSchema)]
 pub struct DrinkPatch {
     /// Event the drink belongs to; `null` detaches it.
     #[serde(default, deserialize_with = "present")]
     #[schema(value_type = Option<Uuid>)]
     pub event_id: Option<Option<Uuid>>,
-    /// Name of the drink.
-    pub name: Option<String>,
-    /// Instant the drink started being drunk.
-    #[schema(value_type = Option<String>, format = DateTime, example = "2026-08-20T21:04:05Z")]
-    pub ingested_at: Option<Timestamp>,
-    /// Ingestion duration, in seconds.
-    pub ingestion_duration_seconds: Option<i64>,
-    /// Absorption duration, in seconds.
-    pub absorption_duration_seconds: Option<i64>,
-    /// Unit of every component quantity.
-    pub quantity_unit: Option<QuantityUnit>,
+    /// Name of the drink. Not nullable.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = String)]
+    pub name: Option<Option<String>>,
+    /// Instant the drink started being drunk. Not nullable.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = String, format = DateTime, example = "2026-08-20T21:04:05Z")]
+    pub ingested_at: Option<Option<Timestamp>>,
+    /// Ingestion duration, in seconds. Not nullable.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = i64)]
+    pub ingestion_duration_seconds: Option<Option<i64>>,
+    /// Absorption duration, in seconds. Not nullable.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = i64)]
+    pub absorption_duration_seconds: Option<Option<i64>>,
+    /// Unit of every component quantity. Not nullable.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = QuantityUnit)]
+    pub quantity_unit: Option<Option<QuantityUnit>>,
     /// Total volume in millilitres; `null` clears it (a drink moving to `cl`).
     #[serde(default, deserialize_with = "present")]
     #[schema(value_type = Option<f64>)]
@@ -146,7 +156,10 @@ pub struct DrinkPatch {
     #[schema(value_type = Option<i64>)]
     pub feeling_rating: Option<Option<i64>>,
     /// The whole new composition, in the order the components were added.
-    pub components: Option<Vec<ComponentRequest>>,
+    /// Not nullable.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Vec<ComponentRequest>)]
+    pub components: Option<Option<Vec<ComponentRequest>>>,
 }
 
 /// Reads a member that is present, `null` included, as `Some`: together with

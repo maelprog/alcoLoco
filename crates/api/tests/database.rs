@@ -2727,6 +2727,26 @@ async fn an_invalid_write_is_a_400_and_leaves_the_stored_drink_alone() {
     let (_, read) = body_of(state.clone(), &format!("/drinks/{drink}")).await;
     assert_eq!(read, created);
 
+    // `null` on a member that cannot be cleared.
+    let answer = send(
+        state.clone(),
+        "PATCH",
+        &format!("/drinks/{drink}"),
+        Some(serde_json::json!({ "name": null, "components": null })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    let mut fields: Vec<&str> = answer.body["errors"]
+        .as_array()
+        .expect("errors")
+        .iter()
+        .map(|e| e["field"].as_str().expect("a field"))
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(fields, ["components", "name"]);
+    let (_, read) = body_of(state.clone(), &format!("/drinks/{drink}")).await;
+    assert_eq!(read, created);
+
     // A creation in percent without its total volume.
     let answer = send(
         state.clone(),
@@ -2762,8 +2782,8 @@ async fn an_ingestion_time_is_held_to_what_the_database_stores() {
     let (drink, body) = record_drink(&state, profile, &payload).await;
     assert_eq!(body["ingested_at"], rendered);
 
-    payload["ingested_at"] = serde_json::to_value(earliest - chrono::Duration::microseconds(1))
-        .expect("must serialise");
+    payload["ingested_at"] =
+        serde_json::to_value(earliest - chrono::Duration::microseconds(1)).expect("must serialise");
     let answer = send(
         state.clone(),
         "POST",

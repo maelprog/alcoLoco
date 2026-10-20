@@ -149,6 +149,35 @@ mod tests {
     }
 
     #[test]
+    fn a_drink_patch_publishes_which_members_may_be_null() {
+        // Every member is optional; only the three the API clears on `null`
+        // are documented as nullable, the others answer 400 to it.
+        let document = rendered();
+        let patch = &document["components"]["schemas"]["DrinkPatch"];
+        let required = patch["required"].as_array().cloned().unwrap_or_default();
+        assert!(required.is_empty(), "a patch requires nothing: {patch}");
+        let nullable = |member: &str| {
+            let schema = &patch["properties"][member];
+            let rendered = schema.to_string();
+            assert!(schema.is_object(), "`{member}` is not documented: {patch}");
+            rendered.contains("\"null\"") || schema["nullable"] == true
+        };
+        for member in ["event_id", "volume_total_ml", "feeling_rating"] {
+            assert!(nullable(member), "`{member}` clears on null: {patch}");
+        }
+        for member in [
+            "name",
+            "ingested_at",
+            "ingestion_duration_seconds",
+            "absorption_duration_seconds",
+            "quantity_unit",
+            "components",
+        ] {
+            assert!(!nullable(member), "`{member}` refuses null: {patch}");
+        }
+    }
+
+    #[test]
     fn the_error_shape_is_published_for_every_later_endpoint_to_reference() {
         let document = rendered();
         let problem = &document["components"]["schemas"]["ProblemDetails"];
