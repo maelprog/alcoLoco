@@ -190,7 +190,7 @@ fn profile_from_row(row: &PgRow) -> Result<Profile, ApiError> {
 
 /// Reads the settings columns of a row, which are all null together when the
 /// lateral join found no applicable version.
-fn settings_from_row(row: &PgRow) -> Result<Option<ProfileSettings>, ApiError> {
+pub(crate) fn settings_from_row(row: &PgRow) -> Result<Option<ProfileSettings>, ApiError> {
     let Some(valid_from) = row.try_get::<Option<Timestamp>, _>("valid_from")? else {
         return Ok(None);
     };

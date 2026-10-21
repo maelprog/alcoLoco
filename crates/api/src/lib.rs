@@ -4,8 +4,8 @@
 //! single one: configuration, connection pool, the error type and its RFC 7807
 //! rendering, the identifier and timestamp conventions, cursor pagination, and
 //! the generated OpenAPI document. Business routes live in a module of their own
-//! and are mounted on [`app`]: [`profile`], [`drink`], [`event`] and
-//! [`library`].
+//! and are mounted on [`app`]: [`profile`], [`drink`], [`event`], [`library`]
+//! and [`bac`].
 //!
 //! Conventions posed here, to be reused rather than restated:
 //!
@@ -23,6 +23,7 @@ use axum::http::{Method, Uri};
 use axum::routing::{get, put};
 use sqlx::PgPool;
 
+pub mod bac;
 pub mod config;
 pub mod drink;
 pub mod error;
@@ -107,7 +108,9 @@ pub fn app(state: AppState) -> Router {
             event::PARTICIPANT_PATH,
             put(event::add_participant).delete(event::remove_participant),
         )
-        .route(library::COLLECTION_PATH, get(library::list));
+        .route(library::COLLECTION_PATH, get(library::list))
+        .route(bac::PROFILE_PATH, get(bac::profile))
+        .route(bac::EVENT_PATH, get(bac::event));
 
     if state.config.environment.exposes_openapi() {
         router = router.route(openapi::DOCUMENT_PATH, get(openapi::document));

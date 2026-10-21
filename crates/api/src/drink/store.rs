@@ -159,7 +159,7 @@ fn as_api_error(error: sqlx::Error) -> ApiError {
 }
 
 /// Reads a row of [`SELECT_DRINK`], components aside.
-fn drink_from_row(row: &PgRow, components: Vec<Component>) -> Result<Drink, ApiError> {
+pub(crate) fn drink_from_row(row: &PgRow, components: Vec<Component>) -> Result<Drink, ApiError> {
     let unit_label: String = row.try_get("quantity_unit")?;
     let quantity_unit = QuantityUnit::from_sql(&unit_label)
         .ok_or_else(|| ApiError::internal(format!("unknown quantity_unit `{unit_label}`")))?;
