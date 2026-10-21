@@ -15,15 +15,17 @@
 //!
 //! # What this module does not do: the Watson degeneracy
 //!
-//! Read this before adding a bound here to "protect" the computation, and read
-//! it if you are working on #16 — it is written for you.
+//! Read this before adding a bound here to "protect" the computation.
 //!
 //! The male equation of SPEC.md §6.2 subtracts `0.09516 × age`, so for a small
 //! enough body it reaches a **non-positive total body water** at a finite age.
-//! `initial_bac_g_per_l` then divides by that value and hands back a negative
-//! concentration. `crates/domain` puts **no guard on the sign**, so the failure
-//! is neither impossible nor visible: it propagates as a plausible-looking
-//! number.
+//! Dividing by that value would hand back a negative concentration. Since #16,
+//! `crates/domain` refuses it: `watson_total_body_water_litres` answers
+//! `EngineError::NonPositiveBodyWater` rather than a volume, and a
+//! concentration can only be computed over a `BodyWater`, which is never zero
+//! or negative. The failure is therefore visible — an error, not a
+//! plausible-looking number — but it is not impossible: such a profile is
+//! accepted here, and its curve cannot be drawn.
 //!
 //! **The bounds below do not close it, and are not meant to.** Weight and height
 //! are bounded away from zero and nothing more, which is a **product decision,
@@ -43,13 +45,14 @@
 //!
 //! The crossing is therefore **104 years inside** the oldest birth date this
 //! module accepts, and a profile past it is reachable through the ordinary API.
-//! Measured end to end on the request that reaches it: a body of 0.5 kg and 1 cm
-//! at 30.6 years yields a total body water of −0.1894 L, and a single 25 cL beer
-//! at 5 % then yields −41.97 g/L.
+//! Measured end to end on the request that reaches it, before #16: a body of
+//! 0.5 kg and 1 cm at 30.6 years yields a total body water of −0.1894 L, and a
+//! single 25 cL beer at 5 % then yielded −41.97 g/L.
 //!
-//! The guard that closes this is `TBW > 0` inside `crates/domain`, which is
-//! **issue #16**, recorded as a debt there. Nothing in this crate substitutes
-//! for it, and no wording here should suggest otherwise.
+//! The guard is `TBW > 0` inside `crates/domain`. Nothing in this crate
+//! substitutes for it, and no wording here should suggest otherwise. What the
+//! API answers for a profile whose curve cannot be drawn belongs to the
+//! endpoint that draws it.
 //!
 //! Every message is built with `format!` from the constant it quotes. A message
 //! spelling a number out would drift the moment the bound moved, and no test

@@ -912,7 +912,8 @@ async fn bac_of(pool: &sqlx::PgPool, profile: Uuid, drink: &Drink) -> f64 {
         settings.weight_kg,
         settings.height_cm,
         age_years,
-    );
+    )
+    .expect("a positive body water");
     domain::initial_bac_g_per_l(
         domain::ingested_alcohol_grams(drink.volume_ml, drink.abv_percent),
         water,
@@ -1523,10 +1524,8 @@ async fn the_schema_enforces_exactly_the_bounds_the_api_restates() {
 }
 
 #[tokio::test]
-async fn an_unusually_small_body_is_accepted_and_the_engine_is_left_unguarded() {
-    // This test records a **deliberate hole**, so that #16 finds it stated
-    // rather than has to rediscover it. Read the module documentation of
-    // `profile::validation` with it.
+async fn an_unusually_small_body_is_accepted_and_the_engine_refuses_its_body_water() {
+    // Read the module documentation of `profile::validation` with this test.
     //
     // Weight and height are bounded away from zero and nothing more, which is a
     // product decision taken by the user on 2026-08-23: accept as many real
@@ -1536,17 +1535,14 @@ async fn an_unusually_small_body_is_accepted_and_the_engine_is_left_unguarded() 
     //
     // The cost is measured and is not zero. The male equation of SPEC.md §6.2
     // reaches a non-positive total body water at 25.715 years for a body at the
-    // worst corner this accepts, and `initial_bac_g_per_l` then divides by it:
-    // a body of 0.5 kg and 1 cm at 30.6 years gives a total body water of
-    // -0.1894 L and, for a single 25 cL beer at 5 %, -41.97 g/L. Those numbers
-    // come from `crates/domain` itself.
+    // worst corner this accepts: a body of 0.5 kg and 1 cm at 30.6 years gives
+    // -0.1894 L. Before #16, `initial_bac_g_per_l` divided by it and handed back
+    // -41.97 g/L for a single 25 cL beer at 5 %.
     //
-    // So the request below is accepted, on purpose, and nothing in this crate
-    // will stop the curve that follows. The guard that does is `TBW > 0` inside
-    // `crates/domain` — issue #16. **When #16 lands, this test is the one to
-    // revisit**: what changes is what the engine does with the profile, not
-    // whether the profile may exist.
-    let name = "an_unusually_small_body_is_accepted_and_the_engine_is_left_unguarded";
+    // So the request below is accepted, on purpose, and the guard is `TBW > 0`
+    // inside `crates/domain`: what changes is what the engine does with the
+    // profile, not whether the profile may exist.
+    let name = "an_unusually_small_body_is_accepted_and_the_engine_refuses_its_body_water";
     let Some(state) = migrated(name).await else {
         return;
     };
@@ -1565,6 +1561,15 @@ async fn an_unusually_small_body_is_accepted_and_the_engine_is_left_unguarded() 
     );
     assert_eq!(answer.body["settings"]["weight_kg"], 0.5);
     assert_eq!(answer.body["settings"]["height_cm"], 1.0);
+
+    // And the engine answers that body with an error, not with a volume.
+    assert!(
+        matches!(
+            domain::watson_total_body_water_litres(domain::Sex::Male, 0.5, 1.0, 30.6),
+            Err(domain::EngineError::NonPositiveBodyWater { .. })
+        ),
+        "the engine accepted a non-positive body water"
+    );
 }
 
 #[tokio::test]
@@ -2481,7 +2486,8 @@ async fn alcohol_of_history(state: &AppState, profile: Uuid) -> f64 {
             settings.weight_kg,
             settings.height_cm,
             age_years,
-        );
+        )
+        .expect("a positive body water");
         total += domain::initial_bac_g_per_l(valid.pure_alcohol_grams(), water);
     }
     total

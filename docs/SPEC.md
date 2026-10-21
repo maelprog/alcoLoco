@@ -325,8 +325,15 @@ L'élimination est d'ordre zéro (saturée) :
 paramètre de fonction pour les tests — ce n'est **pas** une donnée de profil et elle n'apparaît pas
 en base. Le réglage par profil relève du calibrage **[V2+]** (#34).
 
-Le résultat est **borné à zéro par le bas** : à alcoolémie nulle, l'élimination s'arrête. Aucune
-« dette » ne peut être reportée sur une consommation ultérieure.
+Le résultat **affiché** est **borné à zéro par le bas** : `C(t) = max(0, brut(t))`, où `brut` est la
+forme fermée de l'épisode de consommation en cours, élimination comptée depuis son début (§6.5).
+Le plancher porte sur la valeur affichée, pas sur le calcul : tant que les premières fractions d'une
+boisson apparaissent moins vite que `β` n'élimine, `brut` est négatif, la courbe affiche zéro, et cette
+élimination reste imputée à l'épisode.
+
+Aucune « dette » ne peut être reportée d'un épisode sur le suivant : un épisode se termine quand la
+courbe est à zéro **et** qu'aucune boisson n'est encore en cours d'absorption ; la consommation
+suivante ouvre un nouvel épisode, dont l'élimination repart de zéro (arbitrage du 2026-10-21).
 
 En ingestion instantanée on retrouve la forme classique `C(t) = C₀ − β × t`.
 
@@ -369,15 +376,32 @@ somment linéairement ; l'élimination `β`, elle, est **globale au corps** et n
 **qu'une seule fois**, quel que soit le nombre de boissons en cours d'absorption.
 
 ```
-C'(t) = κ × Σ Rᵢ(t) − β × 1[C(t) > 0]     avec κ = 0,806 / TBW
+brut'(t) = Σ κᵢ × Rᵢ(t) − β     au sein d'un épisode, avec κᵢ = 0,806 / TBWᵢ
 ```
 
 > ⚠ Il est **incorrect** de sommer des courbes individuelles portant chacune son propre `− β × t` :
 > on éliminerait alors à `N × β`. Cette règle est une contrainte de correction, pas une option.
 
-**Méthode de calcul.** Le plancher à zéro rend la forme fermée insuffisante (il faut détecter les
-instants de retour à zéro). La courbe est donc obtenue par **intégration en avant à pas fixe**, au
-pas défini en §10.3. Le procédé reste strictement déterministe et rejouable (§7) : à historique
+**Épisodes de consommation** (arbitrage du 2026-10-21). Les consommations d'un profil se
+regroupent en épisodes. Au sein d'un épisode ouvert à `t₀` — l'heure d'ingestion de sa première
+boisson —, la courbe est la forme fermée, **sans plancher**, l'élimination comptée depuis `t₀` :
+
+```
+brut(t) = Σᵢ κᵢ × absorbéᵢ(t − tᵢ) − β × (t − t₀)        C(t) = max(0, brut(t))
+```
+
+où `absorbéᵢ(τ) = ∫₀^τ Rᵢ` est la primitive du profil d'absorption (§6.4) et `κᵢ = 0,806 / TBWᵢ`.
+`β` n'y apparaît qu'une fois, comme l'exige la règle de superposition.
+
+L'épisode se termine quand la courbe est à zéro **et** qu'aucune de ses boissons n'est encore en
+cours d'absorption, soit à `max(E, t₀ + Σ κᵢ × Aᵢ / β)`, `E` étant la dernière fin d'absorption de
+l'épisode. Une boisson ingérée avant cet instant rejoint l'épisode — même si la courbe affiche zéro
+à ce moment parce qu'une boisson est encore en cours d'absorption ; une boisson ingérée à cet instant
+ou après ouvre un nouvel épisode : la dette d'élimination est remise à zéro.
+
+**Méthode de calcul.** Chaque valeur est la forme fermée de son épisode : elle est exacte à tout
+instant, sans pas d'intégration, et le pas d'échantillonnage d'une série ne change jamais le
+résultat (§10.0-I). Le procédé reste strictement déterministe et rejouable (§7) : à historique
 identique, courbe identique au bit près.
 
 Chaque consommation utilise le `TBW` issu de la version de paramètres profil en vigueur à son heure
@@ -465,6 +489,12 @@ Cas de comparaison : homme 80 kg / 180 cm / 30 ans → `TBW` = 45,82 L ; 50 cL �
 > au milieu de la fenêtre et pique donc **plus haut et plus tôt** que la rampe, qui l'étale
 > uniformément. Le pic se lit là où `κ × R(τ) = β`, sur la branche descendante de `R` pour le
 > trapèze. Les trois autres lignes sont inchangées.
+
+> **Cohérence avec §6.3 et §6.5 (arbitrage du 2026-10-21).** Ce tableau calcule chaque variante en
+> forme fermée, l'élimination courant dès `t₀`. C'est exactement la règle des épisodes : pour une
+> boisson seule, l'épisode s'ouvre à son ingestion et le plancher ne porte que sur la valeur affichée.
+> Le moteur retrouve donc ces quatre lignes ; le pic du trapèze, 0,227 g/L à 45,7 min, est vérifié
+> à travers lui par un test actif.
 
 > Les quatre variantes **convergent après le pic** : on retombe sur `C₀ − β × t`. L'arbitrage ne
 > joue donc que sur la première heure suivant chaque verre — mais c'est précisément la fenêtre qui
