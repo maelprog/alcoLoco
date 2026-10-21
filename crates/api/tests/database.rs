@@ -3555,32 +3555,40 @@ async fn an_unknown_event_or_profile_is_reported_and_nothing_is_written() {
         &serde_json::json!({ "name": "Réelle", "starts_at": "2026-10-17T20:00:00Z" }),
     )
     .await;
-    for (method, uri, payload) in [
-        ("GET", format!("/events/{unknown}"), None),
+    let no_event = format!("no event with identifier {unknown}");
+    let no_profile = format!("no profile with identifier {unknown}");
+    let not_taking_part = format!("profile {profile} does not take part in event {event}");
+    for (method, uri, payload, detail) in [
+        ("GET", format!("/events/{unknown}"), None, &no_event),
         (
             "PUT",
             format!("/events/{unknown}"),
             Some(serde_json::json!({ "name": "X", "starts_at": "2026-10-17T20:00:00Z" })),
+            &no_event,
         ),
         (
             "PUT",
             format!("/events/{unknown}/participants/{profile}"),
             None,
+            &no_event,
         ),
         (
             "PUT",
             format!("/events/{event}/participants/{unknown}"),
             None,
+            &no_profile,
         ),
         (
             "DELETE",
             format!("/events/{unknown}/participants/{profile}"),
             None,
+            &no_event,
         ),
         (
             "DELETE",
             format!("/events/{event}/participants/{profile}"),
             None,
+            &not_taking_part,
         ),
     ] {
         let answer = send(state.clone(), method, &uri, payload).await;
@@ -3595,6 +3603,7 @@ async fn an_unknown_event_or_profile_is_reported_and_nothing_is_written() {
             api::error::PROBLEM_JSON,
             "{method} {uri}"
         );
+        assert_eq!(answer.body["detail"], *detail, "{method} {uri}");
     }
     let (_, read) = body_of(state.clone(), &format!("/events/{event}")).await;
     assert!(participants_in(&read).is_empty(), "{read}");
