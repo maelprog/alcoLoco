@@ -44,7 +44,7 @@ impl EventRequest {
     pub fn validate_creation(self) -> Result<ValidCreation, ApiError> {
         let mut errors = Vec::new();
         let mut participant_ids: Vec<Uuid> = Vec::new();
-        for id in self.participant_ids.iter().flatten() {
+        for id in self.participant_ids.iter().flatten().flatten() {
             if !participant_ids.contains(id) {
                 participant_ids.push(*id);
             }
@@ -277,7 +277,7 @@ mod tests {
     fn a_profile_named_twice_takes_part_once_in_the_order_first_named() {
         let (a, b, c) = (crate::new_id(), crate::new_id(), crate::new_id());
         let request = EventRequest {
-            participant_ids: Some(vec![b, a, b, c, a]),
+            participant_ids: Some(Some(vec![b, a, b, c, a])),
             ..sound()
         };
         assert_eq!(
@@ -290,7 +290,7 @@ mod tests {
     fn a_replacement_may_not_name_participants() {
         for participant_ids in [vec![], vec![crate::new_id()]] {
             let request = EventRequest {
-                participant_ids: Some(participant_ids),
+                participant_ids: Some(Some(participant_ids)),
                 ..sound()
             };
             assert_eq!(
@@ -298,5 +298,36 @@ mod tests {
                 ["participant_ids"]
             );
         }
+    }
+
+    #[test]
+    fn a_replacement_refuses_participant_ids_even_when_null() {
+        // Read off the wire, as a client sends it: an explicit `null` is a
+        // member present in the payload, and is refused like a list.
+        let request: EventRequest = serde_json::from_str(
+            r#"{"name":"Soirée","starts_at":"2026-10-17T20:00:00Z","participant_ids":null}"#,
+        )
+        .expect("must parse");
+        assert_eq!(
+            fields_of(request.validate_replacement()),
+            ["participant_ids"]
+        );
+
+        // Absent, it is no member at all; on a creation, `null` names nobody.
+        let absent: EventRequest =
+            serde_json::from_str(r#"{"name":"Soirée","starts_at":"2026-10-17T20:00:00Z"}"#)
+                .expect("must parse");
+        assert!(absent.validate_replacement().is_ok());
+        let creation: EventRequest = serde_json::from_str(
+            r#"{"name":"Soirée","starts_at":"2026-10-17T20:00:00Z","participant_ids":null}"#,
+        )
+        .expect("must parse");
+        assert!(
+            creation
+                .validate_creation()
+                .expect("valid")
+                .participant_ids
+                .is_empty()
+        );
     }
 }

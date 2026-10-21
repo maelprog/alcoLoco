@@ -66,7 +66,10 @@ pub struct EventRequest {
     /// event is open-ended.
     #[schema(value_type = Option<String>, format = DateTime, example = "2026-08-21T03:00:00Z")]
     pub ends_at: Option<Timestamp>,
-    /// Profiles taking part from the start, creation only. A profile named
-    /// twice is added once.
-    pub participant_ids: Option<Vec<Uuid>>,
+    /// Profiles taking part from the start, creation only: on a creation a
+    /// profile named twice is added once, and `null` names nobody; on a
+    /// replacement the member is refused whenever present, `null` included.
+    #[serde(default, deserialize_with = "crate::drink::model::present")]
+    #[schema(value_type = Option<Vec<Uuid>>)]
+    pub participant_ids: Option<Option<Vec<Uuid>>>,
 }

@@ -167,7 +167,7 @@ pub struct DrinkPatch {
 
 /// Reads a member that is present, `null` included, as `Some`: together with
 /// `#[serde(default)]`, an absent member stays `None`.
-fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
