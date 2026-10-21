@@ -765,37 +765,37 @@ mod tests {
     #[test]
     fn drinks_starting_together_give_the_same_curve_in_any_order() {
         // Floating-point sums depend on their order: drinks sharing a start
-        // must still be summed in one order, whatever the slice says. Four
-        // drinks at the same instant, every one of the 24 orders.
+        // must still be summed in one order, whatever the slice says. Six
+        // drinks at the same instant, each differing from another on a single
+        // key of the order — mass, ingestion, absorption, body water — and
+        // every one of the 720 orders. The first drink in the sum, the lightest,
+        // only makes sure that every tied pair comes after it: a sum of two
+        // terms does not depend on their order.
         let lighter =
             watson_total_body_water_litres(Sex::Male, 61.3, 171.0, 44.0).expect("positive");
-        let mut drinks = [
-            intake(T0, INGESTION_HOURS, ABSORPTION_HOURS),
-            intake(T0, 0.1, 0.7),
-            intake(T0, 0.0, 0.0),
-            intake(T0, 0.45, 0.2),
-        ];
-        drinks[1].dose = Dose::new(9.8625, 0.1, 0.7).expect("valid");
-        drinks[2].dose = Dose::new(15.78, 0.0, 0.0).expect("valid");
-        drinks[2].body_water = lighter;
-        drinks[3].dose = Dose::new(0.1 + 0.2, 0.45, 0.2).expect("valid");
-        drinks[3].body_water = lighter;
+        let dose = |grams, a, b| Dose::new(grams, a, b).expect("valid");
+        let mut drinks = [reference_drink(T0); 6];
+        drinks[1].body_water = lighter; // κ only
+        drinks[2].dose = dose(29.5875, INGESTION_HOURS, ABSORPTION_HOURS); // mass only
+        drinks[3].dose = dose(29.5875, 0.1, ABSORPTION_HOURS); // ingestion only
+        drinks[4].dose = dose(29.5875, INGESTION_HOURS, 0.7); // absorption only
+        drinks[5].dose = dose(1.0, INGESTION_HOURS, ABSORPTION_HOURS); // first in the sum
         let curve_of = |order: &[Intake]| {
             bac_series(order, &Trapezoid, BETA, T0, T0 + 6 * HOUR, 7).expect("valid inputs")
         };
         let reference = curve_of(&drinks);
-        let mut indices = [0, 1, 2, 3];
+        let mut indices = [0, 1, 2, 3, 4, 5];
         let mut orders = 0;
         // Heap's algorithm, iterative.
-        let mut counters = [0; 4];
+        let mut counters = [0; 6];
         let mut level = 0;
-        let mut check = |indices: &[usize; 4]| {
+        let mut check = |indices: &[usize; 6]| {
             let order: Vec<Intake> = indices.iter().map(|&index| drinks[index]).collect();
             assert_eq!(curve_of(&order), reference, "order {indices:?}");
             orders += 1;
         };
         check(&indices);
-        while level < 4 {
+        while level < 6 {
             if counters[level] < level {
                 let swap = if level % 2 == 0 { 0 } else { counters[level] };
                 indices.swap(swap, level);
@@ -807,7 +807,7 @@ mod tests {
                 level += 1;
             }
         }
-        assert_eq!(orders, 24);
+        assert_eq!(orders, 720);
     }
 
     #[test]
