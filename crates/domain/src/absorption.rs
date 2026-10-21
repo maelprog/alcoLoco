@@ -13,9 +13,10 @@
 //! both.
 //!
 //! The four tests of the crate marked
-//! `#[ignore = "modèle d'absorption non arbitré — cf. #37"]` pin the shape of
-//! the trapezoid's curve before its peak. Removing that attribute is the act
-//! that closes #37.
+//! `#[ignore = "modèle d'absorption non arbitré — cf. #37"]` pin, for the
+//! trapezoid and two variants, the closed form `κ × absorbed(τ) − β × τ` of a
+//! single drink before its peak, computed by the test itself rather than by
+//! [`crate::curve`]. Removing that attribute is the act that closes #37.
 
 use crate::drink::Drink;
 use crate::{EngineError, check_duration, trapezoid_absorbed};
@@ -65,9 +66,10 @@ impl Dose {
     /// components (SPEC.md §6.1), and its two durations.
     ///
     /// [`Drink`] carries its volumes in millilitres. The database stores a
-    /// quantity entered in cL as centilitres (migration `20261022090000`): the
-    /// reader that rebuilds a [`Drink`] from a row multiplies it by 10 first,
-    /// and nothing here converts it again.
+    /// quantity entered in cL as centilitres (migration `20261022090000`), and
+    /// the API reads it back as such; the conversion to millilitres happens
+    /// when the API builds the [`Drink`] from its own model (`ML_PER_CL` in
+    /// `api::drink::validation`). Nothing here converts it again.
     ///
     /// # Errors
     ///
@@ -108,8 +110,8 @@ impl Dose {
 ///
 /// An implementation describes one drink alone. The engine superposes drinks
 /// by summing what each one has absorbed, applies the elimination once to the
-/// body and floors the result at zero (SPEC.md §6.5): none of that belongs to
-/// a profile.
+/// body, groups the drinks into episodes and floors the displayed value at
+/// zero (SPEC.md §6.3, §6.5): none of that belongs to a profile.
 ///
 /// Contract, which the engine relies on:
 ///

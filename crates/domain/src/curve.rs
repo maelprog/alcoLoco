@@ -1,63 +1,48 @@
-//! Blood alcohol curve of a profile: superposition of its drinks, fixed-step
-//! forward integration and floor at zero (SPEC.md §6.3, §6.5, §10.3).
+//! Blood alcohol curve of a profile: superposition of its drinks, drinking
+//! episodes and display floor at zero (SPEC.md §6.3, §6.5).
 //!
 //! # The model
-//!
-//! ```text
-//! C'(t) = Σᵢ κᵢ × Rᵢ(t) − β × 1[C(t) > 0]     with κᵢ = 0.806 / TBWᵢ
-//! ```
 //!
 //! The rates of appearance `Rᵢ` of the drinks add up; the elimination `β` is
 //! global to the body and applies **once**, however many drinks are being
 //! absorbed (§6.5). Summing single-drink curves that each carry their own
-//! `− β × t` would eliminate at `N × β`. Each drink brings the `κᵢ` of the body
-//! water in force at its own ingestion time (§5.6, §10.0-K): the caller
-//! resolves it and hands it over in its [`Intake`].
+//! `− β × t` would eliminate at `N × β`. Each drink brings the `κᵢ = 0.806 /
+//! TBWᵢ` of the body water in force at its own ingestion time (§5.6, §10.0-K):
+//! the caller resolves it and hands it over in its [`Intake`].
 //!
-//! The floor at zero (§6.3) makes a closed form insufficient: at zero,
-//! elimination stops, and no debt is carried over to a later drink. So the
-//! curve is integrated forward.
-//!
-//! # The integration
-//!
-//! Time is in whole seconds — the caller's Unix timestamps — so that the grid
-//! is exact. The integration step is fixed at [`INTEGRATION_STEP_SECONDS`]
-//! (§10.3), and the grid is **absolute**: its nodes are the multiples of the
-//! step since the Unix epoch, whatever window or sampling is asked for. The
-//! start of each drink is added as a node, so that nothing is charged for the
-//! part of a step before it.
-//!
-//! On each interval `[u, v]` between two consecutive nodes:
+//! Drinks are grouped into **episodes**. Within an episode opened at `t₀` —
+//! the start of its first drink — the curve is the closed form, without any
+//! floor, with the elimination counted from `t₀`:
 //!
 //! ```text
-//! C(v) = max(0, C(u) + Σᵢ κᵢ × (absorbedᵢ(v) − absorbedᵢ(u)) − β × (v − u))
+//! raw(t) = Σᵢ κᵢ × absorbedᵢ(t − tᵢ) − β × (t − t₀)       C(t) = max(0, raw(t))
 //! ```
 //!
 //! where `absorbedᵢ` is the primitive of `Rᵢ` given by the
-//! [`AbsorptionProfile`]. Using the exact primitive rather than a sampled rate
-//! means that, as long as the curve stays above zero, the nodes carry exactly
-//! the closed form `Σ κᵢ × absorbedᵢ − β × t`; the step only matters where the
-//! floor engages. A dose that appears at once (pure Widmark) is a jump of the
-//! primitive at the start of the drink, added at that node.
+//! [`AbsorptionProfile`]. Only the displayed value is floored: while the first
+//! fractions of a drink appear slower than `β` eliminates, `raw` is negative and
+//! the curve shows zero, and that elimination stays charged to the episode.
 //!
-//! A value asked between two nodes is read from the last node before it,
-//! **without** being kept as a node: sampling a series at another step, or
-//! asking for an instant, never changes the integrated values (§10.0-I).
+//! An episode ends when the curve is at zero **and** no drink of it is still
+//! being absorbed: past the last end of absorption `E`, `raw` only falls, so the
+//! end is `max(E, t₀ + Σ κᵢ × Aᵢ / β)`. A drink starting at or after that end
+//! opens a new episode: the elimination restarts from its own `t₀`, and no debt
+//! is carried over (§6.3). A drink starting before it joins the episode, even
+//! if the curve shows zero at that instant because a drink is still being
+//! absorbed.
 //!
-//! The result depends on the drinks and not on their order in the slice: they
-//! are sorted first. Same history, same profile, same `β` → same curve, bit for
-//! bit (§7).
+//! Every value is exact at its instant — there is no integration step — so the
+//! sampling step of a series never changes the result (§10.0-I). Drinks are
+//! sorted by a total order first: same history, same profile, same `β` → same
+//! curve, bit for bit, whatever the order of the slice (§7).
 
 use std::cmp::Ordering;
 
 use crate::absorption::{AbsorptionProfile, Dose};
 use crate::{BodyWater, EngineError, initial_bac_g_per_l};
 
-/// Fixed integration step, in seconds (SPEC.md §10.3, §10.0-I).
-///
-/// It decides the result and is never exposed to a client: the `?step=` of
-/// the API only subsamples the integrated series.
-pub const INTEGRATION_STEP_SECONDS: i64 = 60;
+/// Seconds in an hour.
+const SECONDS_PER_HOUR: f64 = 3600.0;
 
 /// One drink of a profile, as the engine needs it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,9 +67,11 @@ pub struct BacSample {
 
 /// Blood alcohol concentration, in grams per litre, at `at_seconds`.
 ///
-/// `intakes` is the drink history of the profile — at least every drink since
-/// it was last at zero; earlier ones change nothing, by the floor. A drink
-/// starting exactly at `at_seconds` is counted.
+/// `intakes` is the drink history of the profile. Only the episode under way
+/// at `at_seconds` counts, so the history may be cut before the start of that
+/// episode — before an instant where the curve was at zero **and** no drink
+/// was still being absorbed — but not later. A drink starting exactly at
+/// `at_seconds` is counted.
 ///
 /// # Errors
 ///
@@ -97,18 +84,16 @@ pub fn bac_at<P: AbsorptionProfile + ?Sized>(
     at_seconds: i64,
 ) -> Result<f64, EngineError> {
     let rate = check_elimination_rate(elimination_rate_g_per_l_per_h)?;
-    let mut walk = Walk::new(intakes, profile, rate);
-    walk.advance_to(at_seconds);
-    Ok(walk.value_at(at_seconds))
+    let curve = Curve::new(intakes, profile, rate);
+    Ok(curve.value_at(at_seconds))
 }
 
 /// Blood alcohol curve, sampled every `step_seconds` from `from_seconds` to
 /// `to_seconds` included when it falls on the step.
 ///
-/// Every sample is exactly [`bac_at`] at its instant: the sampling step never
-/// changes the integration (SPEC.md §10.0-I). The bounds of the `?step=` of
-/// the API, `[1 min, 1 h]`, and the window of SPEC.md §10.3 belong to the
-/// caller.
+/// Every sample is exactly [`bac_at`] at its instant. The bounds of the
+/// `?step=` of the API, `[1 min, 1 h]`, and the window of SPEC.md §10.3 belong
+/// to the caller.
 ///
 /// # Errors
 ///
@@ -135,14 +120,13 @@ pub fn bac_series<P: AbsorptionProfile + ?Sized>(
             to_seconds,
         });
     }
-    let mut walk = Walk::new(intakes, profile, rate);
+    let curve = Curve::new(intakes, profile, rate);
     let mut samples = Vec::new();
     let mut at = from_seconds;
     loop {
-        walk.advance_to(at);
         samples.push(BacSample {
             at_seconds: at,
-            bac_g_per_l: walk.value_at(at),
+            bac_g_per_l: curve.value_at(at),
         });
         match at.checked_add(step_seconds) {
             Some(next) if next <= to_seconds => at = next,
@@ -162,16 +146,16 @@ fn check_elimination_rate(g_per_l_per_h: f64) -> Result<f64, EngineError> {
 
 /// Hours in a number of seconds.
 fn hours(seconds: i64) -> f64 {
-    seconds as f64 / 3600.0
+    seconds as f64 / SECONDS_PER_HOUR
 }
 
-/// One drink, as the walk uses it.
+/// One drink, as the curve uses it.
 struct Course {
     start: i64,
     dose: Dose,
     /// `κ = 0.806 / TBW`, of the body water at the start of the drink.
     kappa: f64,
-    /// Elapsed hours after which the drink adds nothing any more.
+    /// Elapsed hours after which the whole dose is absorbed.
     absorbed_after_hours: f64,
 }
 
@@ -198,23 +182,22 @@ fn chronological(left: &Course, right: &Course) -> Ordering {
         .then(left.kappa.total_cmp(&right.kappa))
 }
 
-/// The forward integration, node after node. See the module documentation.
-struct Walk<'a, P: AbsorptionProfile + ?Sized> {
-    profile: &'a P,
-    elimination_rate: f64,
-    /// Every drink, in [`chronological`] order.
-    courses: Vec<Course>,
-    /// First drink not started yet.
-    next: usize,
-    /// Drinks started and still being absorbed, in [`chronological`] order.
-    active: Vec<usize>,
-    /// Last node reached.
-    at: i64,
-    /// Concentration at that node.
-    bac: f64,
+/// The drinks of one episode: `courses[first..end]`, opened at the start of
+/// the first one.
+struct Episode {
+    first: usize,
+    end: usize,
 }
 
-impl<'a, P: AbsorptionProfile + ?Sized> Walk<'a, P> {
+/// The drinks of a profile, sorted and split into episodes.
+struct Curve<'a, P: AbsorptionProfile + ?Sized> {
+    profile: &'a P,
+    elimination_rate: f64,
+    courses: Vec<Course>,
+    episodes: Vec<Episode>,
+}
+
+impl<'a, P: AbsorptionProfile + ?Sized> Curve<'a, P> {
     fn new(intakes: &[Intake], profile: &'a P, elimination_rate: f64) -> Self {
         let mut courses: Vec<Course> = intakes
             .iter()
@@ -226,104 +209,58 @@ impl<'a, P: AbsorptionProfile + ?Sized> Walk<'a, P> {
             })
             .collect();
         courses.sort_by(chronological);
-        // Nothing is in the blood before the first drink: the walk starts there.
-        let at = courses.first().map_or(i64::MIN, |course| course.start);
-        let mut walk = Self {
+
+        let mut episodes: Vec<Episode> = Vec::new();
+        // Of the episode under way: its start, the concentration all its
+        // drinks bring once absorbed, and its last end of absorption, in hours
+        // after its start.
+        let (mut opened_at, mut total, mut last_absorption) = (0_i64, 0.0_f64, 0.0_f64);
+        for (index, course) in courses.iter().enumerate() {
+            let since_opening = hours(course.start - opened_at);
+            // Past `max(E, Σ κA / β)`, the curve is at zero and nothing is
+            // being absorbed: the episode is over.
+            let over = since_opening >= last_absorption.max(total / elimination_rate);
+            match episodes.last_mut() {
+                Some(episode) if !over => episode.end = index + 1,
+                _ => {
+                    episodes.push(Episode {
+                        first: index,
+                        end: index + 1,
+                    });
+                    (opened_at, total, last_absorption) = (course.start, 0.0, 0.0);
+                }
+            }
+            total += course.kappa * course.dose.alcohol_grams();
+            last_absorption =
+                last_absorption.max(hours(course.start - opened_at) + course.absorbed_after_hours);
+        }
+
+        Self {
             profile,
             elimination_rate,
             courses,
-            next: 0,
-            active: Vec::new(),
-            at,
-            bac: 0.0,
+            episodes,
+        }
+    }
+
+    /// `max(0, raw(at))` in the last episode opened at or before `at`. Past
+    /// its end, `raw` is negative, so no special case is needed.
+    fn value_at(&self, at: i64) -> f64 {
+        let opened = self
+            .episodes
+            .partition_point(|episode| self.courses[episode.first].start <= at);
+        let Some(episode) = opened.checked_sub(1).map(|index| &self.episodes[index]) else {
+            return 0.0;
         };
-        walk.reach_node();
-        walk
-    }
-
-    /// Starts the drinks beginning at the current node — adding what they
-    /// bring at once, the whole dose for pure Widmark — and retires those that
-    /// have nothing left to bring.
-    fn reach_node(&mut self) {
-        while let Some(course) = self.courses.get(self.next) {
-            if course.start != self.at {
-                break;
-            }
-            self.bac += course.kappa * self.profile.absorbed_grams(&course.dose, 0.0);
-            self.active.push(self.next);
-            self.next += 1;
+        let opened_at = self.courses[episode.first].start;
+        let mut raw = 0.0;
+        for course in &self.courses[episode.first..episode.end] {
+            raw += course.kappa
+                * self
+                    .profile
+                    .absorbed_grams(&course.dose, hours(at - course.start));
         }
-        let (courses, at) = (&self.courses, self.at);
-        self.active.retain(|&index| {
-            let course = &courses[index];
-            hours(at - course.start) < course.absorbed_after_hours
-        });
-    }
-
-    /// The body holds no alcohol and none is on its way: the curve stays at
-    /// zero until the next drink, whatever the nodes in between.
-    fn is_idle(&self) -> bool {
-        self.bac == 0.0 && self.active.is_empty()
-    }
-
-    /// Concentration at `v`, integrated over one interval from the last node.
-    fn integrate_to(&self, v: i64) -> f64 {
-        let mut appeared = 0.0;
-        for &index in &self.active {
-            let course = &self.courses[index];
-            let before = self
-                .profile
-                .absorbed_grams(&course.dose, hours(self.at - course.start));
-            let after = self
-                .profile
-                .absorbed_grams(&course.dose, hours(v - course.start));
-            appeared += course.kappa * (after - before);
-        }
-        (self.bac + appeared - self.elimination_rate * hours(v - self.at)).max(0.0)
-    }
-
-    /// Moves to the last node at or before `target`. Nodes are the multiples
-    /// of [`INTEGRATION_STEP_SECONDS`] and the starts of the drinks.
-    fn advance_to(&mut self, target: i64) {
-        loop {
-            let next_start = self.courses.get(self.next).map(|course| course.start);
-            if self.is_idle() {
-                match next_start {
-                    // Skipping to the next drink yields the very zeros the
-                    // intervals in between would.
-                    Some(start) if start <= target => {
-                        self.at = start;
-                        self.reach_node();
-                        continue;
-                    }
-                    _ => return,
-                }
-            }
-            let next_node =
-                (self.at.div_euclid(INTEGRATION_STEP_SECONDS) + 1) * INTEGRATION_STEP_SECONDS;
-            let v = next_start.map_or(next_node, |start| start.min(next_node));
-            if v > target {
-                return;
-            }
-            self.bac = self.integrate_to(v);
-            self.at = v;
-            self.reach_node();
-        }
-    }
-
-    /// Concentration at `target`, read from the last node without making
-    /// `target` a node. [`Walk::advance_to`] is to be called with it first.
-    fn value_at(&self, target: i64) -> f64 {
-        if target < self.at {
-            // Only before the first drink.
-            0.0
-        } else if target == self.at {
-            self.bac
-        } else if self.is_idle() {
-            0.0
-        } else {
-            self.integrate_to(target)
-        }
+        (raw - self.elimination_rate * hours(at - opened_at)).max(0.0)
     }
 }
 
@@ -343,7 +280,7 @@ mod tests {
     const BETA: f64 = ELIMINATION_RATE_G_PER_L_PER_H;
     /// `C₀ = 0.806 × 19.725 / 45.8202`, pinned in `lib.rs`.
     const C0: f64 = 0.346_972_514_305_917_5;
-    /// A node of the integration grid: 29 333 334 minutes after the epoch.
+    /// A whole minute: 29 333 334 minutes after the epoch.
     const T0: i64 = 1_760_000_040;
     const MINUTE: i64 = 60;
     const HOUR: i64 = 3600;
@@ -381,7 +318,7 @@ mod tests {
     }
 
     /// Closed form of one drink alone, `κ × absorbed(τ) − β × τ`: the curve
-    /// without its floor.
+    /// as an episode of that drink alone computes it, before the display floor.
     fn closed_form(drink: &Intake, at: i64) -> f64 {
         let tau = (at - drink.started_at_seconds) as f64 / 3600.0;
         let absorbed = absorbed_alcohol_grams(
@@ -420,8 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn a_drink_off_the_grid_is_not_charged_for_the_time_before_it() {
-        // 17 s past a node: the first interval is cut at the drink.
+    fn a_drink_between_two_whole_minutes_counts_from_its_own_start() {
         let start = T0 + 17;
         let drinks = [at_once(start)];
         for elapsed in [0, 1, 43, 60 + 43, 1800, 7000] {
@@ -435,10 +371,10 @@ mod tests {
     }
 
     #[test]
-    fn a_later_drink_off_the_grid_counts_from_its_own_start() {
-        // The second drink starts 10 min 17 s after the first, between two
-        // nodes, while the first is still in the blood: from its start on, the
-        // curve is 2 C₀ − β × t, to the second.
+    fn a_later_drink_between_two_whole_minutes_counts_from_its_own_start() {
+        // The second drink starts 10 min 17 s after the first, while the first
+        // is still in the blood: from its start on, the curve is 2 C₀ − β × t,
+        // to the second.
         let second = T0 + 10 * MINUTE + 17;
         let drinks = [at_once(T0), at_once(second)];
         assert!(
@@ -472,15 +408,63 @@ mod tests {
     }
 
     #[test]
+    fn the_reference_trapezoid_peaks_at_0_227_g_per_l_after_45_7_minutes() {
+        // SPEC.md §10.1, through the engine: within an episode the curve is the
+        // closed form, elimination counted from the first sip, so its maximum
+        // is where κ × R = β, τ* = 0.761 281 516 635 374 h = 2740.61 s, at
+        // 0.227 376 400 558 264 47 g/L (both derived in `lib.rs`). Sampled
+        // every second, the highest sample is the second nearest τ*.
+        let drink = reference_drink(T0);
+        let curve =
+            bac_series(&[drink], &Trapezoid, BETA, T0, T0 + 2 * HOUR, 1).expect("valid inputs");
+        let peak = curve
+            .iter()
+            .copied()
+            .reduce(|best, sample| {
+                if sample.bac_g_per_l > best.bac_g_per_l {
+                    sample
+                } else {
+                    best
+                }
+            })
+            .expect("a non-empty series");
+        assert_eq!(
+            peak.at_seconds - T0,
+            2741,
+            "peak at {}",
+            peak.at_seconds - T0
+        );
+        assert!(
+            (peak.bac_g_per_l - closed_form(&drink, peak.at_seconds)).abs() < DERIVED,
+            "the peak is not on the closed form: {peak:?}"
+        );
+        assert!(
+            peak.bac_g_per_l <= 0.227_376_400_558_264_47 + DERIVED
+                && peak.bac_g_per_l > 0.227_376_400_558_264_47 - 1e-6,
+            "{peak:?}"
+        );
+        // §10.1 quotes 0.227 g/L at 45.7 min.
+        assert!(
+            (peak.bac_g_per_l - 0.227).abs() < 5e-4,
+            "disagrees with SPEC.md §10.1: {peak:?}"
+        );
+        assert!(
+            ((peak.at_seconds - T0) as f64 / 60.0 - 45.7).abs() < 0.05,
+            "disagrees with SPEC.md §10.1: {peak:?}"
+        );
+    }
+
+    #[test]
     fn a_rectangular_profile_follows_its_closed_form_while_above_zero() {
         // §6.4: a single zero duration gives a constant rate A / 50 min, whose
-        // κ × R = 0.416 g/L/h stays above β: the floor never engages before the
-        // return to zero, so the nodes carry the closed form exactly.
+        // κ × R = 0.416 g/L/h stays above β: the closed form is positive from
+        // the first second to the return to zero.
         for drink in [intake(T0, 0.0, 50.0 / 60.0), intake(T0, 50.0 / 60.0, 0.0)] {
-            for minutes in 0..=138 {
+            for minutes in 1..=138 {
                 let at = T0 + minutes * MINUTE;
                 let value = bac(&[drink], &Trapezoid, at);
                 let expected = closed_form(&drink, at);
+                assert!(expected > 0.0, "{drink:?} at {minutes} min");
                 assert!(
                     (value - expected).abs() < DERIVED,
                     "{drink:?} at {minutes} min: {value} instead of {expected}"
@@ -492,11 +476,11 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_only_ever_adds_to_the_closed_form() {
-        // The closed form goes negative while the first fractions appear
-        // slower than β eliminates; the floor holds the curve at zero there,
-        // and that elimination is never charged later. So the curve is never
-        // below its closed form, nor below zero — for every shape of §6.4.
+    fn a_single_drink_shows_its_closed_form_floored_at_zero() {
+        // Within one episode, only the displayed value is floored: the curve
+        // is max(0, κ × absorbed − β × τ) for every shape of §6.4 — zero while
+        // the first fractions appear slower than β eliminates, the closed form
+        // afterwards, zero again once eliminated.
         for (a, b) in [
             (INGESTION_HOURS, ABSORPTION_HOURS),
             (0.25, 0.25),
@@ -507,21 +491,24 @@ mod tests {
             for minutes in 0..=240 {
                 let at = T0 + minutes * MINUTE;
                 let value = bac(&[drink], &Trapezoid, at);
-                assert!(value >= 0.0, "a = {a}, b = {b}, {minutes} min: {value}");
+                let expected = closed_form(&drink, at).max(0.0);
                 assert!(
-                    value >= closed_form(&drink, at) - DERIVED,
-                    "a = {a}, b = {b}, {minutes} min: {value} below {}",
-                    closed_form(&drink, at)
+                    (value - expected).abs() < DERIVED,
+                    "a = {a}, b = {b}, {minutes} min: {value} instead of {expected}"
                 );
             }
         }
+        // The early rise of the trapezoid is shown at zero: one minute in,
+        // κ × A × τ² / (2ab) = 0.000 289 g/L, against 0.0025 g/L eliminated.
+        let drink = reference_drink(T0);
+        assert!(closed_form(&drink, T0 + MINUTE) < 0.0);
+        assert_eq!(bac(&[drink], &Trapezoid, T0 + MINUTE), 0.0);
     }
 
     #[test]
-    fn once_absorbed_every_shape_eliminates_at_beta_down_to_zero() {
-        // After a + b, all the dose is in (§6.4): the curve is a line of slope
-        // −β, at a constant credit above the closed form — the elimination the
-        // floor did not charge — until it reaches zero and stays there.
+    fn once_absorbed_every_shape_falls_on_c0_minus_beta_t() {
+        // §10.1: the variants converge after absorption, on C₀ − β × t from the
+        // first sip, down to zero, and stay there.
         for (a, b) in [
             (INGESTION_HOURS, ABSORPTION_HOURS),
             (0.25, 0.25),
@@ -529,26 +516,17 @@ mod tests {
             (0.0, 0.0),
         ] {
             let drink = intake(T0, a, b);
-            let end = T0 + ((a + b) * 3600.0).round() as i64;
-            let credit = bac(&[drink], &Trapezoid, end) - closed_form(&drink, end);
-            assert!(
-                (0.0..=BETA * (a + b)).contains(&credit),
-                "a = {a}, b = {b}: credit {credit}"
-            );
-            let mut at = end;
-            while closed_form(&drink, at + MINUTE) + credit > 0.0 {
-                let now = bac(&[drink], &Trapezoid, at);
-                let next = bac(&[drink], &Trapezoid, at + MINUTE);
+            let end = ((a + b) * 60.0).ceil() as i64;
+            for minutes in end..=138 {
+                let value = bac(&[drink], &Trapezoid, T0 + minutes * MINUTE);
+                let expected = C0 - BETA * minutes as f64 / 60.0;
                 assert!(
-                    (now - next - BETA / 60.0).abs() < DERIVED,
-                    "a = {a}, b = {b}: fell by {} at {}",
-                    now - next,
-                    at - T0
+                    (value - expected).abs() < DERIVED,
+                    "a = {a}, b = {b}, {minutes} min: {value} instead of {expected}"
                 );
-                at += MINUTE;
             }
-            assert_eq!(bac(&[drink], &Trapezoid, at + MINUTE), 0.0);
-            assert_eq!(bac(&[drink], &Trapezoid, at + 10 * HOUR), 0.0);
+            assert_eq!(bac(&[drink], &Trapezoid, T0 + 139 * MINUTE), 0.0);
+            assert_eq!(bac(&[drink], &Trapezoid, T0 + 10 * HOUR), 0.0);
         }
     }
 
@@ -581,9 +559,9 @@ mod tests {
             assert!(together >= bac(&[second], &Trapezoid, at));
         }
         // Both absorbed 65 min after the first: from there the curve falls by
-        // β per hour, not 2 β.
-        let mut minutes = 65;
-        while bac(&both, &Trapezoid, T0 + (minutes + 1) * MINUTE) > 0.0 {
+        // β per hour, not 2 β, down to zero at 2 C₀ / β = 277.6 min after the
+        // first sip.
+        for minutes in 65..277 {
             let now = bac(&both, &Trapezoid, T0 + minutes * MINUTE);
             let next = bac(&both, &Trapezoid, T0 + (minutes + 1) * MINUTE);
             assert!(
@@ -591,12 +569,50 @@ mod tests {
                 "fell by {} at {minutes} min",
                 now - next
             );
-            minutes += 1;
         }
-        // About twice one drink: the tail of two doses lasts about twice as
-        // long (277.6 min from the first sip, plus the second's 15 min offset
-        // and the floor's credit).
-        assert!(minutes > 277, "back to zero after {minutes} min");
+        assert_eq!(bac(&both, &Trapezoid, T0 + 278 * MINUTE), 0.0);
+    }
+
+    #[test]
+    fn a_drink_taken_while_another_is_absorbing_joins_its_episode() {
+        // One minute after the first sip, the curve shows zero — the closed
+        // form is negative — but the first drink is still being absorbed: the
+        // episode is not over, and the second drink inherits the elimination
+        // counted since the first sip.
+        let first = reference_drink(T0);
+        let second = at_once(T0 + MINUTE);
+        assert_eq!(bac(&[first], &Trapezoid, T0 + MINUTE), 0.0);
+        for minutes in 1..=200 {
+            let at = T0 + minutes * MINUTE;
+            let expected = (closed_form(&first, at) + C0).max(0.0);
+            let value = bac(&[first, second], &Trapezoid, at);
+            assert!(
+                (value - expected).abs() < DERIVED,
+                "{minutes} min: {value} instead of {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_episode_that_never_rose_ends_with_its_absorption() {
+        // 33 cL at 0.5 % drunk over two hours: κ × R stays far below β, the
+        // closed form is negative throughout and the curve shows zero. Once the
+        // dose is absorbed, the episode is over: a drink taken right after
+        // starts afresh, with no debt.
+        let mut light = intake(T0, 1.0, 1.0);
+        light.dose = Dose::new(ingested_alcohol_grams(330.0, 0.5), 1.0, 1.0).expect("valid");
+        let after = at_once(T0 + 2 * HOUR);
+        for minutes in 0..=120 {
+            assert_eq!(bac(&[light], &Trapezoid, T0 + minutes * MINUTE), 0.0);
+        }
+        for minutes in 0..=150 {
+            let at = T0 + 2 * HOUR + minutes * MINUTE;
+            assert_eq!(
+                bac(&[light, after], &Trapezoid, at).to_bits(),
+                bac(&[after], &Trapezoid, at).to_bits(),
+                "{minutes} min after the second drink"
+            );
+        }
     }
 
     #[test]
@@ -614,8 +630,9 @@ mod tests {
 
     #[test]
     fn a_return_to_zero_carries_no_debt_to_the_next_drink() {
-        // §6.3: once at zero, elimination stops. A drink taken five hours
-        // later yields exactly the curve it would yield alone — bit for bit.
+        // §6.3: once at zero with nothing left to absorb, the episode is over.
+        // A drink taken five hours later yields exactly the curve it would
+        // yield alone — bit for bit.
         let first = reference_drink(T0);
         let later = reference_drink(T0 + 5 * HOUR);
         assert_eq!(bac(&[first, later], &Trapezoid, T0 + 4 * HOUR), 0.0);
@@ -627,6 +644,31 @@ mod tests {
                 "{minutes} min after the second drink"
             );
         }
+    }
+
+    #[test]
+    fn a_second_evening_is_drawn_as_if_it_were_alone() {
+        // Two evenings of several overlapping drinks, three days apart: the
+        // second one owes nothing to the first.
+        let first_evening = an_evening();
+        let shift = 3 * 24 * HOUR;
+        let second_evening: Vec<Intake> = an_evening()
+            .into_iter()
+            .map(|mut drink| {
+                drink.started_at_seconds += shift;
+                drink
+            })
+            .collect();
+        let both: Vec<Intake> = first_evening
+            .iter()
+            .chain(&second_evening)
+            .copied()
+            .collect();
+        let (from, to) = (T0 + shift - HOUR, T0 + shift + 10 * HOUR);
+        let together = bac_series(&both, &Trapezoid, BETA, from, to, MINUTE).expect("valid");
+        let alone = bac_series(&second_evening, &Trapezoid, BETA, from, to, MINUTE).expect("valid");
+        assert_eq!(together, alone);
+        assert!(alone.iter().any(|sample| sample.bac_g_per_l > 0.2));
     }
 
     // ----- the body ---------------------------------------------------------

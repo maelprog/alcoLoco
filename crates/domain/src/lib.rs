@@ -14,8 +14,9 @@
 //!   [`absorption::AbsorptionProfile`] trait — the trapezoid is the default,
 //!   not a settled product decision (issue #37);
 //! * [`curve`] superposes the drinks of a profile (`Σ Rᵢ`, with `β` applied
-//!   once to the body), integrates them forward at a fixed step and floors the
-//!   result at zero (§6.5), at one instant or over a series.
+//!   once to the body), groups them into drinking episodes, computes each
+//!   episode in closed form and floors only the displayed value at zero
+//!   (§6.3, §6.5), at one instant or over a series.
 //!
 //! The [`drink`] module holds the drink and its components: their validation
 //! rules, the pure alcohol of a drink whatever its unit, and the name proposed
@@ -283,10 +284,9 @@ pub fn initial_bac_g_per_l(alcohol_grams: f64, body_water: BodyWater) -> f64 {
 /// Elimination is zero-order, so this is simply `C / β`, measured from the
 /// moment the concentration is `bac_g_per_l`. For a single drink taken at once
 /// (pure Widmark) the whole curve is `C₀ − β × t`, back to zero at `C₀ / β`
-/// after the ingestion time. With a spread absorption it is not: the floor at
-/// zero of SPEC.md §6.3 holds the curve at zero while the first fractions
-/// appear slower than `β` eliminates them, and that elimination is never
-/// charged. The whole curve is [`curve::bac_at`]'s.
+/// after the ingestion time. With a spread absorption, the curve of a single
+/// drink falls on the same line once the dose is absorbed (SPEC.md §10.1). The
+/// whole curve is [`curve::bac_at`]'s.
 ///
 /// The rate is a parameter so that tests can vary it, but the value used by the
 /// application is [`ELIMINATION_RATE_G_PER_L_PER_H`], and it is applied **once**
@@ -387,8 +387,8 @@ fn trapezoid_rate(alcohol_grams: f64, a: f64, b: f64, tau: f64) -> f64 {
 /// `a = b = 0`, where it steps from `0` to `A` at `τ = 0`.
 ///
 /// This is the quantity a curve needs: `κ × absorbed(τ)` is the concentration
-/// the drink has contributed so far. [`curve`] integrates its increments over
-/// the drinks of a profile, with the floor at zero.
+/// the drink has contributed so far. [`curve`] sums it over the drinks of an
+/// episode, before the display floor at zero.
 ///
 /// # Errors
 ///
@@ -514,8 +514,8 @@ mod tests {
     /// ingestion: `κ × absorbed(τ) − β × τ`.
     ///
     /// This composition belongs to the test, not to the crate: it is the
-    /// closed-form single-drink curve, without the floor at zero of §6.3. The
-    /// curve the engine draws, floor included, is `curve::bac_at`'s.
+    /// closed-form single-drink curve, before the display floor at zero of
+    /// §6.3. The curve the engine draws is `curve::bac_at`'s.
     fn ref_bac_at(ingestion_hours: f64, absorption_hours: f64, elapsed_hours: f64) -> f64 {
         let absorbed = absorbed_alcohol_grams(
             ref_alcohol_grams(),
@@ -857,9 +857,9 @@ mod tests {
 
     #[test]
     fn no_elimination_debt_is_carried_over_to_a_later_drink() {
-        // §6.3: the concentration is floored at zero, so nothing is owed once
-        // sober. The floored integration that shows this on a whole curve is
-        // tested in `curve`; what the bricks of this module can show is that
+        // §6.3: once an episode is over, nothing is owed to the next drink.
+        // The episodes that show this on a whole curve are tested in `curve`;
+        // what the bricks of this module can show is that
         // the sobering time of a drink depends on its own C₀ alone — the idle
         // hours since the previous drink are neither credited nor charged.
         let bac = initial_bac_g_per_l(ref_alcohol_grams(), ref_body_water_litres());
