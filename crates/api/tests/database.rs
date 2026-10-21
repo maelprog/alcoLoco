@@ -2402,22 +2402,14 @@ async fn record_drink(state: &AppState, profile: Uuid, payload: &Value) -> (Uuid
     (id, answer.body)
 }
 
-/// Creates an event the profile takes part in, straight in the database: the
-/// event endpoints are #18's.
-async fn event_with(pool: &sqlx::PgPool, profile: Uuid) -> Uuid {
-    let event = api::new_id();
-    sqlx::query("INSERT INTO public.event (id, name, starts_at) VALUES ($1, 'Soirée', now())")
-        .bind(event)
-        .execute(pool)
-        .await
-        .expect("the event must be written");
-    sqlx::query("INSERT INTO public.event_participant (event_id, profile_id) VALUES ($1, $2)")
-        .bind(event)
-        .bind(profile)
-        .execute(pool)
-        .await
-        .expect("the participant must be written");
-    event
+/// Creates an event the profile takes part in, through the event endpoints.
+async fn event_with(state: &AppState, profile: Uuid) -> Uuid {
+    let payload = serde_json::json!({
+        "name": "Soirée",
+        "starts_at": "2026-10-17T20:00:00Z",
+        "participant_ids": [profile.to_string()],
+    });
+    create_event(state, &payload).await.0
 }
 
 /// The drinks of a profile's history, as stored, oldest identifier first.
@@ -2501,7 +2493,7 @@ async fn a_drink_entered_from_an_event_is_in_the_history_of_the_profile() {
         return;
     };
     let (profile, _) = create_profile(&state, &a_sound_payload("Soirée")).await;
-    let event = event_with(&state.pool, profile).await;
+    let event = event_with(&state, profile).await;
 
     let mut payload = a_beer("Bière blonde", "2026-10-17T21:00:00Z");
     payload["event_id"] = Value::from(event.to_string());
@@ -2527,7 +2519,7 @@ async fn a_drink_may_not_name_an_event_its_profile_is_not_part_of() {
     };
     let (profile, _) = create_profile(&state, &a_sound_payload("Absent")).await;
     let (other, _) = create_profile(&state, &a_sound_payload("Présent")).await;
-    let event = event_with(&state.pool, other).await;
+    let event = event_with(&state, other).await;
 
     for event_id in [event, api::new_id()] {
         let mut payload = a_beer("Bière", "2026-10-17T21:00:00Z");
@@ -2635,7 +2627,7 @@ async fn a_modification_rewrites_what_it_names_and_keeps_the_rest() {
         return;
     };
     let (profile, _) = create_profile(&state, &a_sound_payload("Mixologie")).await;
-    let event = event_with(&state.pool, profile).await;
+    let event = event_with(&state, profile).await;
     let mut payload = serde_json::json!({
         "name": "Vodka – Jus d'orange",
         "ingested_at": "2026-10-17T21:00:00Z",
@@ -3025,7 +3017,7 @@ async fn the_history_serves_every_drink_of_the_profile_latest_ingestion_first() 
     let (profile, _) = create_profile(&state, &a_sound_payload("Historique")).await;
     let (other, _) = create_profile(&state, &a_sound_payload("Voisin")).await;
     record_drink(&state, other, &a_beer("Bière", "2026-10-17T21:30:00Z")).await;
-    let event = event_with(&state.pool, profile).await;
+    let event = event_with(&state, profile).await;
 
     let mut from_event = a_beer("Bière blonde", "2026-10-17T21:00:00Z");
     from_event["event_id"] = Value::from(event.to_string());
@@ -3157,7 +3149,7 @@ async fn the_history_filters_by_ingestion_time_and_by_event() {
         return;
     };
     let (profile, _) = create_profile(&state, &a_sound_payload("Filtres")).await;
-    let event = event_with(&state.pool, profile).await;
+    let event = event_with(&state, profile).await;
     let (at_20, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T20:00:00Z")).await;
     let mut payload = a_beer("Bière", "2026-10-17T21:00:00Z");
     payload["event_id"] = Value::from(event.to_string());
