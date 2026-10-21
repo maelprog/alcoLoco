@@ -613,6 +613,19 @@ mod tests {
                 "{minutes} min after the second drink"
             );
         }
+        // Whereas a drink taken while it is still being absorbed — one hour in,
+        // long after its whole dose would have been eliminated (Σ κA / β =
+        // 9.2 min) — joins it and inherits the elimination since its first sip.
+        let during = at_once(T0 + HOUR);
+        for minutes in 0..=60 {
+            let at = T0 + HOUR + minutes * MINUTE;
+            let expected = (closed_form(&light, at) + C0).max(0.0);
+            let value = bac(&[light, during], &Trapezoid, at);
+            assert!(
+                (value - expected).abs() < DERIVED,
+                "{minutes} min after the second drink: {value} instead of {expected}"
+            );
+        }
     }
 
     #[test]
