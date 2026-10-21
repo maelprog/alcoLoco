@@ -3609,15 +3609,28 @@ async fn the_events_are_walked_by_cursor_in_creation_order() {
     let Some(state) = migrated(name).await else {
         return;
     };
+    // The second event has a participant, which the list has to serve with
+    // it, as the read does.
+    let (profile, _) = create_profile(&state, &a_sound_payload("Listé")).await;
     let mut mine = Vec::new();
-    for label in ["Un", "Deux", "Trois"] {
+    for (label, participants) in [
+        ("Un", vec![]),
+        ("Deux", vec![profile.to_string()]),
+        ("Trois", vec![]),
+    ] {
         let (id, _) = create_event(
             &state,
-            &serde_json::json!({ "name": label, "starts_at": "2026-10-17T20:00:00Z" }),
+            &serde_json::json!({
+                "name": label,
+                "starts_at": "2026-10-17T20:00:00Z",
+                "participant_ids": participants,
+            }),
         )
         .await;
         mine.push(id);
     }
+    let mut listed_participants: std::collections::HashMap<Uuid, Vec<Uuid>> =
+        std::collections::HashMap::new();
 
     // Other tests create events meanwhile: walk the whole collection one
     // item at a time and keep ours.
@@ -3639,6 +3652,9 @@ async fn the_events_are_walked_by_cursor_in_creation_order() {
                 .expect("id");
             assert!(!seen.contains(&id), "{id} served twice");
             seen.push(id);
+            if mine.contains(&id) {
+                listed_participants.insert(id, participants_in(item));
+            }
         }
         match body["next_cursor"].as_str() {
             Some(next) => cursor = Some(next.to_owned()),
@@ -3647,6 +3663,9 @@ async fn the_events_are_walked_by_cursor_in_creation_order() {
     }
     let ours: Vec<Uuid> = seen.into_iter().filter(|id| mine.contains(id)).collect();
     assert_eq!(ours, mine);
+    assert!(listed_participants[&mine[0]].is_empty());
+    assert_eq!(listed_participants[&mine[1]], [profile]);
+    assert!(listed_participants[&mine[2]].is_empty());
 
     let answer = send(state, "GET", "/events?limit=0", None).await;
     assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
