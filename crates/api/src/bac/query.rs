@@ -122,8 +122,12 @@ fn read_step(errors: &mut Vec<FieldError>, step: Option<&str>) -> Option<i64> {
     let Some(text) = step else {
         return Some(DEFAULT_STEP_SECONDS);
     };
+    // Digits only: `i64::from_str` also takes a leading `+`.
+    let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
     match text.parse::<i64>() {
-        Ok(seconds) if (STEP_MIN_SECONDS..=STEP_MAX_SECONDS).contains(&seconds) => Some(seconds),
+        Ok(seconds) if digits && (STEP_MIN_SECONDS..=STEP_MAX_SECONDS).contains(&seconds) => {
+            Some(seconds)
+        }
         _ => {
             errors.push(FieldError::new(
                 "step",
@@ -374,7 +378,9 @@ mod tests {
         };
         assert_eq!(window("60").expect("the finest step").step, 60);
         assert_eq!(window("3600").expect("the coarsest step").step, 3600);
-        for refused in ["59", "3601", "0", "-60", "60.5", "", " ", "1e2"] {
+        for refused in [
+            "59", "3601", "0", "-60", "60.5", "", " ", "1e2", "+60", "+3600",
+        ] {
             let errors = window(refused).expect_err(refused);
             assert_eq!(fields(errors), ["step"], "step `{refused}`");
         }
