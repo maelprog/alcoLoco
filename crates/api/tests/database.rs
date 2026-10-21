@@ -3651,3 +3651,37 @@ async fn the_events_are_walked_by_cursor_in_creation_order() {
     let answer = send(state, "GET", "/events?limit=0", None).await;
     assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
 }
+
+#[tokio::test]
+async fn the_participants_are_served_in_the_order_they_were_added() {
+    // Added one by one in the reverse order of their identifiers: the order
+    // served is that of `joined_at`, not of the identifiers.
+    let name = "the_participants_are_served_in_the_order_they_were_added";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let mut profiles = Vec::new();
+    for label in ["Premier", "Deuxième", "Troisième"] {
+        profiles.push(create_profile(&state, &a_sound_payload(label)).await.0);
+    }
+    profiles.sort();
+    profiles.reverse();
+    let (event, _) = create_event(
+        &state,
+        &serde_json::json!({ "name": "Arrivées", "starts_at": "2026-10-17T20:00:00Z" }),
+    )
+    .await;
+    for profile in &profiles {
+        let answer = send(
+            state.clone(),
+            "PUT",
+            &format!("/events/{event}/participants/{profile}"),
+            None,
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+    }
+    let (status, read) = body_of(state, &format!("/events/{event}")).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(participants_in(&read), profiles, "{read}");
+}
