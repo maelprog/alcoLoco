@@ -217,7 +217,9 @@ impl ProfileBacQuery {
 impl EventBacQuery {
     /// The grid of an event: from its start to `min(now, end) + 3 h`, an
     /// open-ended event ending now (SPEC.md §10.3). Empty while the event has
-    /// not started.
+    /// not started, whatever its end: `to` is then the instant of the request,
+    /// earlier than `from` — even for an event starting within three hours,
+    /// where `now + 3 h` would otherwise reach past its start.
     ///
     /// # Errors
     ///
@@ -233,7 +235,11 @@ impl EventBacQuery {
         let step = read_step(&mut errors, self.step.as_deref());
         let end = ends_at.map_or(now, |ends_at| ends_at.min(now));
         let from = second_at_or_after(starts_at);
-        let to = second_at_or_before(end).saturating_add(DECAY_SECONDS);
+        let to = if now < starts_at {
+            second_at_or_before(now)
+        } else {
+            second_at_or_before(end).saturating_add(DECAY_SECONDS)
+        };
         match step.and_then(|step| bounded(&mut errors, Grid { from, to, step })) {
             Some(grid) => Ok(grid),
             None => Err(errors),
@@ -445,6 +451,26 @@ mod tests {
             .into_grid(at("2026-08-21T20:00:00Z"), None, at("2026-08-20T12:00:00Z"))
             .expect("valid");
         assert!(grid.is_empty());
+    }
+
+    #[test]
+    fn an_event_starting_within_the_decay_period_has_no_sample_yet() {
+        // Starting in an hour, `min(now, end) + 3 h` is already past the
+        // start: the window must still be empty until the event begins, and
+        // end at the instant of the request, whatever the end of the event.
+        let now = at("2026-08-20T19:00:00.5Z");
+        for ends_at in [None, Some(at("2026-08-21T02:00:00Z"))] {
+            let grid = EventBacQuery::default()
+                .into_grid(at("2026-08-20T20:00:00Z"), ends_at, now)
+                .expect("valid");
+            assert!(grid.is_empty(), "{ends_at:?}: {grid:?}");
+            assert_eq!(grid.to, seconds("2026-08-20T19:00:00Z"));
+        }
+        // Started half a second before the request: one sample, its start.
+        let grid = EventBacQuery::default()
+            .into_grid(at("2026-08-20T19:00:00Z"), None, now)
+            .expect("valid");
+        assert_eq!(grid.times().first(), Some(&at("2026-08-20T19:00:00Z")));
     }
 
     #[test]

@@ -4187,6 +4187,24 @@ async fn the_window_of_an_event_follows_now_until_its_end() {
     let (status, body) = body_of(state.clone(), &format!("/events/{later}/bac")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["times"], serde_json::json!([]));
+
+    // Starting in an hour, open-ended or not: no sample yet, although
+    // `now + 3 h` is past the start.
+    let in_an_hour = (chrono::Utc::now() + chrono::TimeDelta::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let in_five_hours = (chrono::Utc::now() + chrono::TimeDelta::hours(5))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    for ends_at in [Value::Null, Value::from(in_five_hours)] {
+        let (soon, _) = create_event(
+            &state,
+            &serde_json::json!({ "name": "Bientôt", "starts_at": in_an_hour, "ends_at": ends_at }),
+        )
+        .await;
+        let (status, body) = body_of(state.clone(), &format!("/events/{soon}/bac")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["times"], serde_json::json!([]), "{ends_at}: {body}");
+        assert_eq!(body["to"], body["computed_at"], "{body}");
+    }
 }
 
 #[tokio::test]

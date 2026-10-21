@@ -67,8 +67,9 @@ pub struct EventBac {
     #[schema(value_type = String, format = DateTime, example = "2026-08-20T20:00:00Z")]
     pub from: Timestamp,
     /// Last instant of the window: three hours after the end of the event or
-    /// after `computed_at`, whichever is earlier (SPEC.md §10.3). Earlier
-    /// than `from` while the event has not started, `times` being then empty.
+    /// after `computed_at`, whichever is earlier (SPEC.md §10.3). While the
+    /// event has not started — even if it starts within three hours — it is
+    /// `computed_at`, earlier than `from`, and `times` is empty.
     #[schema(value_type = String, format = DateTime, example = "2026-08-21T05:00:00Z")]
     pub to: Timestamp,
     /// Seconds between two samples.
