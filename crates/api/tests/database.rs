@@ -2433,8 +2433,8 @@ async fn component_count(pool: &sqlx::PgPool, drink: Uuid) -> i64 {
 /// drink brings once absorbed, before elimination — read back through the API
 /// and computed with the settings in force at each ingestion time.
 ///
-/// The engine of #16 does not exist yet; this is the part of its input a
-/// write of #14 decides, and the part that has to lose a deleted drink.
+/// Not the curve of `domain::curve`: only the part of its input a write of
+/// #14 decides, and the part that has to lose a deleted drink.
 async fn alcohol_of_history(state: &AppState, profile: Uuid) -> f64 {
     let mut total = 0.0;
     for id in history_of(&state.pool, profile).await {
