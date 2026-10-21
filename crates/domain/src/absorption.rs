@@ -72,9 +72,11 @@ impl Dose {
     ///
     /// [`Drink`] carries its volumes in millilitres. The database stores a
     /// quantity entered in cL as centilitres (migration `20261022090000`), and
-    /// the API reads it back as such; the conversion to millilitres happens
-    /// when the API builds the [`Drink`] from its own model (`ML_PER_CL` in
-    /// `api::drink::validation`). Nothing here converts it again.
+    /// the API reads it back as such. The API converts it to millilitres
+    /// (`ML_PER_CL`, in `api::drink::validation`) on both of its paths to a
+    /// [`Drink`]: the validation of a write (`DrinkRequest::validate`) and the
+    /// reading of a stored drink for a curve (`api::drink::Drink::to_domain`).
+    /// Nothing here converts it again.
     ///
     /// # Errors
     ///

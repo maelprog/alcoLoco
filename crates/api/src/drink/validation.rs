@@ -70,6 +70,17 @@ pub struct ValidDrink {
 /// counts volumes in millilitres, multiplied by this.
 pub const ML_PER_CL: f64 = 10.0;
 
+/// A component quantity as the API carries it — centilitres in cL, percent in
+/// percent — in the unit of the domain: millilitres in cL, percent in percent.
+/// The one place the conversion is written, for a write and for a stored
+/// drink read back alike.
+fn domain_quantity(unit: QuantityUnit, quantity: f64) -> f64 {
+    match unit {
+        QuantityUnit::Cl => quantity * ML_PER_CL,
+        QuantityUnit::Percent => quantity,
+    }
+}
+
 impl From<QuantityUnit> for domain::drink::QuantityUnit {
     fn from(unit: QuantityUnit) -> Self {
         match unit {
@@ -212,10 +223,7 @@ impl DrinkRequest {
                 components: components
                     .into_iter()
                     .map(|component| ComponentDraft {
-                        quantity: match unit {
-                            QuantityUnit::Cl => component.quantity * ML_PER_CL,
-                            QuantityUnit::Percent => component.quantity,
-                        },
+                        quantity: domain_quantity(unit, component.quantity),
                         ..component
                     })
                     .collect(),
@@ -244,6 +252,35 @@ impl DrinkRequest {
             }),
             _ => Err(ApiError::validation(errors)),
         }
+    }
+}
+
+impl Drink {
+    /// The stored drink as the domain counts it, for a computation: its
+    /// quantities converted to millilitres in cL, as a write converts them.
+    ///
+    /// # Errors
+    ///
+    /// The rules of the domain the stored drink breaks — none for a drink the
+    /// API and the database both accepted.
+    pub fn to_domain(&self) -> Result<domain::drink::Drink, Vec<DrinkError>> {
+        DrinkDraft {
+            name: self.name.clone(),
+            unit: self.quantity_unit.into(),
+            volume_total_ml: self.volume_total_ml,
+            ingestion_duration_seconds: i64::from(self.ingestion_duration_seconds),
+            absorption_duration_seconds: i64::from(self.absorption_duration_seconds),
+            components: self
+                .components
+                .iter()
+                .map(|component| ComponentDraft {
+                    name: component.name.clone(),
+                    abv_percent: component.abv_percent,
+                    quantity: domain_quantity(self.quantity_unit, component.quantity),
+                })
+                .collect(),
+        }
+        .validate()
     }
 }
 
@@ -859,6 +896,41 @@ mod tests {
         }
         .merge_onto(stored())
         .expect("the same unit is no change of unit");
+    }
+
+    #[test]
+    fn a_stored_drink_in_cl_reaches_the_domain_in_millilitres() {
+        // 40 cL of vodka and 160 cL of orange juice: 400 mL and 1600 mL.
+        let drink = stored().to_domain().expect("a stored drink is valid");
+        assert_eq!(drink.component_volumes_ml(), [400.0, 1600.0]);
+        assert_eq!(drink.unit(), domain::drink::QuantityUnit::Cl);
+        assert_eq!(drink.ingestion_duration_seconds(), 900);
+        assert_eq!(drink.absorption_duration_seconds(), 2400);
+        // The very drink a write builds from the same quantities.
+        let written = DrinkPatch::default()
+            .merge_onto(stored())
+            .expect("valid")
+            .drink;
+        assert_eq!(drink, written);
+    }
+
+    #[test]
+    fn a_stored_drink_in_percent_keeps_its_shares() {
+        let mut shares = stored();
+        shares.quantity_unit = QuantityUnit::Percent;
+        shares.volume_total_ml = Some(200.0);
+        shares.components[0].quantity = 20.0;
+        shares.components[1].quantity = 80.0;
+        let drink = shares.to_domain().expect("a stored drink is valid");
+        assert_eq!(drink.component_volumes_ml(), [40.0, 160.0]);
+        assert_eq!(drink.entered_volume_total_ml(), Some(200.0));
+    }
+
+    #[test]
+    fn a_stored_drink_breaking_a_rule_is_reported() {
+        let mut empty = stored();
+        empty.components.clear();
+        assert_eq!(empty.to_domain(), Err(vec![DrinkError::NoComponent]));
     }
 
     #[test]
