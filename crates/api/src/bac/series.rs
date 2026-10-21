@@ -16,7 +16,7 @@ use crate::error::ApiError;
 use crate::profile::{ProfileSettings, Sex};
 use crate::timestamp::Timestamp;
 
-use super::query::{Grid, second_at_or_before};
+use super::query::{Grid, minute_of};
 
 /// Days in a mean Gregorian year, to express an age in years.
 const DAYS_PER_YEAR: f64 = 365.2425;
@@ -52,27 +52,32 @@ pub fn age_years(birth_date: NaiveDate, at: Timestamp) -> Option<f64> {
 }
 
 /// Total body water at `at` for the settings in force then: Watson with the
-/// age at that instant, the Widmark fallback when no age exists yet (SPEC.md
-/// §6.2).
+/// age at that instant (SPEC.md §6.2). `None` before the birth date: a drink
+/// ingested then counts for nothing, without falling back on Widmark (user
+/// decision of 2026-10-21).
 ///
 /// # Errors
 ///
 /// [`EngineError::NonPositiveBodyWater`] when the estimate is not strictly
 /// positive.
-pub fn body_water(settings: &ProfileSettings, at: Timestamp) -> Result<BodyWater, EngineError> {
+pub fn body_water(
+    settings: &ProfileSettings,
+    at: Timestamp,
+) -> Result<Option<BodyWater>, EngineError> {
     let sex = match settings.sex {
         Sex::Male => domain::Sex::Male,
         Sex::Female => domain::Sex::Female,
     };
-    domain::total_body_water_litres(
-        sex,
-        settings.weight_kg,
-        Some(settings.height_cm),
-        age_years(settings.birth_date, at),
-    )
+    age_years(settings.birth_date, at)
+        .map(|age| {
+            domain::watson_total_body_water_litres(sex, settings.weight_kg, settings.height_cm, age)
+        })
+        .transpose()
 }
 
-/// The intake of one stored drink.
+/// The intake of one stored drink, starting at the minute of its ingestion,
+/// truncated; `None` for a drink ingested before the birth date, which counts
+/// for nothing.
 ///
 /// # Errors
 ///
@@ -81,7 +86,7 @@ pub fn body_water(settings: &ProfileSettings, at: Timestamp) -> Result<BodyWater
 /// and an internal failure when the drink is invalid or the profile owns no
 /// settings version, neither of which the database lets happen through the
 /// API.
-pub fn intake(profile: uuid::Uuid, stored: &StoredDrink) -> Result<Intake, ApiError> {
+pub fn intake(profile: uuid::Uuid, stored: &StoredDrink) -> Result<Option<Intake>, ApiError> {
     let drink = &stored.drink;
     let Some(settings) = &stored.settings else {
         return Err(ApiError::internal(format!(
@@ -94,22 +99,25 @@ pub fn intake(profile: uuid::Uuid, stored: &StoredDrink) -> Result<Intake, ApiEr
     })?;
     let dose = Dose::of_drink(&valid)
         .map_err(|error| ApiError::internal(format!("drink {}: {error}", drink.id)))?;
-    let body_water = body_water(settings, drink.ingested_at).map_err(|error| {
+    let Some(body_water) = body_water(settings, drink.ingested_at).map_err(|error| {
         ApiError::conflict(format!(
             "the settings of profile {profile} in force at {} give no positive body water \
              ({error}): its curve cannot be computed",
             drink.ingested_at
         ))
-    })?;
-    Ok(Intake {
-        started_at_seconds: second_at_or_before(drink.ingested_at),
+    })?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Intake {
+        started_at_seconds: minute_of(drink.ingested_at),
         dose,
         body_water,
-    })
+    }))
 }
 
-/// The current value at `now` and the series on `grid`, from the intakes of
-/// one profile.
+/// The current value at the minute of `now` and the series on `grid`, from
+/// the intakes of one profile.
 ///
 /// # Errors
 ///
@@ -121,7 +129,7 @@ pub fn values(intakes: &[Intake], grid: Grid, now: Timestamp) -> Result<Values, 
         intakes,
         &Trapezoid,
         ELIMINATION_RATE_G_PER_L_PER_H,
-        second_at_or_before(now),
+        minute_of(now),
     )
     .map_err(engine)?;
     let series = if grid.is_empty() {
@@ -232,19 +240,30 @@ mod tests {
             age_years(settings.birth_date, when).expect("born"),
         )
         .expect("positive");
-        assert_eq!(body_water(&settings, when), Ok(expected));
+        assert_eq!(body_water(&settings, when), Ok(Some(expected)));
         // Ten years later, the same settings give less water to a man.
-        let later = body_water(&settings, at("2036-08-20T21:00:00Z")).expect("positive");
+        let later = body_water(&settings, at("2036-08-20T21:00:00Z"))
+            .expect("positive")
+            .expect("born");
         assert!(later.litres() < expected.litres());
     }
 
     #[test]
-    fn before_the_birth_date_the_body_water_falls_back_on_widmark() {
+    fn a_drink_before_the_birth_date_counts_for_nothing() {
+        // User decision of 2026-10-21: no Widmark fallback, the value is 0.
         let settings = reference_settings();
-        assert_eq!(
-            body_water(&settings, at("1990-01-01T00:00:00Z")),
-            domain::widmark_total_body_water_litres(domain::Sex::Male, 80.0)
+        assert_eq!(body_water(&settings, at("1990-01-01T00:00:00Z")), Ok(None));
+        let unborn = intake(
+            uuid::Uuid::nil(),
+            &stored("1990-01-01T21:00:00Z", reference_settings()),
         );
+        assert!(matches!(unborn, Ok(None)), "{unborn:?}");
+        // On the day of the birth, it counts.
+        let born = intake(
+            uuid::Uuid::nil(),
+            &stored("1996-08-20T21:00:00Z", reference_settings()),
+        );
+        assert!(matches!(born, Ok(Some(_))), "{born:?}");
     }
 
     #[test]
@@ -274,9 +293,10 @@ mod tests {
         let settings = reference_settings();
         let made = intake(
             uuid::Uuid::nil(),
-            &stored("2026-08-20T21:00:00.900Z", settings.clone()),
+            &stored("2026-08-20T21:00:42.900Z", settings.clone()),
         )
-        .expect("an intake");
+        .expect("an intake")
+        .expect("born");
         // 50 cL at 5 %: 500 mL × 5 / 100 × 0.789.
         assert_eq!(
             made.dose.alcohol_grams(),
@@ -284,14 +304,14 @@ mod tests {
         );
         assert_eq!(made.dose.ingestion_hours(), 1200.0 / 3600.0);
         assert_eq!(made.dose.absorption_hours(), 1800.0 / 3600.0);
-        // The start is the second of the ingestion, rounded down.
+        // The start is the minute of the ingestion, truncated.
         assert_eq!(
             made.started_at_seconds,
             at("2026-08-20T21:00:00Z").timestamp()
         );
         assert_eq!(
-            Ok(made.body_water),
-            body_water(&settings, at("2026-08-20T21:00:00.900Z"))
+            Ok(Some(made.body_water)),
+            body_water(&settings, at("2026-08-20T21:00:42.900Z"))
         );
     }
 
@@ -305,9 +325,11 @@ mod tests {
             uuid::Uuid::nil(),
             &stored("2026-08-20T21:00:00Z", reference_settings()),
         )
-        .expect("an intake");
-        let second =
-            intake(uuid::Uuid::nil(), &stored("2026-08-20T21:00:00Z", heavier)).expect("an intake");
+        .expect("an intake")
+        .expect("born");
+        let second = intake(uuid::Uuid::nil(), &stored("2026-08-20T21:00:00Z", heavier))
+            .expect("an intake")
+            .expect("born");
         assert!(second.body_water.litres() > first.body_water.litres());
     }
 
@@ -335,7 +357,7 @@ mod tests {
                 &stored("2026-08-20T21:30:00Z", reference_settings()),
             ),
         ]
-        .map(|made| made.expect("an intake"));
+        .map(|made| made.expect("an intake").expect("born"));
         let window = grid("2026-08-20T20:00:00Z", "2026-08-21T03:00:00Z", 300);
         let now = at("2026-08-20T21:47:30.5Z");
         let computed = values(&intakes, window, now).expect("values");
@@ -363,7 +385,7 @@ mod tests {
                 &intakes,
                 &Trapezoid,
                 ELIMINATION_RATE_G_PER_L_PER_H,
-                at("2026-08-20T21:47:30Z").timestamp(),
+                at("2026-08-20T21:47:00Z").timestamp(),
             )
             .expect("a value")
         );
@@ -381,7 +403,8 @@ mod tests {
             uuid::Uuid::nil(),
             &stored("2026-08-20T21:00:00Z", reference_settings()),
         )
-        .expect("an intake")];
+        .expect("an intake")
+        .expect("born")];
         let window = grid("2026-08-20T21:00:00Z", "2026-08-20T23:00:00Z", 60);
         let series = values(&intakes, window, at("2026-08-20T21:00:00Z"))
             .expect("values")
@@ -410,7 +433,8 @@ mod tests {
             uuid::Uuid::nil(),
             &stored("2026-08-20T21:00:00Z", reference_settings()),
         )
-        .expect("an intake")];
+        .expect("an intake")
+        .expect("born")];
         let empty = Grid {
             from: 10,
             to: 0,

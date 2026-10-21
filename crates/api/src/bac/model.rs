@@ -16,19 +16,22 @@ use crate::timestamp::Timestamp;
 pub struct ProfileBac {
     /// Identifier of the profile.
     pub profile_id: Uuid,
-    /// Instant of the current value: the instant of the request, to the second.
-    #[schema(value_type = String, format = DateTime, example = "2026-08-20T23:04:05Z")]
+    /// Instant of the current value: the instant of the request, truncated
+    /// to the minute.
+    #[schema(value_type = String, format = DateTime, example = "2026-08-20T23:04:00Z")]
     pub computed_at: Timestamp,
     /// Blood alcohol concentration at `computed_at`, in grams per litre.
     pub current_bac_g_per_l: f64,
-    /// First instant of the window, `from` rounded up to the second.
+    /// First instant of the window, `from` truncated to the minute.
     #[schema(value_type = String, format = DateTime, example = "2026-08-20T20:00:00Z")]
     pub from: Timestamp,
-    /// Last instant of the window, `to` rounded down to the second; sampled
-    /// when it falls on the step.
+    /// Last instant of the window, `to` truncated to the minute; sampled when
+    /// it falls on the step.
     #[schema(value_type = String, format = DateTime, example = "2026-08-21T04:00:00Z")]
     pub to: Timestamp,
-    /// Seconds between two samples.
+    /// Seconds between two samples actually used: the step asked for, or,
+    /// when the answer would exceed its cap of 10 081 values, the smallest
+    /// multiple of 60 s that fits — possibly coarser than an hour.
     pub step_seconds: i64,
     /// Instants sampled, from `from` every `step_seconds`.
     #[schema(value_type = Vec<String>, example = json!(["2026-08-20T20:00:00Z", "2026-08-20T20:01:00Z"]))]
@@ -58,21 +61,25 @@ pub struct ParticipantBac {
 pub struct EventBac {
     /// Identifier of the event.
     pub event_id: Uuid,
-    /// Instant of the current values: the instant of the request, to the
-    /// second.
-    #[schema(value_type = String, format = DateTime, example = "2026-08-20T23:04:05Z")]
+    /// Instant of the current values: the instant of the request, truncated
+    /// to the minute.
+    #[schema(value_type = String, format = DateTime, example = "2026-08-20T23:04:00Z")]
     pub computed_at: Timestamp,
-    /// First instant of the window: the start of the event, rounded up to the
-    /// second.
+    /// First instant of the window: the start of the event, truncated to the
+    /// minute.
     #[schema(value_type = String, format = DateTime, example = "2026-08-20T20:00:00Z")]
     pub from: Timestamp,
-    /// Last instant of the window: three hours after the end of the event or
-    /// after `computed_at`, whichever is earlier (SPEC.md §10.3). While the
-    /// event has not started — even if it starts within three hours — it is
-    /// `computed_at`, earlier than `from`, and `times` is empty.
+    /// Last instant of the window: three hours after the end of the event,
+    /// or after `computed_at` while the event is open-ended (SPEC.md §10.3).
+    /// An event yet to start is sampled all the same, its participants having
+    /// possibly drunk before it; `times` is empty only when this instant is
+    /// earlier than `from`, i.e. for an open-ended event starting more than
+    /// three hours after the request.
     #[schema(value_type = String, format = DateTime, example = "2026-08-21T05:00:00Z")]
     pub to: Timestamp,
-    /// Seconds between two samples.
+    /// Seconds between two samples actually used: the step asked for, or,
+    /// when the answer would exceed its cap of 10 081 values, the smallest
+    /// multiple of 60 s that fits — possibly coarser than an hour.
     pub step_seconds: i64,
     /// Instants sampled, from `from` every `step_seconds`, shared by every
     /// participant.

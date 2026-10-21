@@ -163,8 +163,9 @@ pub async fn profile_drinks(
 /// The participants of an event and their drinks, or nothing when no event
 /// carries that identifier.
 ///
-/// `window` receives the start and the end of the event and answers the grid
-/// to sample, from which `before` is drawn: the drinks ingested from
+/// `window` receives the start and the end of the event and its number of
+/// participants — the cap of one answer counts every series — and answers the
+/// grid to sample, from which `before` is drawn: the drinks ingested from
 /// `before(grid)` on cannot change a value of the answer.
 ///
 /// # Errors
@@ -173,7 +174,7 @@ pub async fn profile_drinks(
 pub async fn event_drinks(
     pool: &PgPool,
     event_id: Uuid,
-    window: impl FnOnce(Timestamp, Option<Timestamp>) -> Result<Grid, ApiError>,
+    window: impl FnOnce(Timestamp, Option<Timestamp>, usize) -> Result<Grid, ApiError>,
     before: impl FnOnce(Grid) -> Result<Timestamp, ApiError>,
 ) -> Result<Option<EventDrinks>, ApiError> {
     let mut tx = pool.begin().await?;
@@ -185,8 +186,6 @@ pub async fn event_drinks(
     else {
         return Ok(None);
     };
-    let grid = window(event.try_get("starts_at")?, event.try_get("ends_at")?)?;
-
     let rows = sqlx::query(SELECT_PARTICIPANTS)
         .bind(event_id)
         .fetch_all(&mut *tx)
@@ -195,6 +194,11 @@ pub async fn event_drinks(
         .iter()
         .map(|row| row.try_get("profile_id"))
         .collect::<Result<_, _>>()?;
+    let grid = window(
+        event.try_get("starts_at")?,
+        event.try_get("ends_at")?,
+        ids.len(),
+    )?;
     let mut drinks = drinks_of(&mut tx, &ids, before(grid)?).await?;
     tx.commit().await?;
 

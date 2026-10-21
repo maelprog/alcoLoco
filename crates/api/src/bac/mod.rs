@@ -16,11 +16,15 @@
 //! - each drink is computed with the settings version in force at its
 //!   ingestion time and the age then (SPEC.md §5.6, §10.0-K);
 //! - every value is exact at its instant, so the step only thins out the
-//!   samples (SPEC.md §10.0-I); it is bounded to `[1 min, 1 h]` and a series
-//!   holds at most [`query::MAX_SAMPLES`] samples;
-//! - instants are counted in whole seconds: a drink starts at the second of
-//!   its ingestion, rounded down, and the current value is that of the second
-//!   of the request.
+//!   samples (SPEC.md §10.0-I); the step asked for is bounded to
+//!   `[1 min, 1 h]`, and one answer holds at most [`query::MAX_POINTS`]
+//!   values summed over its series, the step being widened to fit rather
+//!   than refused, and served as `step_seconds` ([`query::Grid::fitted`]);
+//! - instants are truncated to the minute: a drink starts at the minute of
+//!   its ingestion, and the current value is that of the minute of the
+//!   request;
+//! - a drink ingested before the birth date of its profile counts for
+//!   nothing (user decision of 2026-10-21).
 
 pub mod model;
 pub mod query;
@@ -38,7 +42,7 @@ use crate::timestamp::{self, Timestamp};
 use crate::{AppState, ProblemDetails};
 
 pub use model::{EventBac, ParticipantBac, ProfileBac};
-use query::{EventBacQuery, Grid, ProfileBacQuery, instant, second_at_or_before};
+use query::{EventBacQuery, Grid, MINUTE_SECONDS, ProfileBacQuery, instant, minute_of};
 
 /// Where the curve of a profile is served, in the path syntax of axum 0.8.
 pub const PROFILE_PATH: &str = "/profiles/{id}/bac";
@@ -56,8 +60,8 @@ fn at(seconds: i64) -> Result<Timestamp, ApiError> {
 /// a drink starting after both the window and the request changes no value
 /// of it.
 fn drinks_before(grid: Grid, now: Timestamp) -> Result<Timestamp, ApiError> {
-    at(grid.to.max(second_at_or_before(now)))?
-        .checked_add_signed(TimeDelta::seconds(1))
+    at(grid.to.max(minute_of(now)))?
+        .checked_add_signed(TimeDelta::seconds(MINUTE_SECONDS))
         .ok_or_else(|| ApiError::internal("no instant after the window"))
 }
 
@@ -90,11 +94,12 @@ pub async fn profile(
     let intakes = drinks
         .iter()
         .map(|drink| series::intake(profile_id, drink))
+        .filter_map(Result::transpose)
         .collect::<Result<Vec<_>, _>>()?;
     let values = series::values(&intakes, grid, now)?;
     Ok(Json(ProfileBac {
         profile_id,
-        computed_at: at(second_at_or_before(now))?,
+        computed_at: at(minute_of(now))?,
         current_bac_g_per_l: values.current,
         from: at(grid.from)?,
         to: at(grid.to)?,
@@ -130,9 +135,9 @@ pub async fn event(
     let event = store::event_drinks(
         &state.pool,
         event_id,
-        |starts_at, ends_at| {
+        |starts_at, ends_at, participants| {
             query
-                .into_grid(starts_at, ends_at, now)
+                .into_grid(starts_at, ends_at, now, participants)
                 .map_err(ApiError::validation)
         },
         |grid| drinks_before(grid, now),
@@ -149,6 +154,7 @@ pub async fn event(
                 .drinks
                 .iter()
                 .map(|drink| series::intake(participant.profile_id, drink))
+                .filter_map(Result::transpose)
                 .collect::<Result<Vec<_>, _>>()?;
             let values = series::values(&intakes, grid, now)?;
             Ok(ParticipantBac {
@@ -161,7 +167,7 @@ pub async fn event(
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(EventBac {
         event_id,
-        computed_at: at(second_at_or_before(now))?,
+        computed_at: at(minute_of(now))?,
         from: at(grid.from)?,
         to: at(grid.to)?,
         step_seconds: grid.step,
@@ -182,25 +188,29 @@ mod tests {
 
     #[test]
     fn the_drinks_read_reach_the_later_of_the_window_and_now() {
-        let now: Timestamp = "2026-08-20T22:00:00.4Z".parse().expect("a real instant");
+        let now: Timestamp = "2026-08-20T22:00:40.4Z".parse().expect("a real instant");
+        let minute = "2026-08-20T22:00:00Z"
+            .parse::<Timestamp>()
+            .expect("a real instant")
+            .timestamp();
         let window = Grid {
             from: 0,
-            to: now.timestamp() + 600,
+            to: minute + 600,
             step: 60,
         };
         assert_eq!(
             drinks_before(window, now).expect("an instant").timestamp(),
-            now.timestamp() + 601
+            minute + 660
         );
         let past = Grid {
             from: 0,
             to: 60,
             step: 60,
         };
-        // A drink started within the second of the request counts now.
+        // A drink started within the minute of the request counts now.
         assert_eq!(
             drinks_before(past, now).expect("an instant").timestamp(),
-            now.timestamp() + 1
+            minute + 60
         );
     }
 }

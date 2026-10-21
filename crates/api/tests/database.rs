@@ -3984,10 +3984,6 @@ async fn the_curve_of_a_profile_refuses_what_it_cannot_read() {
         (&*format!("{window}&step=59"), "step"),
         (&*format!("{window}&step=3601"), "step"),
         ("from=2025-08-21T00:00:00Z&to=2025-08-20T00:00:00Z", "to"),
-        (
-            "from=2025-01-01T00:00:00Z&to=2025-12-31T00:00:00Z&step=60",
-            "step",
-        ),
     ] {
         let (status, body) =
             body_of(state.clone(), &format!("/profiles/{profile}/bac?{query}")).await;
@@ -3995,6 +3991,29 @@ async fn the_curve_of_a_profile_refuses_what_it_cannot_read() {
         assert_eq!(body["type"], "/problems/validation_failed", "{query}");
         assert_eq!(body["errors"][0]["field"], field, "{query}: {body}");
     }
+
+    // A year at one minute exceeds the cap of one answer: the step is
+    // widened to the smallest multiple of a minute that fits, not refused.
+    let year = profile_curve(
+        &state,
+        profile,
+        "from=2025-01-01T00:00:00Z&to=2025-12-31T00:00:00Z&step=60",
+    )
+    .await;
+    let widened = year["step_seconds"].as_i64().expect("a step");
+    let samples = year["times"].as_array().expect("times").len();
+    assert_eq!(widened % 60, 0, "{widened}");
+    assert!(widened > 60);
+    assert!(samples <= 10_081, "{samples}");
+    assert_eq!(
+        year["bac_g_per_l"].as_array().expect("values").len(),
+        samples
+    );
+    let span = 364 * 24 * 3600;
+    assert!(
+        span / (widened - 60) + 1 > 10_081,
+        "a minute less would fit"
+    );
 
     // A profile that never drank is at zero everywhere.
     let body = profile_curve(&state, profile, &format!("{window}&step=3600")).await;
@@ -4188,23 +4207,51 @@ async fn the_window_of_an_event_follows_now_until_its_end() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["times"], serde_json::json!([]));
 
-    // Starting in an hour, open-ended or not: no sample yet, although
-    // `now + 3 h` is past the start.
-    let in_an_hour = (chrono::Utc::now() + chrono::TimeDelta::hours(1))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let in_five_hours = (chrono::Utc::now() + chrono::TimeDelta::hours(5))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    for ends_at in [Value::Null, Value::from(in_five_hours)] {
-        let (soon, _) = create_event(
-            &state,
-            &serde_json::json!({ "name": "Bientôt", "starts_at": in_an_hour, "ends_at": ends_at }),
-        )
-        .await;
-        let (status, body) = body_of(state.clone(), &format!("/events/{soon}/bac")).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["times"], serde_json::json!([]), "{ends_at}: {body}");
-        assert_eq!(body["to"], body["computed_at"], "{body}");
-    }
+    // Starting in an hour: sampled all the same, the participants having
+    // possibly drunk before (user decision of 2026-10-21). With a fixed end in
+    // five hours, up to three hours after it; open-ended, up to three hours
+    // after now.
+    let base = chrono::Utc::now();
+    let in_an_hour =
+        (base + chrono::TimeDelta::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let in_five_hours = base + chrono::TimeDelta::hours(5);
+    let fixed_end = in_five_hours.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (soon, _) = create_event(
+        &state,
+        &serde_json::json!({ "name": "Bientôt", "starts_at": in_an_hour, "ends_at": fixed_end }),
+    )
+    .await;
+    let (status, body) = body_of(state.clone(), &format!("/events/{soon}/bac")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let end: api::Timestamp = fixed_end.parse().expect("an instant");
+    let expected_to = api::Timestamp::from_timestamp(end.timestamp().div_euclid(60) * 60, 0)
+        .expect("an instant")
+        + chrono::TimeDelta::hours(3);
+    assert_eq!(body["to"], serde_json::json!(expected_to), "{body}");
+    // Seven hours, one value a minute.
+    assert_eq!(body["times"].as_array().expect("times").len(), 7 * 60 + 1);
+
+    let (open_soon, _) = create_event(
+        &state,
+        &serde_json::json!({ "name": "Bientôt, sans fin", "starts_at": in_an_hour }),
+    )
+    .await;
+    let (status, body) = body_of(state.clone(), &format!("/events/{open_soon}/bac")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let instant = |member: &str| {
+        body[member]
+            .as_str()
+            .and_then(|text| text.parse::<api::Timestamp>().ok())
+            .unwrap_or_else(|| panic!("no {member} in {body}"))
+    };
+    assert_eq!(
+        instant("to") - instant("computed_at"),
+        chrono::TimeDelta::hours(3)
+    );
+    assert!(
+        !body["times"].as_array().expect("times").is_empty(),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -4259,4 +4306,50 @@ async fn an_evening_of_ten_participants_and_twenty_drinks_each_is_served_quickly
         elapsed < std::time::Duration::from_secs(2),
         "an evening of 10 × 20 drinks took {elapsed:?}"
     );
+}
+
+#[tokio::test]
+async fn many_participants_widen_the_step_of_an_event_to_fit_the_cap() {
+    // User decision of 2026-10-21: one answer holds at most 10 081 values,
+    // summed over its series; beyond, the step is widened to the smallest
+    // multiple of a minute that fits, and served. Twenty participants over
+    // 6 h + 3 h at one minute would be 20 × 541 = 10 820 values; at two
+    // minutes, 20 × 271 = 5 420.
+    let name = "many_participants_widen_the_step_of_an_event_to_fit_the_cap";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let mut participants = Vec::new();
+    for index in 0..20 {
+        let (profile, _) =
+            create_profile(&state, &a_reference_man(&format!("Invité {index}"))).await;
+        participants.push(profile.to_string());
+    }
+    let (event, _) = create_event(
+        &state,
+        &serde_json::json!({
+            "name": "Foule",
+            "starts_at": "2025-05-10T20:00:00Z",
+            "ends_at": "2025-05-11T02:00:00Z",
+            "participant_ids": participants,
+        }),
+    )
+    .await;
+    let (status, body) = body_of(state.clone(), &format!("/events/{event}/bac")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["step_seconds"], 120, "{body}");
+    let times = body["times"].as_array().expect("times").len();
+    assert_eq!(times, 9 * 30 + 1);
+    let series = body["participants"].as_array().expect("participants");
+    assert_eq!(series.len(), 20);
+    for participant in series {
+        assert_eq!(
+            participant["bac_g_per_l"].as_array().expect("values").len(),
+            times
+        );
+    }
+    // A step asked for that already fits is kept.
+    let (status, coarse) = body_of(state, &format!("/events/{event}/bac?step=600")).await;
+    assert_eq!(status, StatusCode::OK, "{coarse}");
+    assert_eq!(coarse["step_seconds"], 600);
 }

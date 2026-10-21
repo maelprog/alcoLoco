@@ -311,7 +311,8 @@ C₀ (g/L de sang) = 0,806 × A / TBW
 soit, en notation de Widmark, `C₀ = A / (r × M)` avec `r = TBW / (0,806 × M)`.
 
 Repli : si l'âge ou la taille est indisponible, utiliser les constantes de Widmark historiques
-(`r` = 0,68 homme / 0,55 femme).
+(`r` = 0,68 homme / 0,55 femme). Une boisson ingérée avant la date de naissance n'est pas un âge
+indisponible : elle ne compte pas, sa contribution est nulle, sans repli (arbitrage du 2026-10-21).
 
 ### 6.3 Élimination
 
@@ -520,11 +521,20 @@ l'historique. À confirmer.
 
 - **Pas d'intégration interne : 1 min**, fixe. C'est lui qui détermine le résultat du calcul, et il
   n'est jamais exposé au client.
-- **Fenêtre** : durée de l'événement **+ 3 h** de décroissance. Pour un événement à fin ouverte,
-  la borne haute est `min(maintenant, fin) + 3 h`.
-- **`?step=` de `GET /profiles/{id}/bac` (#17)** : sous-échantillonne la série déjà intégrée,
-  **borné à [1 min, 1 h]**, valeur par défaut 1 min. Une valeur hors bornes est rejetée en 400. Ce
-  paramètre ne peut pas altérer le résultat du calcul — seulement la densité de points rendus.
+- **Fenêtre** : du début de l'événement à sa fin **+ 3 h** de décroissance, même si la fin fixée
+  est encore à venir. Pour un événement à fin ouverte, la borne haute est `maintenant + 3 h`. Un
+  événement pas encore commencé est échantillonné quand même, ses participants ayant pu boire
+  avant ; la série n'est vide que si la borne haute précède le début (arbitrages du 2026-10-21).
+- **`?step=` de `GET /profiles/{id}/bac` et `GET /events/{id}/bac` (#17)** : sous-échantillonne la
+  série, **borné à [1 min, 1 h]**, valeur par défaut 1 min. Une valeur hors bornes est rejetée en
+  400. Ce paramètre ne peut pas altérer le résultat du calcul — seulement la densité de points
+  rendus.
+- **Plafond par requête** : une réponse porte au plus **10 081 valeurs**, toutes séries confondues
+  (une semaine au pas d'une minute). Au-delà, le pas n'est pas refusé : il est élargi au plus petit
+  multiple d'une minute qui fait tenir le total, et la réponse indique le pas effectivement utilisé
+  (arbitrage du 2026-10-21).
+- **Instants** : tronqués à la minute — bornes de la fenêtre, début de chaque boisson, instant de
+  la valeur courante (arbitrage du 2026-10-21).
 
 Motif du plafond : sans borne, une soirée de 12 h à 10 participants demandée au pas de la seconde
 produit ~432 000 points par requête.
