@@ -2402,22 +2402,14 @@ async fn record_drink(state: &AppState, profile: Uuid, payload: &Value) -> (Uuid
     (id, answer.body)
 }
 
-/// Creates an event the profile takes part in, straight in the database: the
-/// event endpoints are #18's.
-async fn event_with(pool: &sqlx::PgPool, profile: Uuid) -> Uuid {
-    let event = api::new_id();
-    sqlx::query("INSERT INTO public.event (id, name, starts_at) VALUES ($1, 'Soirée', now())")
-        .bind(event)
-        .execute(pool)
-        .await
-        .expect("the event must be written");
-    sqlx::query("INSERT INTO public.event_participant (event_id, profile_id) VALUES ($1, $2)")
-        .bind(event)
-        .bind(profile)
-        .execute(pool)
-        .await
-        .expect("the participant must be written");
-    event
+/// Creates an event the profile takes part in, through the event endpoints.
+async fn event_with(state: &AppState, profile: Uuid) -> Uuid {
+    let payload = serde_json::json!({
+        "name": "Soirée",
+        "starts_at": "2026-10-17T20:00:00Z",
+        "participant_ids": [profile.to_string()],
+    });
+    create_event(state, &payload).await.0
 }
 
 /// The drinks of a profile's history, as stored, oldest identifier first.
@@ -2501,7 +2493,7 @@ async fn a_drink_entered_from_an_event_is_in_the_history_of_the_profile() {
         return;
     };
     let (profile, _) = create_profile(&state, &a_sound_payload("Soirée")).await;
-    let event = event_with(&state.pool, profile).await;
+    let event = event_with(&state, profile).await;
 
     let mut payload = a_beer("Bière blonde", "2026-10-17T21:00:00Z");
     payload["event_id"] = Value::from(event.to_string());
@@ -2527,7 +2519,7 @@ async fn a_drink_may_not_name_an_event_its_profile_is_not_part_of() {
     };
     let (profile, _) = create_profile(&state, &a_sound_payload("Absent")).await;
     let (other, _) = create_profile(&state, &a_sound_payload("Présent")).await;
-    let event = event_with(&state.pool, other).await;
+    let event = event_with(&state, other).await;
 
     for event_id in [event, api::new_id()] {
         let mut payload = a_beer("Bière", "2026-10-17T21:00:00Z");
@@ -2635,7 +2627,7 @@ async fn a_modification_rewrites_what_it_names_and_keeps_the_rest() {
         return;
     };
     let (profile, _) = create_profile(&state, &a_sound_payload("Mixologie")).await;
-    let event = event_with(&state.pool, profile).await;
+    let event = event_with(&state, profile).await;
     let mut payload = serde_json::json!({
         "name": "Vodka – Jus d'orange",
         "ingested_at": "2026-10-17T21:00:00Z",
@@ -3025,7 +3017,7 @@ async fn the_history_serves_every_drink_of_the_profile_latest_ingestion_first() 
     let (profile, _) = create_profile(&state, &a_sound_payload("Historique")).await;
     let (other, _) = create_profile(&state, &a_sound_payload("Voisin")).await;
     record_drink(&state, other, &a_beer("Bière", "2026-10-17T21:30:00Z")).await;
-    let event = event_with(&state.pool, profile).await;
+    let event = event_with(&state, profile).await;
 
     let mut from_event = a_beer("Bière blonde", "2026-10-17T21:00:00Z");
     from_event["event_id"] = Value::from(event.to_string());
@@ -3157,7 +3149,7 @@ async fn the_history_filters_by_ingestion_time_and_by_event() {
         return;
     };
     let (profile, _) = create_profile(&state, &a_sound_payload("Filtres")).await;
-    let event = event_with(&state.pool, profile).await;
+    let event = event_with(&state, profile).await;
     let (at_20, _) = record_drink(&state, profile, &a_beer("Bière", "2026-10-17T20:00:00Z")).await;
     let mut payload = a_beer("Bière", "2026-10-17T21:00:00Z");
     payload["event_id"] = Value::from(event.to_string());
@@ -3240,4 +3232,484 @@ async fn a_bound_finer_than_the_microsecond_keeps_its_inclusive_and_exclusive_si
     .await;
     assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
     assert_eq!(answer.body["errors"][0]["field"], "before");
+}
+
+// ---------------------------------------------------------------------------
+// Events (#18)
+// ---------------------------------------------------------------------------
+
+/// Creates an event through the API and answers its identifier and body.
+async fn create_event(state: &AppState, payload: &Value) -> (Uuid, Value) {
+    let answer = send(state.clone(), "POST", "/events", Some(payload.clone())).await;
+    assert_eq!(answer.status, StatusCode::CREATED, "{}", answer.body);
+    let id: Uuid = answer.body["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no identifier in {}", answer.body))
+        .parse()
+        .expect("the identifier must be a UUID");
+    assert_eq!(answer.location.as_deref(), Some(&*format!("/events/{id}")));
+    (id, answer.body)
+}
+
+/// The profile identifiers listed as participants of an event body.
+fn participants_in(body: &Value) -> Vec<Uuid> {
+    body["participants"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no participants in {body}"))
+        .iter()
+        .map(|p| {
+            p["profile_id"]
+                .as_str()
+                .and_then(|id| id.parse().ok())
+                .unwrap_or_else(|| panic!("no profile_id in {p}"))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_event_is_created_with_its_participants_read_and_replaced() {
+    let name = "an_event_is_created_with_its_participants_read_and_replaced";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (alice, _) = create_profile(&state, &a_sound_payload("Alice")).await;
+    let (bob, _) = create_profile(&state, &a_sound_payload("Bob")).await;
+
+    let (event, created) = create_event(
+        &state,
+        &serde_json::json!({
+            "name": "  Soirée chez Alice  ",
+            "starts_at": "2026-10-17T20:00:00Z",
+            "ends_at": "2026-10-18T03:00:00Z",
+            "participant_ids": [bob.to_string(), alice.to_string(), bob.to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(created["name"], "Soirée chez Alice");
+    assert_eq!(created["starts_at"], "2026-10-17T20:00:00Z");
+    assert_eq!(created["ends_at"], "2026-10-18T03:00:00Z");
+    // Added together, so ordered by identifier; a profile named twice once.
+    let mut both = vec![alice, bob];
+    both.sort();
+    assert_eq!(participants_in(&created), both);
+    let names: BTreeSet<&str> = created["participants"]
+        .as_array()
+        .expect("participants")
+        .iter()
+        .filter_map(|p| p["display_name"].as_str())
+        .collect();
+    assert_eq!(names, BTreeSet::from(["Alice", "Bob"]));
+
+    let (status, read) = body_of(state.clone(), &format!("/events/{event}")).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(read, created);
+
+    // A replacement rewrites the event, leaves its participants, and an
+    // absent end makes it open-ended.
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/events/{event}"),
+        Some(serde_json::json!({
+            "name": "Soirée prolongée",
+            "starts_at": "2026-10-17T21:00:00Z",
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["name"], "Soirée prolongée");
+    assert_eq!(answer.body["starts_at"], "2026-10-17T21:00:00Z");
+    assert!(answer.body["ends_at"].is_null(), "{}", answer.body);
+    assert_eq!(participants_in(&answer.body), both);
+
+    // Participants are not rewritten through the event, not even emptied.
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/events/{event}"),
+        Some(serde_json::json!({
+            "name": "Soirée",
+            "starts_at": "2026-10-17T21:00:00Z",
+            "participant_ids": [],
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "participant_ids");
+    let (_, read) = body_of(state.clone(), &format!("/events/{event}")).await;
+    assert_eq!(read["name"], "Soirée prolongée");
+    assert_eq!(participants_in(&read), both);
+
+    // An end before the start is a 400, never the constraint's 500.
+    let answer = send(
+        state,
+        "PUT",
+        &format!("/events/{event}"),
+        Some(serde_json::json!({
+            "name": "Soirée",
+            "starts_at": "2026-10-17T21:00:00Z",
+            "ends_at": "2026-10-17T20:59:59.999999Z",
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "ends_at");
+}
+
+#[tokio::test]
+async fn the_times_of_an_event_are_held_to_what_the_schema_accepts() {
+    // Ties the two rules `event::validation` restates to the live server: the
+    // earliest `timestamptz` is stored and an end equal to the start too,
+    // while the microsecond before the earliest is a field error, and an end
+    // one microsecond before the start is refused by
+    // `event_ends_after_it_starts` itself.
+    let name = "the_times_of_an_event_are_held_to_what_the_schema_accepts";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (event, created) = create_event(
+        &state,
+        &serde_json::json!({
+            "name": "Instantané",
+            "starts_at": "-4713-11-24T00:00:00Z",
+            "ends_at": "-4713-11-24T00:00:00Z",
+        }),
+    )
+    .await;
+    assert_eq!(created["starts_at"], "-4713-11-24T00:00:00Z");
+    assert_eq!(created["ends_at"], "-4713-11-24T00:00:00Z");
+
+    let error = sqlx::query(
+        "UPDATE public.event SET starts_at = '2026-10-17T21:00:00Z', \
+         ends_at = '2026-10-17T20:59:59.999999Z' WHERE id = $1",
+    )
+    .bind(event)
+    .execute(&state.pool)
+    .await
+    .expect_err("an end before the start must be refused");
+    let constraint = error
+        .as_database_error()
+        .and_then(|database| database.constraint().map(str::to_owned));
+    assert_eq!(constraint.as_deref(), Some("event_ends_after_it_starts"));
+
+    let answer = send(
+        state,
+        "POST",
+        "/events",
+        Some(serde_json::json!({
+            "name": "Préhistoire",
+            "starts_at": "-4713-11-23T23:59:59.999999Z",
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "starts_at");
+}
+
+#[tokio::test]
+async fn a_profile_may_take_part_in_several_events() {
+    // First acceptance criterion of #18.
+    let name = "a_profile_may_take_part_in_several_events";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Fêtard")).await;
+    let (first, _) = create_event(
+        &state,
+        &serde_json::json!({
+            "name": "Vendredi",
+            "starts_at": "2026-10-16T20:00:00Z",
+            "participant_ids": [profile.to_string()],
+        }),
+    )
+    .await;
+    let (second, created) = create_event(
+        &state,
+        &serde_json::json!({ "name": "Samedi", "starts_at": "2026-10-17T20:00:00Z" }),
+    )
+    .await;
+    assert!(participants_in(&created).is_empty(), "{created}");
+
+    // Adding is idempotent: twice is once.
+    for _ in 0..2 {
+        let answer = send(
+            state.clone(),
+            "PUT",
+            &format!("/events/{second}/participants/{profile}"),
+            None,
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+    }
+
+    for event in [first, second] {
+        let (status, body) = body_of(state.clone(), &format!("/events/{event}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(participants_in(&body), [profile], "{body}");
+    }
+
+    // And a drink may be recorded from either.
+    for event in [first, second] {
+        let mut payload = a_beer("Bière", "2026-10-17T21:00:00Z");
+        payload["event_id"] = Value::from(event.to_string());
+        let (_, body) = record_drink(&state, profile, &payload).await;
+        assert_eq!(body["event_id"], event.to_string());
+    }
+}
+
+#[tokio::test]
+async fn removing_a_participant_keeps_its_drinks_in_its_history() {
+    // Second acceptance criterion of #18.
+    let name = "removing_a_participant_keeps_its_drinks_in_its_history";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Partant")).await;
+    let (other, _) = create_profile(&state, &a_sound_payload("Restant")).await;
+    let (event, _) = create_event(
+        &state,
+        &serde_json::json!({
+            "name": "Soirée",
+            "starts_at": "2026-10-17T20:00:00Z",
+            "participant_ids": [profile.to_string(), other.to_string()],
+        }),
+    )
+    .await;
+    let mut payload = a_beer("Bière", "2026-10-17T21:00:00Z");
+    payload["event_id"] = Value::from(event.to_string());
+    let (drink, _) = record_drink(&state, profile, &payload).await;
+    let (kept, _) = record_drink(&state, other, &payload).await;
+
+    let uri = format!("/events/{event}/participants/{profile}");
+    let answer = send(state.clone(), "DELETE", &uri, None).await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+
+    // The drink is still in the history, detached from the event.
+    assert_eq!(history_of(&state.pool, profile).await, [drink]);
+    let (status, body) = body_of(state.clone(), &format!("/drinks/{drink}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["event_id"].is_null(), "{body}");
+    // The other participant and its drink are untouched.
+    let (_, body) = body_of(state.clone(), &format!("/drinks/{kept}")).await;
+    assert_eq!(body["event_id"], event.to_string());
+    let (_, read) = body_of(state.clone(), &format!("/events/{event}")).await;
+    assert_eq!(participants_in(&read), [other]);
+
+    // No longer a participant: a second removal is a 404, and the event can
+    // no longer be named by its drinks.
+    let answer = send(state.clone(), "DELETE", &uri, None).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
+    assert_eq!(answer.media_type, api::error::PROBLEM_JSON);
+    let answer = send(
+        state.clone(),
+        "POST",
+        &format!("/profiles/{profile}/drinks"),
+        Some(payload),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.body["errors"][0]["field"], "event_id");
+}
+
+#[tokio::test]
+async fn an_unknown_event_or_profile_is_reported_and_nothing_is_written() {
+    let name = "an_unknown_event_or_profile_is_reported_and_nothing_is_written";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_sound_payload("Connu")).await;
+    let unknown = api::new_id();
+    let label = format!("Fantôme {unknown}");
+
+    let answer = send(
+        state.clone(),
+        "POST",
+        "/events",
+        Some(serde_json::json!({
+            "name": label,
+            "starts_at": "2026-10-17T20:00:00Z",
+            "participant_ids": [profile.to_string(), unknown.to_string()],
+        })),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    let errors = answer.body["errors"].as_array().expect("errors");
+    assert_eq!(errors.len(), 1, "{}", answer.body);
+    assert_eq!(errors[0]["field"], "participant_ids");
+    assert!(
+        errors[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(&unknown.to_string())),
+        "{}",
+        answer.body
+    );
+    let written: i64 = sqlx::query_scalar("SELECT count(*) FROM public.event WHERE name = $1")
+        .bind(&label)
+        .fetch_one(&state.pool)
+        .await
+        .expect("the count must run");
+    assert_eq!(written, 0, "a refused creation writes no event");
+
+    let (event, _) = create_event(
+        &state,
+        &serde_json::json!({ "name": "Réelle", "starts_at": "2026-10-17T20:00:00Z" }),
+    )
+    .await;
+    let no_event = format!("no event with identifier {unknown}");
+    let no_profile = format!("no profile with identifier {unknown}");
+    let not_taking_part = format!("profile {profile} does not take part in event {event}");
+    for (method, uri, payload, detail) in [
+        ("GET", format!("/events/{unknown}"), None, &no_event),
+        (
+            "PUT",
+            format!("/events/{unknown}"),
+            Some(serde_json::json!({ "name": "X", "starts_at": "2026-10-17T20:00:00Z" })),
+            &no_event,
+        ),
+        (
+            "PUT",
+            format!("/events/{unknown}/participants/{profile}"),
+            None,
+            &no_event,
+        ),
+        (
+            "PUT",
+            format!("/events/{event}/participants/{unknown}"),
+            None,
+            &no_profile,
+        ),
+        (
+            "DELETE",
+            format!("/events/{unknown}/participants/{profile}"),
+            None,
+            &no_event,
+        ),
+        (
+            "DELETE",
+            format!("/events/{event}/participants/{profile}"),
+            None,
+            &not_taking_part,
+        ),
+    ] {
+        let answer = send(state.clone(), method, &uri, payload).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::NOT_FOUND,
+            "{method} {uri}: {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.media_type,
+            api::error::PROBLEM_JSON,
+            "{method} {uri}"
+        );
+        assert_eq!(answer.body["detail"], *detail, "{method} {uri}");
+    }
+    let (_, read) = body_of(state.clone(), &format!("/events/{event}")).await;
+    assert!(participants_in(&read).is_empty(), "{read}");
+
+    let answer = send(state, "GET", "/events/not-a-uuid", None).await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+}
+
+#[tokio::test]
+async fn the_events_are_walked_by_cursor_in_creation_order() {
+    let name = "the_events_are_walked_by_cursor_in_creation_order";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    // The second event has a participant, which the list has to serve with
+    // it, as the read does.
+    let (profile, _) = create_profile(&state, &a_sound_payload("Listé")).await;
+    let mut mine = Vec::new();
+    for (label, participants) in [
+        ("Un", vec![]),
+        ("Deux", vec![profile.to_string()]),
+        ("Trois", vec![]),
+    ] {
+        let (id, _) = create_event(
+            &state,
+            &serde_json::json!({
+                "name": label,
+                "starts_at": "2026-10-17T20:00:00Z",
+                "participant_ids": participants,
+            }),
+        )
+        .await;
+        mine.push(id);
+    }
+    let mut listed_participants: std::collections::HashMap<Uuid, Vec<Uuid>> =
+        std::collections::HashMap::new();
+
+    // Other tests create events meanwhile: walk the whole collection one
+    // item at a time and keep ours.
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let uri = match &cursor {
+            None => "/events?limit=1".to_owned(),
+            Some(cursor) => format!("/events?limit=1&cursor={cursor}"),
+        };
+        let (status, body) = body_of(state.clone(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let items = body["items"].as_array().expect("items");
+        assert!(items.len() <= 1, "{body}");
+        for item in items {
+            let id: Uuid = item["id"]
+                .as_str()
+                .and_then(|id| id.parse().ok())
+                .expect("id");
+            assert!(!seen.contains(&id), "{id} served twice");
+            seen.push(id);
+            if mine.contains(&id) {
+                listed_participants.insert(id, participants_in(item));
+            }
+        }
+        match body["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    let ours: Vec<Uuid> = seen.into_iter().filter(|id| mine.contains(id)).collect();
+    assert_eq!(ours, mine);
+    assert!(listed_participants[&mine[0]].is_empty());
+    assert_eq!(listed_participants[&mine[1]], [profile]);
+    assert!(listed_participants[&mine[2]].is_empty());
+
+    let answer = send(state, "GET", "/events?limit=0", None).await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+}
+
+#[tokio::test]
+async fn the_participants_are_served_in_the_order_they_were_added() {
+    // Added one by one in the reverse order of their identifiers: the order
+    // served is that of `joined_at`, not of the identifiers.
+    let name = "the_participants_are_served_in_the_order_they_were_added";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let mut profiles = Vec::new();
+    for label in ["Premier", "Deuxième", "Troisième"] {
+        profiles.push(create_profile(&state, &a_sound_payload(label)).await.0);
+    }
+    profiles.sort();
+    profiles.reverse();
+    let (event, _) = create_event(
+        &state,
+        &serde_json::json!({ "name": "Arrivées", "starts_at": "2026-10-17T20:00:00Z" }),
+    )
+    .await;
+    for profile in &profiles {
+        let answer = send(
+            state.clone(),
+            "PUT",
+            &format!("/events/{event}/participants/{profile}"),
+            None,
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+    }
+    let (status, read) = body_of(state, &format!("/events/{event}")).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(participants_in(&read), profiles, "{read}");
 }
