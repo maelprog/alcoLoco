@@ -39,7 +39,7 @@
 use std::cmp::Ordering;
 
 use crate::absorption::{AbsorptionProfile, Dose};
-use crate::{BodyWater, EngineError, initial_bac_g_per_l};
+use crate::{BodyWater, EngineError, check_duration, initial_bac_g_per_l};
 
 /// Seconds in an hour.
 const SECONDS_PER_HOUR: f64 = 3600.0;
@@ -76,7 +76,10 @@ pub struct BacSample {
 /// # Errors
 ///
 /// [`EngineError::InvalidEliminationRate`] when `elimination_rate_g_per_l_per_h`
-/// is not a finite, strictly positive number.
+/// is not a finite, strictly positive number, and
+/// [`EngineError::InvalidDuration`] when the profile declares, for one of the
+/// drinks, a time of full absorption that is negative or not finite: the
+/// episode of that drink could never end.
 pub fn bac_at<P: AbsorptionProfile + ?Sized>(
     intakes: &[Intake],
     profile: &P,
@@ -84,7 +87,7 @@ pub fn bac_at<P: AbsorptionProfile + ?Sized>(
     at_seconds: i64,
 ) -> Result<f64, EngineError> {
     let rate = check_elimination_rate(elimination_rate_g_per_l_per_h)?;
-    let curve = Curve::new(intakes, profile, rate);
+    let curve = Curve::new(intakes, profile, rate)?;
     Ok(curve.value_at(at_seconds))
 }
 
@@ -97,7 +100,8 @@ pub fn bac_at<P: AbsorptionProfile + ?Sized>(
 ///
 /// # Errors
 ///
-/// [`EngineError::InvalidEliminationRate`] as for [`bac_at`],
+/// [`EngineError::InvalidEliminationRate`] and [`EngineError::InvalidDuration`]
+/// as for [`bac_at`],
 /// [`EngineError::NonPositiveStep`] when `step_seconds` is not positive and
 /// [`EngineError::ReversedWindow`] when `to_seconds < from_seconds`.
 pub fn bac_series<P: AbsorptionProfile + ?Sized>(
@@ -120,7 +124,7 @@ pub fn bac_series<P: AbsorptionProfile + ?Sized>(
             to_seconds,
         });
     }
-    let curve = Curve::new(intakes, profile, rate);
+    let curve = Curve::new(intakes, profile, rate)?;
     let mut samples = Vec::new();
     let mut at = from_seconds;
     loop {
@@ -198,16 +202,21 @@ struct Curve<'a, P: AbsorptionProfile + ?Sized> {
 }
 
 impl<'a, P: AbsorptionProfile + ?Sized> Curve<'a, P> {
-    fn new(intakes: &[Intake], profile: &'a P, elimination_rate: f64) -> Self {
-        let mut courses: Vec<Course> = intakes
+    fn new(intakes: &[Intake], profile: &'a P, elimination_rate: f64) -> Result<Self, EngineError> {
+        let mut courses = intakes
             .iter()
-            .map(|intake| Course {
-                start: intake.started_at_seconds,
-                dose: intake.dose,
-                kappa: initial_bac_g_per_l(1.0, intake.body_water),
-                absorbed_after_hours: profile.fully_absorbed_after_hours(&intake.dose),
+            .map(|intake| {
+                Ok(Course {
+                    start: intake.started_at_seconds,
+                    dose: intake.dose,
+                    kappa: initial_bac_g_per_l(1.0, intake.body_water),
+                    // An infinite time would keep the episode open forever.
+                    absorbed_after_hours: check_duration(
+                        profile.fully_absorbed_after_hours(&intake.dose),
+                    )?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<Course>, EngineError>>()?;
         courses.sort_by(chronological);
 
         let mut episodes: Vec<Episode> = Vec::new();
@@ -235,12 +244,12 @@ impl<'a, P: AbsorptionProfile + ?Sized> Curve<'a, P> {
                 last_absorption.max(hours(course.start - opened_at) + course.absorbed_after_hours);
         }
 
-        Self {
+        Ok(Self {
             profile,
             elimination_rate,
             courses,
             episodes,
-        }
+        })
     }
 
     /// `max(0, raw(at))` in the last episode opened at or before `at`. Past
@@ -879,6 +888,97 @@ mod tests {
         // And the trapezoid itself tells another story before its peak.
         let trapezoid = bac(&drinks, &Trapezoid, T0 + 20 * MINUTE);
         assert!((trapezoid - ramp[20].bac_g_per_l).abs() > 1e-3);
+    }
+
+    /// First-order absorption, `A × (1 − e^(−k τ))` with `k = 3 / t_abs`, the
+    /// fourth variant of §10.1. It only tends to the whole dose, so it declares
+    /// a cut-off: past `10 / k`, the remainder `e^(−10)` is deemed negligible
+    /// and the whole dose is returned.
+    struct Exponential;
+
+    impl Exponential {
+        fn rate(dose: &Dose) -> f64 {
+            3.0 / dose.absorption_hours()
+        }
+    }
+
+    impl AbsorptionProfile for Exponential {
+        fn absorbed_grams(&self, dose: &Dose, elapsed_hours: f64) -> f64 {
+            if elapsed_hours < 0.0 {
+                0.0
+            } else if elapsed_hours >= self.fully_absorbed_after_hours(dose) {
+                dose.alcohol_grams()
+            } else {
+                dose.alcohol_grams() * (1.0 - (-Self::rate(dose) * elapsed_hours).exp())
+            }
+        }
+
+        fn fully_absorbed_after_hours(&self, dose: &Dose) -> f64 {
+            10.0 / Self::rate(dose)
+        }
+    }
+
+    #[test]
+    fn an_asymptotic_profile_with_a_cut_off_still_ends_its_episodes() {
+        // The second of two evenings three days apart is drawn as if alone,
+        // whatever the profile, as long as it declares when it is done.
+        let first_evening = an_evening();
+        let shift = 3 * 24 * HOUR;
+        let second_evening: Vec<Intake> = an_evening()
+            .into_iter()
+            .map(|mut drink| {
+                drink.started_at_seconds += shift;
+                drink
+            })
+            .collect();
+        let both: Vec<Intake> = first_evening
+            .iter()
+            .chain(&second_evening)
+            .copied()
+            .collect();
+        let (from, to) = (T0 + shift - HOUR, T0 + shift + 10 * HOUR);
+        let together = bac_series(&both, &Exponential, BETA, from, to, MINUTE).expect("valid");
+        let alone =
+            bac_series(&second_evening, &Exponential, BETA, from, to, MINUTE).expect("valid");
+        assert_eq!(together, alone);
+        assert!(alone.iter().any(|sample| sample.bac_g_per_l > 0.2));
+    }
+
+    /// A profile that never declares the dose absorbed.
+    struct Endless(f64);
+
+    impl AbsorptionProfile for Endless {
+        fn absorbed_grams(&self, dose: &Dose, elapsed_hours: f64) -> f64 {
+            Exponential.absorbed_grams(dose, elapsed_hours.min(1.0))
+        }
+
+        fn fully_absorbed_after_hours(&self, _dose: &Dose) -> f64 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn a_profile_without_a_finite_end_of_absorption_is_refused() {
+        // Its episodes could never end: a later evening would inherit the
+        // elimination of every earlier one.
+        let drinks = [reference_drink(T0)];
+        for end in [f64::INFINITY, f64::NAN, -1.0] {
+            assert!(
+                matches!(
+                    bac_at(&drinks, &Endless(end), BETA, T0 + HOUR),
+                    Err(EngineError::InvalidDuration { .. })
+                ),
+                "an end of absorption at {end} h was accepted"
+            );
+            assert!(
+                matches!(
+                    bac_series(&drinks, &Endless(end), BETA, T0, T0 + HOUR, MINUTE),
+                    Err(EngineError::InvalidDuration { .. })
+                ),
+                "an end of absorption at {end} h was accepted"
+            );
+        }
+        assert!(bac_at(&drinks, &Endless(2.0), BETA, T0 + HOUR).is_ok());
     }
 
     #[test]

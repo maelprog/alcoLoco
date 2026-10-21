@@ -8,7 +8,12 @@
 //! [`AbsorptionProfile`] trait, so trying another model — pure Widmark, a
 //! linear ramp, a first-order exponential absorption, the candidates #37 is to
 //! confront on real curves — costs an implementation of that trait and nothing
-//! else. Two are provided: [`Trapezoid`], the default, and [`PureWidmark`],
+//! else. A profile must declare a **finite** time after which the dose is
+//! wholly absorbed, since a drinking episode only ends once nothing is left to
+//! absorb: an asymptotic profile, such as the exponential one, declares a
+//! cut-off — the time after which the unabsorbed remainder is deemed
+//! negligible — and returns the whole dose from there on. Choosing that
+//! cut-off is part of choosing the profile, in #37. Two are provided: [`Trapezoid`], the default, and [`PureWidmark`],
 //! which ignores both durations, so that the same drinks can be compared under
 //! both.
 //!
@@ -119,7 +124,11 @@ impl Dose {
 ///   time, never decreases, and never exceeds the mass of the dose;
 /// * it equals that mass from
 ///   [`fully_absorbed_after_hours`](Self::fully_absorbed_after_hours) on, a
-///   time which may be [`f64::INFINITY`] for a profile that only tends to it;
+///   time which must be **finite** and non-negative — the engine refuses any
+///   other with [`EngineError::InvalidDuration`]. A profile that only tends to
+///   the whole dose declares a cut-off past which the remainder is deemed
+///   negligible, and returns the whole dose from there (see the module
+///   documentation; the cut-off belongs to #37);
 /// * it is a pure function of its arguments, so that a curve can be replayed
 ///   bit for bit (SPEC.md §7).
 pub trait AbsorptionProfile {
@@ -130,7 +139,8 @@ pub trait AbsorptionProfile {
     /// instantaneous intake — a Dirac rate — is a plain step of the primitive.
     fn absorbed_grams(&self, dose: &Dose, elapsed_hours: f64) -> f64;
 
-    /// Elapsed time, in hours, after which the whole dose is absorbed.
+    /// Elapsed time, in hours, after which the whole dose is absorbed: finite
+    /// and non-negative.
     fn fully_absorbed_after_hours(&self, dose: &Dose) -> f64;
 }
 
