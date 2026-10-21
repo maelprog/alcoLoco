@@ -33,6 +33,12 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         crate::drink::read,
         crate::drink::update,
         crate::drink::delete,
+        crate::event::list,
+        crate::event::read,
+        crate::event::create,
+        crate::event::update,
+        crate::event::add_participant,
+        crate::event::remove_participant,
     ),
     components(schemas(
         crate::drink::Component,
@@ -41,6 +47,9 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         crate::drink::DrinkPatch,
         crate::drink::DrinkRequest,
         crate::error::FieldError,
+        crate::event::Event,
+        crate::event::EventRequest,
+        crate::event::Participant,
         crate::error::ProblemDetails,
         crate::health::DatabaseStatus,
         crate::health::HealthResponse,
@@ -60,6 +69,7 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         (name = "profiles", description = "Profils et paramètres physiologiques versionnés."),
         (name = "library", description = "Bibliothèque de base, en lecture seule."),
         (name = "drinks", description = "Consommations d'un profil : saisie, historique, modification, suppression."),
+        (name = "events", description = "Événements et profils participants."),
     ),
 )]
 struct ApiDoc;
@@ -111,6 +121,9 @@ mod tests {
             (crate::library::COLLECTION_PATH, &["get"]),
             (crate::drink::PROFILE_COLLECTION_PATH, &["get", "post"]),
             (crate::drink::ITEM_PATH, &["get", "patch", "delete"]),
+            (crate::event::COLLECTION_PATH, &["get", "post"]),
+            (crate::event::ITEM_PATH, &["get", "put"]),
+            (crate::event::PARTICIPANT_PATH, &["put", "delete"]),
         ] {
             for method in methods {
                 assert!(
@@ -139,6 +152,10 @@ mod tests {
             (crate::drink::PROFILE_COLLECTION_PATH, "get", "404"),
             (crate::drink::ITEM_PATH, "patch", "400"),
             (crate::drink::ITEM_PATH, "delete", "404"),
+            (crate::event::COLLECTION_PATH, "post", "400"),
+            (crate::event::ITEM_PATH, "put", "404"),
+            (crate::event::PARTICIPANT_PATH, "put", "404"),
+            (crate::event::PARTICIPANT_PATH, "delete", "404"),
         ] {
             let schema = &document["paths"][path][method]["responses"][status]["content"]["application/json"]
                 ["schema"];
@@ -181,10 +198,11 @@ mod tests {
     }
 
     /// The paths that serve a [`crate::pagination::Page`].
-    const PAGED_PATHS: [&str; 3] = [
+    const PAGED_PATHS: [&str; 4] = [
         crate::profile::COLLECTION_PATH,
         crate::library::COLLECTION_PATH,
         crate::drink::PROFILE_COLLECTION_PATH,
+        crate::event::COLLECTION_PATH,
     ];
 
     /// The query parameter `name` of `GET path`.
