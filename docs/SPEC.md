@@ -523,8 +523,10 @@ l'historique. À confirmer.
   n'est jamais exposé au client.
 - **Fenêtre** : du début de l'événement à sa fin **+ 3 h** de décroissance, même si la fin fixée
   est encore à venir. Pour un événement à fin ouverte, la borne haute est `maintenant + 3 h`. Un
-  événement pas encore commencé est échantillonné quand même, ses participants ayant pu boire
-  avant ; la série n'est vide que si la borne haute précède le début (arbitrages du 2026-10-21).
+  événement pas encore commencé est échantillonné quand même (courbe projetée), ses participants
+  ayant pu boire avant : à fin fixée (arbitrage du 2026-10-21) comme à fin ouverte (arbitrage du
+  2026-10-22). La série n'est vide que si la borne haute précède le début, soit pour un événement
+  à fin ouverte qui commence plus de 3 h après la requête.
 - **`?step=` de `GET /profiles/{id}/bac` et `GET /events/{id}/bac` (#17)** : sous-échantillonne la
   série, **borné à [1 min, 1 h]**, valeur par défaut 1 min. Une valeur hors bornes est rejetée en
   400. Ce paramètre ne peut pas altérer le résultat du calcul — seulement la densité de points

@@ -71,8 +71,9 @@ pub struct EventBac {
     pub from: Timestamp,
     /// Last instant of the window: three hours after the end of the event,
     /// or after `computed_at` while the event is open-ended (SPEC.md §10.3).
-    /// An event yet to start is sampled all the same, its participants having
-    /// possibly drunk before it; `times` is empty only when this instant is
+    /// An event yet to start is sampled all the same, as a projected curve,
+    /// its participants having possibly drunk before it, whether its end is
+    /// fixed or open; `times` is empty only when this instant is
     /// earlier than `from`, i.e. for an open-ended event starting more than
     /// three hours after the request.
     #[schema(value_type = String, format = DateTime, example = "2026-08-21T05:00:00Z")]

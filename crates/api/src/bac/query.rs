@@ -235,10 +235,11 @@ impl EventBacQuery {
     /// The grid of an event of `participants` participants: from its start to
     /// three hours after its end — after the instant of the request for an
     /// open-ended event (SPEC.md §10.3, user decision of 2026-10-21). An event
-    /// yet to start is sampled all the same, since its participants may have
-    /// drunk before it; the grid is empty only when that end is before the
-    /// start, i.e. for an open-ended event starting more than three hours
-    /// after the request.
+    /// yet to start is sampled all the same, as a projected curve, since its
+    /// participants may have drunk before it — with a fixed end (user decision
+    /// of 2026-10-21) as open-ended (user decision of 2026-10-22). The grid is
+    /// empty only when its end is before the start, i.e. for an open-ended
+    /// event starting more than three hours after the request.
     ///
     /// # Errors
     ///
@@ -591,9 +592,10 @@ mod tests {
 
     #[test]
     fn an_event_yet_to_start_is_sampled_as_projected() {
-        // User decision of 2026-10-21: the participants may have drunk before
-        // the event. Starting in an hour and ending in five: up to its end
-        // plus three hours. Open-ended, the end is now: still past the start.
+        // The participants may have drunk before the event. Starting in an
+        // hour and ending in five: up to its end plus three hours (user
+        // decision of 2026-10-21). Open-ended, the end is now: still past the
+        // start (user decision of 2026-10-22).
         let now = at("2026-08-20T19:00:00.5Z");
         let starts_at = at("2026-08-20T20:00:00Z");
         let fixed = event(None)

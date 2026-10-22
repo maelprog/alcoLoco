@@ -4166,8 +4166,9 @@ async fn a_removed_participant_leaves_the_event_curves_and_keeps_its_own() {
 #[tokio::test]
 async fn the_window_of_an_event_follows_now_until_its_end() {
     // SPEC.md §10.3: the window closes three hours after the end of the
-    // event, or after now while it is under way; an event yet to start has
-    // no sample.
+    // event, or after now while it is open-ended; an event yet to start is
+    // sampled all the same, as a projected curve, and an open-ended one has
+    // no sample only when it starts more than three hours after now.
     let name = "the_window_of_an_event_follows_now_until_its_end";
     let Some(state) = migrated(name).await else {
         return;
@@ -4208,9 +4209,9 @@ async fn the_window_of_an_event_follows_now_until_its_end() {
     assert_eq!(body["times"], serde_json::json!([]));
 
     // Starting in an hour: sampled all the same, the participants having
-    // possibly drunk before (user decision of 2026-10-21). With a fixed end in
-    // five hours, up to three hours after it; open-ended, up to three hours
-    // after now.
+    // possibly drunk before. With a fixed end in five hours, up to three
+    // hours after it (user decision of 2026-10-21); open-ended, up to three
+    // hours after now (user decision of 2026-10-22).
     let base = chrono::Utc::now();
     let in_an_hour =
         (base + chrono::TimeDelta::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);

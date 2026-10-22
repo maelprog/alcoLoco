@@ -76,7 +76,7 @@ fn drinks_before(grid: Grid, now: Timestamp) -> Result<Timestamp, ApiError> {
     ),
     responses(
         (status = 200, description = "The curve over the window, and the value now", body = ProfileBac),
-        (status = 400, description = "Unusable identifier, `from`, `to` or `step`, or a window holding too many samples", body = ProblemDetails),
+        (status = 400, description = "Unusable identifier, `from`, `to` or `step`, or `to` earlier than `from`; a window too long for the step is never refused, the step being widened instead", body = ProblemDetails),
         (status = 404, description = "No profile carries that identifier", body = ProblemDetails),
         (status = 409, description = "The settings in force at a drink give no positive body water", body = ProblemDetails),
     ),
@@ -121,7 +121,7 @@ pub async fn profile(
     ),
     responses(
         (status = 200, description = "One curve per participant on a shared grid, and the values now", body = EventBac),
-        (status = 400, description = "Unusable identifier or `step`, or a step too fine for the window of the event", body = ProblemDetails),
+        (status = 400, description = "Unusable identifier or `step`; a window too long for the step is never refused, the step being widened instead", body = ProblemDetails),
         (status = 404, description = "No event carries that identifier", body = ProblemDetails),
         (status = 409, description = "The settings in force at a drink give no positive body water", body = ProblemDetails),
     ),
