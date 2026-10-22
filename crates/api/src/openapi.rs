@@ -39,8 +39,13 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         crate::event::update,
         crate::event::add_participant,
         crate::event::remove_participant,
+        crate::bac::profile,
+        crate::bac::event,
     ),
     components(schemas(
+        crate::bac::EventBac,
+        crate::bac::ParticipantBac,
+        crate::bac::ProfileBac,
         crate::drink::Component,
         crate::drink::ComponentRequest,
         crate::drink::Drink,
@@ -70,6 +75,7 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         (name = "library", description = "Bibliothèque de base, en lecture seule."),
         (name = "drinks", description = "Consommations d'un profil : saisie, historique, modification, suppression."),
         (name = "events", description = "Événements et profils participants."),
+        (name = "curves", description = "Courbes d'alcoolémie d'un profil et des participants d'un événement."),
     ),
 )]
 struct ApiDoc;
@@ -124,6 +130,8 @@ mod tests {
             (crate::event::COLLECTION_PATH, &["get", "post"]),
             (crate::event::ITEM_PATH, &["get", "put"]),
             (crate::event::PARTICIPANT_PATH, &["put", "delete"]),
+            (crate::bac::PROFILE_PATH, &["get"]),
+            (crate::bac::EVENT_PATH, &["get"]),
         ] {
             for method in methods {
                 assert!(

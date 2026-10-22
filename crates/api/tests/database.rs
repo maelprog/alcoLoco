@@ -2433,8 +2433,8 @@ async fn component_count(pool: &sqlx::PgPool, drink: Uuid) -> i64 {
 /// drink brings once absorbed, before elimination — read back through the API
 /// and computed with the settings in force at each ingestion time.
 ///
-/// The engine of #16 does not exist yet; this is the part of its input a
-/// write of #14 decides, and the part that has to lose a deleted drink.
+/// Not the curve of `domain::curve`: only the part of its input a write of
+/// #14 decides, and the part that has to lose a deleted drink.
 async fn alcohol_of_history(state: &AppState, profile: Uuid) -> f64 {
     let mut total = 0.0;
     for id in history_of(&state.pool, profile).await {
@@ -3712,4 +3712,645 @@ async fn the_participants_are_served_in_the_order_they_were_added() {
     let (status, read) = body_of(state, &format!("/events/{event}")).await;
     assert_eq!(status, StatusCode::OK, "{read}");
     assert_eq!(participants_in(&read), profiles, "{read}");
+}
+
+// ---------------------------------------------------------------------------
+// Curves (#17)
+// ---------------------------------------------------------------------------
+
+/// A man of 80 kg and 180 cm born on 1996-08-20 — the reference body of
+/// SPEC.md §10.1 — whose first settings version starts on 2025-01-01.
+fn a_reference_man(display_name: &str) -> Value {
+    let mut payload = a_sound_payload(display_name);
+    payload["settings"]["sex"] = Value::from("male");
+    payload["settings"]["weight_kg"] = Value::from(80.0);
+    payload["settings"]["height_cm"] = Value::from(180.0);
+    payload["settings"]["birth_date"] = Value::from("1996-08-20");
+    payload["settings"]["valid_from"] = Value::from("2025-01-01T00:00:00Z");
+    payload
+}
+
+/// A beer of `centilitres` cL at 5 %, drunk over 20 min and absorbed over
+/// 30 min — the reference durations of SPEC.md §10.1.
+fn a_timed_beer(ingested_at: &str, centilitres: f64) -> Value {
+    serde_json::json!({
+        "name": "Bière",
+        "ingested_at": ingested_at,
+        "ingestion_duration_seconds": 1200,
+        "absorption_duration_seconds": 1800,
+        "quantity_unit": "cl",
+        "components": [{ "name": "Bière", "abv_percent": 5.0, "quantity": centilitres }],
+    })
+}
+
+/// A drink as the test computes it by hand, from first principles.
+struct HandDrink {
+    ingested_at: String,
+    alcohol_grams: f64,
+    weight_kg: f64,
+}
+
+/// The intakes of a reference man, computed without the API: Watson with the
+/// age at each ingestion time (whole days over a mean Gregorian year, the
+/// convention of `bac_of`), 20 min of ingestion and 30 min of absorption.
+fn hand_intakes(drinks: &[HandDrink]) -> Vec<domain::curve::Intake> {
+    let birth: chrono::NaiveDate = "1996-08-20".parse().expect("a real date");
+    drinks
+        .iter()
+        .map(|drink| {
+            let at: api::Timestamp = drink.ingested_at.parse().expect("a real instant");
+            let age_days = (at.date_naive() - birth).num_days();
+            let age_years = f64::from(i32::try_from(age_days).expect("fits")) / 365.2425;
+            domain::curve::Intake {
+                started_at_seconds: at.timestamp(),
+                dose: domain::absorption::Dose::new(
+                    drink.alcohol_grams,
+                    1200.0 / 3600.0,
+                    1800.0 / 3600.0,
+                )
+                .expect("a dose"),
+                body_water: domain::watson_total_body_water_litres(
+                    domain::Sex::Male,
+                    drink.weight_kg,
+                    180.0,
+                    age_years,
+                )
+                .expect("a positive body water"),
+            }
+        })
+        .collect()
+}
+
+/// Whether a JSON array holds `expected`, value for value.
+///
+/// Within 1e-12 g/L rather than to the bit: the API serialises the exact
+/// value, but `serde_json` parses a float back without the
+/// `float_roundtrip` feature and may land one unit in the last place away —
+/// measured on this very test. Compare two answers of the API to the bit
+/// with [`bits_of`]: they go through the same parser.
+fn same_values(values: &Value, expected: &[f64]) -> bool {
+    let values = values
+        .as_array()
+        .unwrap_or_else(|| panic!("not an array: {values}"));
+    values.len() == expected.len()
+        && values.iter().zip(expected).all(|(value, expected)| {
+            value
+                .as_f64()
+                .is_some_and(|value| (value - expected).abs() <= 1e-12)
+        })
+}
+
+/// The series the engine gives for `intakes` on a grid.
+fn engine_values(intakes: &[domain::curve::Intake], from: &str, to: &str, step: i64) -> Vec<f64> {
+    let seconds = |text: &str| {
+        text.parse::<api::Timestamp>()
+            .expect("an instant")
+            .timestamp()
+    };
+    domain::curve::bac_series(
+        intakes,
+        &domain::absorption::Trapezoid,
+        domain::ELIMINATION_RATE_G_PER_L_PER_H,
+        seconds(from),
+        seconds(to),
+        step,
+    )
+    .expect("a series")
+    .iter()
+    .map(|sample| sample.bac_g_per_l)
+    .collect()
+}
+
+/// The numbers of a JSON array, as bits.
+fn bits_of(values: &Value) -> Vec<u64> {
+    values
+        .as_array()
+        .unwrap_or_else(|| panic!("not an array: {values}"))
+        .iter()
+        .map(|value| value.as_f64().expect("a number").to_bits())
+        .collect()
+}
+
+/// The curve of a profile, which has to be served.
+async fn profile_curve(state: &AppState, profile: Uuid, query: &str) -> Value {
+    let (status, body) = body_of(state.clone(), &format!("/profiles/{profile}/bac?{query}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn the_curve_of_a_profile_is_the_engine_on_its_stored_drinks() {
+    // A beer in cL and a cocktail in percent: the curve served is the engine
+    // fed with the alcohol of each drink in millilitres — 50 cL is
+    // 500 mL, not 50 — and the body water of its ingestion time.
+    let name = "the_curve_of_a_profile_is_the_engine_on_its_stored_drinks";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_reference_man("Courbe")).await;
+    record_drink(&state, profile, &a_timed_beer("2025-08-20T21:00:00Z", 50.0)).await;
+    let cocktail = serde_json::json!({
+        "name": "Vodka – Jus d'orange",
+        "ingested_at": "2025-08-20T21:30:00Z",
+        "ingestion_duration_seconds": 1200,
+        "absorption_duration_seconds": 1800,
+        "quantity_unit": "percent",
+        "volume_total_ml": 200.0,
+        "components": [
+            { "name": "Vodka", "abv_percent": 40.0, "quantity": 20.0 },
+            { "name": "Jus d'orange", "abv_percent": 0.0, "quantity": 80.0 },
+        ],
+    });
+    record_drink(&state, profile, &cocktail).await;
+
+    let (from, to) = ("2025-08-20T20:00:00Z", "2025-08-21T02:00:00Z");
+    let body = profile_curve(&state, profile, &format!("from={from}&to={to}&step=60")).await;
+
+    let expected = engine_values(
+        &hand_intakes(&[
+            HandDrink {
+                ingested_at: "2025-08-20T21:00:00Z".to_owned(),
+                alcohol_grams: domain::ingested_alcohol_grams(500.0, 5.0),
+                weight_kg: 80.0,
+            },
+            HandDrink {
+                ingested_at: "2025-08-20T21:30:00Z".to_owned(),
+                alcohol_grams: domain::ingested_alcohol_grams(40.0, 40.0),
+                weight_kg: 80.0,
+            },
+        ]),
+        from,
+        to,
+        60,
+    );
+    assert!(same_values(&body["bac_g_per_l"], &expected), "{body}");
+    assert_eq!(body["profile_id"], profile.to_string());
+    assert_eq!(body["from"], from);
+    assert_eq!(body["to"], to);
+    assert_eq!(body["step_seconds"], 60);
+    let times = body["times"].as_array().expect("times");
+    assert_eq!(times.len(), 361);
+    assert_eq!(times[0], from);
+    assert_eq!(times[1], "2025-08-20T20:01:00Z");
+    assert_eq!(times[360], to);
+    assert!(
+        body["bac_g_per_l"]
+            .as_array()
+            .expect("values")
+            .iter()
+            .any(|value| value.as_f64().is_some_and(|value| value > 0.2)),
+        "{body}"
+    );
+    // Long after both drinks, the current value is zero.
+    assert_eq!(body["current_bac_g_per_l"], 0.0);
+    assert!(
+        body["computed_at"]
+            .as_str()
+            .is_some_and(|at| at.ends_with('Z'))
+    );
+}
+
+#[tokio::test]
+async fn each_drink_of_a_curve_takes_the_settings_of_its_ingestion_time() {
+    // A weight change between two drinks: the earlier one keeps the first
+    // version, the later one takes the second (SPEC.md §5.6).
+    let name = "each_drink_of_a_curve_takes_the_settings_of_its_ingestion_time";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let mut payload = a_reference_man("Prise de poids");
+    let (profile, _) = create_profile(&state, &payload).await;
+    record_drink(&state, profile, &a_timed_beer("2025-03-01T21:00:00Z", 50.0)).await;
+    record_drink(&state, profile, &a_timed_beer("2025-09-01T21:00:00Z", 50.0)).await;
+    payload["settings"]["weight_kg"] = Value::from(95.0);
+    payload["settings"]["valid_from"] = Value::from("2025-06-01T00:00:00Z");
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/profiles/{profile}"),
+        Some(payload),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+
+    let grams = domain::ingested_alcohol_grams(500.0, 5.0);
+    for (day, weight_kg, other_weight_kg) in
+        [("2025-03-01", 80.0, 95.0), ("2025-09-01", 95.0, 80.0)]
+    {
+        let (from, to) = (format!("{day}T20:00:00Z"), format!("{day}T23:00:00Z"));
+        let body = profile_curve(&state, profile, &format!("from={from}&to={to}&step=300")).await;
+        let with = |weight_kg| {
+            engine_values(
+                &hand_intakes(&[HandDrink {
+                    ingested_at: format!("{day}T21:00:00Z"),
+                    alcohol_grams: grams,
+                    weight_kg,
+                }]),
+                &from,
+                &to,
+                300,
+            )
+        };
+        assert!(
+            same_values(&body["bac_g_per_l"], &with(weight_kg)),
+            "{day}: {body}"
+        );
+        assert!(
+            !same_values(&body["bac_g_per_l"], &with(other_weight_kg)),
+            "{day}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_curve_of_a_profile_refuses_what_it_cannot_read() {
+    let name = "the_curve_of_a_profile_refuses_what_it_cannot_read";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_reference_man("Refus")).await;
+    let window = "from=2025-08-20T20:00:00Z&to=2025-08-21T02:00:00Z";
+
+    let (status, body) = body_of(
+        state.clone(),
+        &format!("/profiles/{}/bac?{window}", Uuid::now_v7()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["type"], "/problems/not_found");
+
+    for (query, field) in [
+        ("to=2025-08-21T02:00:00Z", "from"),
+        (&*format!("{window}&step=59"), "step"),
+        (&*format!("{window}&step=3601"), "step"),
+        ("from=2025-08-21T00:00:00Z&to=2025-08-20T00:00:00Z", "to"),
+    ] {
+        let (status, body) =
+            body_of(state.clone(), &format!("/profiles/{profile}/bac?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["type"], "/problems/validation_failed", "{query}");
+        assert_eq!(body["errors"][0]["field"], field, "{query}: {body}");
+    }
+
+    // A year at one minute exceeds the cap of one answer: the step is
+    // widened to the smallest multiple of a minute that fits, not refused.
+    let year = profile_curve(
+        &state,
+        profile,
+        "from=2025-01-01T00:00:00Z&to=2025-12-31T00:00:00Z&step=60",
+    )
+    .await;
+    let widened = year["step_seconds"].as_i64().expect("a step");
+    let samples = year["times"].as_array().expect("times").len();
+    assert_eq!(widened % 60, 0, "{widened}");
+    assert!(widened > 60);
+    assert!(samples <= 10_081, "{samples}");
+    assert_eq!(
+        year["bac_g_per_l"].as_array().expect("values").len(),
+        samples
+    );
+    let span = 364 * 24 * 3600;
+    assert!(
+        span / (widened - 60) + 1 > 10_081,
+        "a minute less would fit"
+    );
+
+    // A profile that never drank is at zero everywhere.
+    let body = profile_curve(&state, profile, &format!("{window}&step=3600")).await;
+    assert_eq!(bits_of(&body["bac_g_per_l"]), vec![0.0_f64.to_bits(); 7]);
+}
+
+#[tokio::test]
+async fn the_curves_of_an_event_share_one_grid_and_count_every_drink_of_its_participants() {
+    // Acceptance criterion of #17: the series of several participants share
+    // the same grid. A drink entered from the profile, outside the event,
+    // counts all the same: the curve is the body's. A non-participant is not
+    // served.
+    let name = "the_curves_of_an_event_share_one_grid_and_count_every_drink_of_its_participants";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (first, _) = create_profile(&state, &a_reference_man("Alice")).await;
+    let (second, _) = create_profile(&state, &a_reference_man("Bob")).await;
+    let (outsider, _) = create_profile(&state, &a_reference_man("Carol")).await;
+    let (event, _) = create_event(
+        &state,
+        &serde_json::json!({
+            "name": "Soirée",
+            "starts_at": "2025-05-10T20:00:00Z",
+            "ends_at": "2025-05-11T01:00:00Z",
+            "participant_ids": [first.to_string(), second.to_string()],
+        }),
+    )
+    .await;
+    let mut from_event = a_timed_beer("2025-05-10T21:00:00Z", 50.0);
+    from_event["event_id"] = Value::from(event.to_string());
+    record_drink(&state, first, &from_event).await;
+    record_drink(&state, second, &a_timed_beer("2025-05-10T22:00:00Z", 33.0)).await;
+    record_drink(
+        &state,
+        outsider,
+        &a_timed_beer("2025-05-10T21:00:00Z", 50.0),
+    )
+    .await;
+
+    let (status, body) = body_of(state.clone(), &format!("/events/{event}/bac")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // From the start to three hours after the end, every minute.
+    assert_eq!(body["from"], "2025-05-10T20:00:00Z");
+    assert_eq!(body["to"], "2025-05-11T04:00:00Z");
+    assert_eq!(body["step_seconds"], 60);
+    let times = body["times"].as_array().expect("times").len();
+    assert_eq!(times, 8 * 60 + 1);
+
+    let participants = body["participants"].as_array().expect("participants");
+    let served: Vec<&str> = participants
+        .iter()
+        .map(|p| p["profile_id"].as_str().expect("an identifier"))
+        .collect();
+    assert_eq!(served, [first.to_string(), second.to_string()]);
+    for (participant, profile) in participants.iter().zip([first, second]) {
+        assert_eq!(
+            participant["bac_g_per_l"].as_array().expect("values").len(),
+            times
+        );
+        // The same values as the curve of the profile on the same window.
+        let alone = profile_curve(
+            &state,
+            profile,
+            "from=2025-05-10T20:00:00Z&to=2025-05-11T04:00:00Z&step=60",
+        )
+        .await;
+        assert_eq!(
+            bits_of(&participant["bac_g_per_l"]),
+            bits_of(&alone["bac_g_per_l"])
+        );
+        assert_eq!(alone["times"], body["times"]);
+        assert!(
+            bits_of(&participant["bac_g_per_l"])
+                .into_iter()
+                .any(|bits| f64::from_bits(bits) > 0.0),
+            "{participant}"
+        );
+    }
+    assert_eq!(participants[0]["display_name"], "Alice");
+
+    // A coarser step thins out the same values.
+    let (status, coarse) = body_of(state.clone(), &format!("/events/{event}/bac?step=600")).await;
+    assert_eq!(status, StatusCode::OK, "{coarse}");
+    assert_eq!(coarse["times"].as_array().expect("times").len(), 8 * 6 + 1);
+    let fine = bits_of(&participants[0]["bac_g_per_l"]);
+    let thinned: Vec<u64> = fine.iter().step_by(10).copied().collect();
+    assert_eq!(bits_of(&coarse["participants"][0]["bac_g_per_l"]), thinned);
+
+    let (status, refused) = body_of(state.clone(), &format!("/events/{event}/bac?step=30")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["errors"][0]["field"], "step");
+    let (status, missing) =
+        body_of(state.clone(), &format!("/events/{}/bac", Uuid::now_v7())).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+}
+
+#[tokio::test]
+async fn a_removed_participant_leaves_the_event_curves_and_keeps_its_own() {
+    // Removing a participant detaches its drinks from the event (#18): it is
+    // no longer among the curves of the event, and its own curve still counts
+    // every one of those drinks.
+    let name = "a_removed_participant_leaves_the_event_curves_and_keeps_its_own";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (staying, _) = create_profile(&state, &a_reference_man("Reste")).await;
+    let (leaving, _) = create_profile(&state, &a_reference_man("Part")).await;
+    let (event, _) = create_event(
+        &state,
+        &serde_json::json!({
+            "name": "Départ",
+            "starts_at": "2025-05-10T20:00:00Z",
+            "ends_at": "2025-05-11T01:00:00Z",
+            "participant_ids": [staying.to_string(), leaving.to_string()],
+        }),
+    )
+    .await;
+    let mut from_event = a_timed_beer("2025-05-10T21:00:00Z", 50.0);
+    from_event["event_id"] = Value::from(event.to_string());
+    record_drink(&state, leaving, &from_event).await;
+    let window = "from=2025-05-10T20:00:00Z&to=2025-05-11T04:00:00Z&step=60";
+    let before = profile_curve(&state, leaving, window).await;
+
+    let answer = send(
+        state.clone(),
+        "DELETE",
+        &format!("/events/{event}/participants/{leaving}"),
+        None,
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+
+    let (status, body) = body_of(state.clone(), &format!("/events/{event}/bac")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let served: Vec<&str> = body["participants"]
+        .as_array()
+        .expect("participants")
+        .iter()
+        .map(|p| p["profile_id"].as_str().expect("an identifier"))
+        .collect();
+    assert_eq!(served, [staying.to_string()]);
+    let after = profile_curve(&state, leaving, window).await;
+    assert_eq!(
+        bits_of(&after["bac_g_per_l"]),
+        bits_of(&before["bac_g_per_l"])
+    );
+}
+
+#[tokio::test]
+async fn the_window_of_an_event_follows_now_until_its_end() {
+    // SPEC.md §10.3: the window closes three hours after the end of the
+    // event, or after now while it is open-ended; an event yet to start is
+    // sampled all the same, as a projected curve, and an open-ended one has
+    // no sample only when it starts more than three hours after now.
+    let name = "the_window_of_an_event_follows_now_until_its_end";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let yesterday = (chrono::Utc::now() - chrono::TimeDelta::days(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (open, _) = create_event(
+        &state,
+        &serde_json::json!({ "name": "En cours", "starts_at": yesterday }),
+    )
+    .await;
+    let (status, body) = body_of(state.clone(), &format!("/events/{open}/bac?step=3600")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let instant = |member: &str| {
+        body[member]
+            .as_str()
+            .and_then(|text| text.parse::<api::Timestamp>().ok())
+            .unwrap_or_else(|| panic!("no {member} in {body}"))
+    };
+    assert_eq!(
+        instant("to") - instant("computed_at"),
+        chrono::TimeDelta::hours(3)
+    );
+    assert!(
+        body["participants"]
+            .as_array()
+            .expect("participants")
+            .is_empty()
+    );
+
+    let (later, _) = create_event(
+        &state,
+        &serde_json::json!({ "name": "À venir", "starts_at": "2999-01-01T20:00:00Z" }),
+    )
+    .await;
+    let (status, body) = body_of(state.clone(), &format!("/events/{later}/bac")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["times"], serde_json::json!([]));
+
+    // Starting in an hour: sampled all the same, the participants having
+    // possibly drunk before. With a fixed end in five hours, up to three
+    // hours after it (user decision of 2026-10-21); open-ended, up to three
+    // hours after now (user decision of 2026-10-22).
+    let base = chrono::Utc::now();
+    let in_an_hour =
+        (base + chrono::TimeDelta::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let in_five_hours = base + chrono::TimeDelta::hours(5);
+    let fixed_end = in_five_hours.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (soon, _) = create_event(
+        &state,
+        &serde_json::json!({ "name": "Bientôt", "starts_at": in_an_hour, "ends_at": fixed_end }),
+    )
+    .await;
+    let (status, body) = body_of(state.clone(), &format!("/events/{soon}/bac")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let end: api::Timestamp = fixed_end.parse().expect("an instant");
+    let expected_to = api::Timestamp::from_timestamp(end.timestamp().div_euclid(60) * 60, 0)
+        .expect("an instant")
+        + chrono::TimeDelta::hours(3);
+    assert_eq!(body["to"], serde_json::json!(expected_to), "{body}");
+    // Seven hours, one value a minute.
+    assert_eq!(body["times"].as_array().expect("times").len(), 7 * 60 + 1);
+
+    let (open_soon, _) = create_event(
+        &state,
+        &serde_json::json!({ "name": "Bientôt, sans fin", "starts_at": in_an_hour }),
+    )
+    .await;
+    let (status, body) = body_of(state.clone(), &format!("/events/{open_soon}/bac")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let instant = |member: &str| {
+        body[member]
+            .as_str()
+            .and_then(|text| text.parse::<api::Timestamp>().ok())
+            .unwrap_or_else(|| panic!("no {member} in {body}"))
+    };
+    assert_eq!(
+        instant("to") - instant("computed_at"),
+        chrono::TimeDelta::hours(3)
+    );
+    assert!(
+        !body["times"].as_array().expect("times").is_empty(),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn an_evening_of_ten_participants_and_twenty_drinks_each_is_served_quickly() {
+    // Acceptance criterion of #17: a realistic evening answers in an
+    // acceptable time. Ten participants, twenty drinks each over six hours,
+    // the whole window at the finest step.
+    let name = "an_evening_of_ten_participants_and_twenty_drinks_each_is_served_quickly";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let mut participants = Vec::new();
+    for index in 0..10 {
+        let (profile, _) =
+            create_profile(&state, &a_reference_man(&format!("Convive {index}"))).await;
+        participants.push(profile);
+    }
+    let (event, _) = create_event(
+        &state,
+        &serde_json::json!({
+            "name": "Grande soirée",
+            "starts_at": "2025-05-10T20:00:00Z",
+            "ends_at": "2025-05-11T02:00:00Z",
+            "participant_ids": participants.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+        }),
+    )
+    .await;
+    for profile in &participants {
+        for drink in 0..20 {
+            let at = "2025-05-10T20:00:00Z"
+                .parse::<api::Timestamp>()
+                .expect("an instant")
+                + chrono::TimeDelta::minutes(drink * 18);
+            let at = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let mut payload = a_timed_beer(&at, 25.0);
+            payload["event_id"] = Value::from(event.to_string());
+            record_drink(&state, *profile, &payload).await;
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let (status, body) = body_of(state.clone(), &format!("/events/{event}/bac")).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["participants"].as_array().expect("participants").len(),
+        10
+    );
+    assert_eq!(body["times"].as_array().expect("times").len(), 9 * 60 + 1);
+    eprintln!("an evening of 10 × 20 drinks served in {elapsed:?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "an evening of 10 × 20 drinks took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn many_participants_widen_the_step_of_an_event_to_fit_the_cap() {
+    // User decision of 2026-10-21: one answer holds at most 10 081 values,
+    // summed over its series; beyond, the step is widened to the smallest
+    // multiple of a minute that fits, and served. Twenty participants over
+    // 6 h + 3 h at one minute would be 20 × 541 = 10 820 values; at two
+    // minutes, 20 × 271 = 5 420.
+    let name = "many_participants_widen_the_step_of_an_event_to_fit_the_cap";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let mut participants = Vec::new();
+    for index in 0..20 {
+        let (profile, _) =
+            create_profile(&state, &a_reference_man(&format!("Invité {index}"))).await;
+        participants.push(profile.to_string());
+    }
+    let (event, _) = create_event(
+        &state,
+        &serde_json::json!({
+            "name": "Foule",
+            "starts_at": "2025-05-10T20:00:00Z",
+            "ends_at": "2025-05-11T02:00:00Z",
+            "participant_ids": participants,
+        }),
+    )
+    .await;
+    let (status, body) = body_of(state.clone(), &format!("/events/{event}/bac")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["step_seconds"], 120, "{body}");
+    let times = body["times"].as_array().expect("times").len();
+    assert_eq!(times, 9 * 30 + 1);
+    let series = body["participants"].as_array().expect("participants");
+    assert_eq!(series.len(), 20);
+    for participant in series {
+        assert_eq!(
+            participant["bac_g_per_l"].as_array().expect("values").len(),
+            times
+        );
+    }
+    // A step asked for that already fits is kept.
+    let (status, coarse) = body_of(state, &format!("/events/{event}/bac?step=600")).await;
+    assert_eq!(status, StatusCode::OK, "{coarse}");
+    assert_eq!(coarse["step_seconds"], 600);
 }
