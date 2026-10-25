@@ -111,3 +111,25 @@ get millilitres. In percent it is still a share of `drink.volume_total_ml`.
 Correct statement: `20261022090000_drink_component_quantity_in_cl.sql:1-10`,
 whose `COMMENT ON COLUMN` (`:21-22`) also replaces the stored column comment:
 unlike erratum 2, `col_description()` returns the right text.
+
+### 5. `20260919090000_settings_version_check_under_concurrency.sql:56-63` and `:127-128`, `20261021090000_drink_components_invariants.sql:62-63` — the settings guard row and its profile
+
+What the files say:
+
+- "Nothing but this check ever locks a guard row";
+- the guard table has "**no foreign key** to `profile`", and "a guard row
+  outlives its profile";
+- in the comment stored on the table: "One row per profile whose settings
+  versions were ever removed", "No foreign key on purpose";
+- in the drink migration: "the settings guard, which only removals write".
+
+What is true: since migration 20261025090000 (#75), `profile_settings_guard`
+has a foreign key to `profile`, `ON DELETE CASCADE`. Every profile has its
+guard row from its creation on, written by a trigger on `profile`, and the row
+is deleted with the profile; a deletion of a profile therefore also locks it.
+The check only ever updates an existing guard row, which takes no lock on the
+profile row, so the interleavings of plain DML that motivated the absence of a
+foreign key still commit.
+
+Correct statement: `20261025090000_profile_settings_guard_follows_its_profile.sql:1-67`,
+whose `COMMENT ON TABLE` also replaces the stored table comment.

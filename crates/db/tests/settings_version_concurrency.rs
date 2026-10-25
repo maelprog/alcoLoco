@@ -790,3 +790,190 @@ async fn removing_a_version_needs_insert_update_and_select_on_the_guard_table() 
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The guard row of a deleted profile (#75)
+// ---------------------------------------------------------------------------
+
+/// SQLSTATE `foreign_key_violation`.
+const FOREIGN_KEY_VIOLATION: &str = "23503";
+
+async fn guard_rows(pool: &PgPool, profile: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM profile_settings_guard WHERE profile_id = $1")
+        .bind(profile)
+        .fetch_one(pool)
+        .await
+        .expect("the count must run")
+}
+
+#[tokio::test]
+async fn a_guard_row_is_written_with_its_profile_and_deleted_with_it() {
+    // Since migration 20261025090000 the guard row of a profile exists from
+    // the creation of the profile on, and goes with it (`ON DELETE CASCADE`
+    // towards `profile`): a deleted profile leaves no guard row behind, and
+    // none can be written for a profile that does not exist.
+    let name = "a_guard_row_is_written_with_its_profile_and_deleted_with_it";
+    let Some(url) = database_url(name) else {
+        return;
+    };
+    let pool = migrated_pool(&url).await;
+    let (profile, _) = profile_with_versions(&pool, 2).await;
+    assert_eq!(guard_rows(&pool, profile).await, 1, "written at creation");
+
+    let mut conn = connection(&url).await;
+    run(
+        &mut conn,
+        &format!("DELETE FROM profile WHERE id = '{profile}'"),
+    )
+    .await
+    .expect("a profile deletes with its versions and its guard row");
+    assert_eq!(version_count(&pool, profile).await, 0);
+    assert_eq!(guard_rows(&pool, profile).await, 0, "deleted with it");
+
+    let orphan = run(
+        &mut conn,
+        &format!("INSERT INTO profile_settings_guard (profile_id) VALUES ('{profile}')"),
+    )
+    .await
+    .expect_err("a guard row needs its profile");
+    assert_eq!(
+        sqlstate(&orphan).as_deref(),
+        Some(FOREIGN_KEY_VIOLATION),
+        "wrong mechanism: {orphan}"
+    );
+}
+
+#[tokio::test]
+async fn removing_versions_then_the_profile_in_one_transaction_commits() {
+    // The removal of a version records its profile for the ordered pass of
+    // the check, which runs at COMMIT — after the profile, and its guard row
+    // with it, are gone. That pass must skip the profile rather than write a
+    // guard row the foreign key refuses.
+    let name = "removing_versions_then_the_profile_in_one_transaction_commits";
+    let Some(url) = database_url(name) else {
+        return;
+    };
+    let pool = migrated_pool(&url).await;
+    let (profile, versions) = profile_with_versions(&pool, 2).await;
+
+    let mut conn = connection(&url).await;
+    run(&mut conn, "BEGIN").await.expect("BEGIN");
+    delete_version(&mut conn, versions[0]).await;
+    run(
+        &mut conn,
+        &format!("DELETE FROM profile WHERE id = '{profile}'"),
+    )
+    .await
+    .expect("the profile must delete");
+    run(&mut conn, "COMMIT")
+        .await
+        .unwrap_or_else(|error| panic!("the COMMIT must pass: {error}"));
+    assert_eq!(version_count(&pool, profile).await, 0);
+    assert_eq!(guard_rows(&pool, profile).await, 0);
+}
+
+/// A statement adding a settings version to `profile`, in 2030: after every
+/// version [`profile_with_versions`] writes.
+fn insert_version_sql(profile: Uuid) -> String {
+    format!(
+        "INSERT INTO profile_settings_version (
+             id, profile_id, valid_from, weight_kg, height_cm, sex, birth_date
+         ) VALUES ('{}', '{profile}', timestamptz '2030-01-01', 80, 170, 'male',
+                   date '1990-01-01')",
+        Uuid::now_v7()
+    )
+}
+
+#[tokio::test]
+async fn deleting_a_profile_while_its_settings_change_does_not_deadlock() {
+    // Plain DML under READ COMMITTED, the level of the application: the
+    // deletion of a profile races the removal or the addition of one of its
+    // settings versions, in both orders. Each transaction either commits or
+    // is refused on the spot by a foreign key — never a deadlock, never a
+    // version or a guard row left for a profile that is gone.
+    let name = "deleting_a_profile_while_its_settings_change_does_not_deadlock";
+    let Some(url) = database_url(name) else {
+        return;
+    };
+    let pool = migrated_pool(&url).await;
+    let s = |text: &str| text.to_owned();
+    let delete_profile = |p: Uuid| format!("DELETE FROM profile WHERE id = '{p}'");
+
+    // 1 and 2. t changes the settings of P and has not committed; t2 deletes
+    //    P and waits for t; t commits, then t2. In the removal case the
+    //    deletion waits in its cascade towards the versions, and must not be
+    //    holding the guard row t writes at COMMIT by then.
+    for (label, removal) in [
+        ("change first, removal", true),
+        ("change first, addition", false),
+    ] {
+        let (p, ps) = profile_with_versions(&pool, 3).await;
+        let mut t = connection(&url).await;
+        let mut t2 = connection(&url).await;
+        let t2_pid = backend_pid(&mut t2).await;
+        run(&mut t, "BEGIN").await.expect("BEGIN");
+        let change = if removal {
+            delete_sql(ps[0])
+        } else {
+            insert_version_sql(p)
+        };
+        run(&mut t, &change).await.expect("the change itself");
+        let deleter = spawn_session(t2, &[s("BEGIN"), delete_profile(p), s("COMMIT")]);
+        assert!(
+            wait_until_blocked(&pool, &[t2_pid]).await,
+            "{label}: the deletion must wait for the change"
+        );
+        run(&mut t, "COMMIT")
+            .await
+            .unwrap_or_else(|error| panic!("{label}, change: {error}"));
+        outcome_of(deleter)
+            .await
+            .unwrap_or_else(|error| panic!("{label}, deletion: {error}"));
+        assert_eq!(version_count(&pool, p).await, 0, "{label}");
+        assert_eq!(guard_rows(&pool, p).await, 0, "{label}");
+    }
+
+    // 3 and 4. t2 has deleted P and has not committed; t changes the settings
+    //    of P and waits for t2; t2 commits. The removal then finds nothing to
+    //    remove and commits; the addition is refused by the foreign key of
+    //    the version, P being gone.
+    for (label, removal) in [
+        ("deletion first, removal", true),
+        ("deletion first, addition", false),
+    ] {
+        let (p, ps) = profile_with_versions(&pool, 3).await;
+        let mut t = connection(&url).await;
+        let t_pid = backend_pid(&mut t).await;
+        let mut t2 = connection(&url).await;
+        run(&mut t2, "BEGIN").await.expect("BEGIN");
+        run(&mut t2, &delete_profile(p))
+            .await
+            .expect("the deletion");
+        let change = if removal {
+            delete_sql(ps[0])
+        } else {
+            insert_version_sql(p)
+        };
+        let changer = spawn_session(t, &[s("BEGIN"), change, s("COMMIT")]);
+        assert!(
+            wait_until_blocked(&pool, &[t_pid]).await,
+            "{label}: the change must wait for the deletion"
+        );
+        run(&mut t2, "COMMIT")
+            .await
+            .unwrap_or_else(|error| panic!("{label}, deletion: {error}"));
+        let outcome = outcome_of(changer).await;
+        if removal {
+            outcome.unwrap_or_else(|error| panic!("{label}: {error}"));
+        } else {
+            let error = outcome.expect_err("a version of a deleted profile");
+            assert_eq!(
+                sqlstate(&error).as_deref(),
+                Some(FOREIGN_KEY_VIOLATION),
+                "{label}: wrong mechanism: {error}"
+            );
+        }
+        assert_eq!(version_count(&pool, p).await, 0, "{label}");
+        assert_eq!(guard_rows(&pool, p).await, 0, "{label}");
+    }
+}
