@@ -96,3 +96,16 @@ DML. The measurements of class (d) remain the history of the defect.
 Correct statement:
 `20260919090000_settings_version_check_under_concurrency.sql:14-18` (what stops
 being true in the initial migration) and `:25-43` (how the check holds).
+
+### 4. `20260819090000_initial_schema.sql:577-578` — unit of a component quantity in cL
+
+What the file says, in the comment stored on the `drink_component.quantity`
+column: "Millilitres when the parent drink is in cl".
+
+What is true: since migration 20261022090000, a component quantity of a drink
+in cL is stored in **centilitres**, as entered; a reader multiplies it by 10 to
+get millilitres. In percent it is still a share of `drink.volume_total_ml`.
+
+Correct statement: `20261022090000_drink_component_quantity_in_cl.sql:1-10`,
+whose `COMMENT ON COLUMN` (`:21-22`) also replaces the stored column comment:
+unlike erratum 2, `col_description()` returns the right text.
