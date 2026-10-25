@@ -1,7 +1,7 @@
 //! `/profiles` — the profiles of SPEC.md §5.1, without authentication in V1.
 //!
 //! The module is split three ways: [`model`] holds the payload types, [`store`]
-//! holds every statement, and this file holds the four handlers. What is worth
+//! holds every statement, and this file holds the five handlers. What is worth
 //! knowing before reading any of them:
 //!
 //! - a profile carries its identity and its **input preferences**; the four
@@ -13,7 +13,9 @@
 //!   a write that changes only the preferences posts none (SPEC.md §10.0-J);
 //! - a write at `T` replaces every version already later than `T`, and the
 //!   answer to a `PUT` reports whether a version was posted and how many were
-//!   replaced (SPEC.md §5.1, issue #7).
+//!   replaced (SPEC.md §5.1, issue #7);
+//! - deleting a profile deletes everything it owns, in one transaction, and
+//!   the events it was the only participant of (SPEC.md §5.1, issue #75).
 
 pub mod model;
 pub mod store;
@@ -176,6 +178,31 @@ pub async fn update(
         settings_version_created: version_created,
         settings_versions_replaced: versions_replaced,
     }))
+}
+
+/// Deletes a profile and everything it owns: its settings versions, its
+/// participations, its drinks and their components. An event it was the only
+/// participant of is deleted with it; the other events it took part in stay,
+/// without it.
+#[utoipa::path(
+    delete,
+    path = ITEM_PATH,
+    tag = "profiles",
+    params(("id" = Uuid, Path, description = "Identifier of the profile")),
+    responses(
+        (status = 204, description = "The profile and everything it owned are deleted, with the events it was the only participant of"),
+        (status = 400, description = "The identifier is not a UUID", body = ProblemDetails),
+        (status = 404, description = "No profile carries that identifier", body = ProblemDetails),
+    ),
+)]
+pub async fn delete(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    match store::delete(&state.pool, id).await? {
+        store::Deleted::Done => Ok(StatusCode::NO_CONTENT),
+        store::Deleted::NoSuchProfile => Err(no_such_profile(id)),
+    }
 }
 
 #[cfg(test)]

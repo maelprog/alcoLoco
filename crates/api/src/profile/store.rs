@@ -165,6 +165,43 @@ const SELECT_SETTINGS_AT: &str = "
     FROM public.profile_settings_at($1, $2)
 ";
 
+/// The events a profile takes part in, locked before the profile is deleted.
+///
+/// The lock is what makes [`DELETE_EVENTS_LEFT_EMPTY`] sound: adding a
+/// participant takes a `FOR KEY SHARE` lock on the event row, which conflicts
+/// with this one, so a participant being added concurrently is either
+/// committed before this statement returns — and seen by the next statement,
+/// under READ COMMITTED — or added after this transaction, when the event may
+/// already be gone. Ordered by `id`, so that two deletions lock in one order.
+const LOCK_EVENTS_OF_PROFILE: &str = "
+    SELECT e.id
+    FROM public.event AS e
+    WHERE e.id IN (
+        SELECT ep.event_id FROM public.event_participant AS ep WHERE ep.profile_id = $1
+    )
+    ORDER BY e.id
+    FOR UPDATE
+";
+
+/// A profile. What it owns goes with it, by the foreign keys of the schema:
+/// its settings versions, its participations and its drinks (`ON DELETE
+/// CASCADE`, migration of #2), the components of those drinks (`ON DELETE
+/// CASCADE` on `drink`), and its guard row (`ON DELETE CASCADE`, migration of
+/// #75). The settings-version check does not refuse it: at `COMMIT` the
+/// profile no longer exists, and an absent profile has no version to keep.
+const DELETE_PROFILE: &str = "DELETE FROM public.profile WHERE id = $1";
+
+/// Among the events `$1` names, those left without any participant: the
+/// events the deleted profile took part in alone (decision of 2026-10-25 on
+/// #75). An event that had no participant before is not among them.
+const DELETE_EVENTS_LEFT_EMPTY: &str = "
+    DELETE FROM public.event AS e
+    WHERE e.id = ANY ($1::pg_catalog.uuid[])
+      AND NOT EXISTS (
+          SELECT 1 FROM public.event_participant AS ep WHERE ep.event_id = e.id
+      )
+";
+
 /// Reads a row of [`SELECT_PAGE`] or [`SELECT_ONE`].
 ///
 /// A label the `sex` or `quantity_unit` enum carries but the API does not know
@@ -434,6 +471,47 @@ pub async fn update(pool: &PgPool, id: Uuid, profile: &ValidProfile) -> Result<U
         version_created,
         versions_replaced,
     })
+}
+
+/// What a deletion did, so that the handler can answer the right status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deleted {
+    /// No profile carries that identifier.
+    NoSuchProfile,
+    /// The profile and everything it owned are gone.
+    Done,
+}
+
+/// Deletes a profile, everything it owns, and the events it took part in
+/// alone, in one transaction.
+///
+/// # Errors
+///
+/// Fails when a statement cannot be run.
+pub async fn delete(pool: &PgPool, id: Uuid) -> Result<Deleted, ApiError> {
+    let mut tx = pool.begin().await?;
+
+    let events: Vec<Uuid> = sqlx::query_scalar(LOCK_EVENTS_OF_PROFILE)
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+    let deleted = sqlx::query(DELETE_PROFILE)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if deleted == 0 {
+        return Ok(Deleted::NoSuchProfile);
+    }
+
+    sqlx::query(DELETE_EVENTS_LEFT_EMPTY)
+        .bind(&events)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(Deleted::Done)
 }
 
 #[cfg(test)]
