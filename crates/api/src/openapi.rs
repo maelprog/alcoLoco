@@ -41,9 +41,11 @@ pub const DOCUMENT_PATH: &str = "/openapi.json";
         crate::event::remove_participant,
         crate::bac::profile,
         crate::bac::event,
+        crate::bac::feeling_suggestion,
     ),
     components(schemas(
         crate::bac::EventBac,
+        crate::bac::FeelingSuggestion,
         crate::bac::ParticipantBac,
         crate::bac::ProfileBac,
         crate::drink::Component,
@@ -132,6 +134,7 @@ mod tests {
             (crate::event::PARTICIPANT_PATH, &["put", "delete"]),
             (crate::bac::PROFILE_PATH, &["get"]),
             (crate::bac::EVENT_PATH, &["get"]),
+            (crate::bac::FEELING_SUGGESTION_PATH, &["get"]),
         ] {
             for method in methods {
                 assert!(
@@ -164,6 +167,8 @@ mod tests {
             (crate::event::ITEM_PATH, "put", "404"),
             (crate::event::PARTICIPANT_PATH, "put", "404"),
             (crate::event::PARTICIPANT_PATH, "delete", "404"),
+            (crate::bac::FEELING_SUGGESTION_PATH, "get", "400"),
+            (crate::bac::FEELING_SUGGESTION_PATH, "get", "404"),
         ] {
             let schema = &document["paths"][path][method]["responses"][status]["content"]["application/json"]
                 ["schema"];
@@ -304,6 +309,31 @@ mod tests {
         let event = query_parameter(&document, path, "event_id");
         assert_eq!(event["schema"]["format"], "uuid", "{event}");
         assert_ne!(event["required"], true, "{event}");
+    }
+
+    #[test]
+    fn the_feeling_suggestion_publishes_its_optional_instant_and_its_bounded_rating() {
+        let document = rendered();
+        let path = crate::bac::FEELING_SUGGESTION_PATH;
+        let parameter = query_parameter(&document, path, "at");
+        assert_eq!(parameter["schema"]["format"], "date-time", "{parameter}");
+        assert_ne!(parameter["required"], true, "{parameter}");
+        let suggestion = &document["components"]["schemas"]["FeelingSuggestion"];
+        let rating = &suggestion["properties"]["rating"];
+        assert_eq!(rating["minimum"], 1, "{suggestion}");
+        assert_eq!(
+            rating["maximum"],
+            domain::feeling::SUGGESTED_RATING_MAX,
+            "{suggestion}"
+        );
+        let mut required: Vec<&str> = suggestion["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a suggestion requires nothing: {suggestion}"))
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        required.sort_unstable();
+        assert_eq!(required, ["at", "bac_g_per_l", "rating"], "{suggestion}");
     }
 
     #[test]

@@ -212,3 +212,54 @@ fn the_front_pages_within_the_bounds_the_api_enforces() {
          no longer agree on the default page"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Feeling suggestion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_rating_suggested_is_one_a_drink_accepts() {
+    // The form of #29 pre-selects the `rating` of
+    // `GET /profiles/{id}/feeling-suggestion` and posts it back as the
+    // `feeling_rating` of the drink: a suggestion outside the scale the drink
+    // endpoints validate would be answered with a 400 the user never chose.
+    // Swept over the concentrations rather than read from the constants
+    // alone, so that a scale overshooting its own maximum fails too.
+    use api::drink::validation::{FEELING_RATING_MAX, FEELING_RATING_MIN};
+    use domain::feeling::{SUGGESTED_RATING_MAX, SUGGESTED_RATING_MIN, suggested_rating};
+
+    assert_eq!(i64::from(SUGGESTED_RATING_MIN), FEELING_RATING_MIN);
+    assert!(i64::from(SUGGESTED_RATING_MAX) <= FEELING_RATING_MAX);
+    for thousandths in 0..=10_000 {
+        let rating = i64::from(suggested_rating(f64::from(thousandths) / 1000.0));
+        assert!(
+            (FEELING_RATING_MIN..=FEELING_RATING_MAX).contains(&rating),
+            "{thousandths} mg/L suggests {rating}, which a drink refuses"
+        );
+    }
+}
+
+#[test]
+fn a_feeling_suggestion_travels_under_the_members_the_front_reads() {
+    // `{ at, bac_g_per_l, rating }`, the shape #73 sets for the form of #29,
+    // checked on the serialised payload rather than on the struct, so that a
+    // `serde` rename cannot slip past.
+    let suggestion = api::bac::FeelingSuggestion {
+        at: "2026-08-20T23:04:00Z".parse().expect("a real instant"),
+        bac_g_per_l: 0.0,
+        rating: 1,
+    };
+    let value = serde_json::to_value(&suggestion).expect("the payload must serialise");
+    let members: BTreeSet<&str> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        members,
+        BTreeSet::from(["at", "bac_g_per_l", "rating"]),
+        "{value}"
+    );
+    assert_eq!(value["at"], "2026-08-20T23:04:00Z");
+}

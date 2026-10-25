@@ -41,6 +41,25 @@ pub struct ProfileBac {
     pub bac_g_per_l: Vec<f64>,
 }
 
+/// The feeling rating suggested to a profile at an instant (SPEC.md §5.3,
+/// §5.9).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct FeelingSuggestion {
+    /// Instant of the suggestion: `at`, or the instant of the request,
+    /// truncated to the minute.
+    #[schema(value_type = String, format = DateTime, example = "2026-08-20T23:04:00Z")]
+    pub at: Timestamp,
+    /// Blood alcohol concentration at `at`, in grams per litre: the value of
+    /// the curve of the profile at that instant, unrounded, from the drinks
+    /// stored — the drink being entered is not one of them yet.
+    pub bac_g_per_l: f64,
+    /// Feeling rating suggested, from 1 to 6: the scale of SPEC.md §5.9
+    /// applied to `bac_g_per_l` rounded to two decimals, each band including
+    /// its lower bound. Levels 7 to 10 are never suggested.
+    #[schema(minimum = 1, maximum = 6, example = 2)]
+    pub rating: u8,
+}
+
 /// The curve of one participant of an event, on the grid of the event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ParticipantBac {

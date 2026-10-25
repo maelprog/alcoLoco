@@ -73,6 +73,18 @@ pub struct EventBacQuery {
     pub step: Option<String>,
 }
 
+/// The `?at=` of `GET /profiles/{id}/feeling-suggestion`, exactly as it
+/// arrives.
+#[derive(Debug, Default, Clone, serde::Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct FeelingSuggestionQuery {
+    /// Instant of the suggestion, usually the ingestion time of the drink
+    /// being entered. Defaults to the instant of the request. Truncated to
+    /// the minute.
+    #[param(value_type = Option<String>, format = DateTime, example = "2026-08-20T23:04:00Z")]
+    pub at: Option<String>,
+}
+
 /// Instants sampled by a series, in seconds since the Unix epoch.
 ///
 /// Empty when `to < from`: an open-ended event starting more than three hours
@@ -260,6 +272,24 @@ impl EventBacQuery {
             step,
         }
         .fitted(participants))
+    }
+}
+
+impl FeelingSuggestionQuery {
+    /// The minute of the suggestion: `at` truncated to the minute, or the
+    /// minute of `now` when the request names no instant.
+    ///
+    /// # Errors
+    ///
+    /// The field error of `at`, when it is not a date-time.
+    pub fn into_minute(self, now: Timestamp) -> Result<i64, Vec<FieldError>> {
+        let Some(text) = self.at else {
+            return Ok(minute_of(now));
+        };
+        let mut errors = Vec::new();
+        read_instant(&mut errors, "at", Some(&text))
+            .map(minute_of)
+            .ok_or(errors)
     }
 }
 
@@ -639,5 +669,34 @@ mod tests {
             )
             .expect("valid");
         assert_eq!(ten.step, 60);
+    }
+
+    fn suggestion(at: Option<&str>) -> FeelingSuggestionQuery {
+        FeelingSuggestionQuery {
+            at: at.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_suggestion_is_of_the_minute_asked_for_or_of_now() {
+        let now = at("2026-08-20T23:04:59.9Z");
+        assert_eq!(
+            suggestion(None).into_minute(now),
+            Ok(seconds("2026-08-20T23:04:00Z"))
+        );
+        assert_eq!(
+            suggestion(Some("2026-08-20T21:30:45+02:00")).into_minute(now),
+            Ok(seconds("2026-08-20T19:30:00Z"))
+        );
+    }
+
+    #[test]
+    fn the_instant_of_a_suggestion_has_to_be_readable() {
+        for text in ["", "now", "2026-08-20", "2026-13-01T00:00:00Z"] {
+            let errors = suggestion(Some(text))
+                .into_minute(at("2026-08-20T23:04:00Z"))
+                .expect_err(text);
+            assert_eq!(fields(errors), ["at"], "{text}");
+        }
     }
 }

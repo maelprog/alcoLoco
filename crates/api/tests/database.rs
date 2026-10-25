@@ -4354,3 +4354,134 @@ async fn many_participants_widen_the_step_of_an_event_to_fit_the_cap() {
     assert_eq!(status, StatusCode::OK, "{coarse}");
     assert_eq!(coarse["step_seconds"], 600);
 }
+
+// ---------------------------------------------------------------------------
+// Feeling suggestion (#73)
+// ---------------------------------------------------------------------------
+
+/// The feeling suggestion of a profile, which has to be served.
+async fn feeling_suggestion(state: &AppState, profile: Uuid, query: &str) -> Value {
+    let (status, body) = body_of(
+        state.clone(),
+        &format!("/profiles/{profile}/feeling-suggestion{query}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{query}: {body}");
+    body
+}
+
+#[tokio::test]
+async fn a_profile_that_never_drank_is_suggested_the_lowest_rating() {
+    let name = "a_profile_that_never_drank_is_suggested_the_lowest_rating";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_reference_man("Sobre")).await;
+
+    let body = feeling_suggestion(&state, profile, "?at=2025-08-20T21:04:59.9Z").await;
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "at": "2025-08-20T21:04:00Z",
+            "bac_g_per_l": 0.0,
+            "rating": 1,
+        })
+    );
+
+    // Without `at`, the suggestion is of the minute of the request.
+    let before = chrono::Utc::now();
+    let body = feeling_suggestion(&state, profile, "").await;
+    let after = chrono::Utc::now();
+    let at: api::Timestamp = body["at"]
+        .as_str()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| panic!("no instant: {body}"));
+    assert_eq!(at.timestamp() % 60, 0, "{body}");
+    assert!(
+        at.timestamp() >= before.timestamp() - 60 && at <= after,
+        "{body}"
+    );
+    assert_eq!(body["rating"], 1, "{body}");
+}
+
+#[tokio::test]
+async fn the_suggestion_reads_the_value_of_the_curve_at_the_same_instant() {
+    // Acceptance criterion of #73: the concentration the rating is read from
+    // is the one `GET /profiles/{id}/bac` serves at the same minute, to the
+    // bit — the same drinks, the same settings, the same engine. Four beers
+    // take the reference man through several bands and back to zero.
+    let name = "the_suggestion_reads_the_value_of_the_curve_at_the_same_instant";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_reference_man("Barème")).await;
+    for ingested_at in [
+        "2025-08-20T21:00:00Z",
+        "2025-08-20T21:10:00Z",
+        "2025-08-20T21:20:00Z",
+        "2025-08-20T21:30:00Z",
+    ] {
+        record_drink(&state, profile, &a_timed_beer(ingested_at, 50.0)).await;
+    }
+
+    let mut ratings = BTreeSet::new();
+    let start: api::Timestamp = "2025-08-20T20:50:00Z".parse().expect("an instant");
+    for index in 0..40 {
+        // Off the minute on purpose: both endpoints truncate it.
+        let minute = start + chrono::TimeDelta::seconds(index * 600);
+        let instant = minute + chrono::TimeDelta::seconds(37);
+        let minute = minute.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let text = instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let curve = profile_curve(&state, profile, &format!("from={text}&to={text}")).await;
+        let body = feeling_suggestion(&state, profile, &format!("?at={text}")).await;
+        assert_eq!(body["at"], minute, "{body}");
+        assert_eq!(curve["times"][0], minute, "{curve}");
+        assert_eq!(
+            bits_of(&serde_json::json!([body["bac_g_per_l"]])),
+            bits_of(&curve["bac_g_per_l"]),
+            "{text}: {body} against {curve}"
+        );
+        let bac = body["bac_g_per_l"].as_f64().expect("a number");
+        let rating = body["rating"].as_u64().expect("a rating");
+        assert_eq!(
+            rating,
+            u64::from(domain::feeling::suggested_rating(bac)),
+            "{body}"
+        );
+        ratings.insert(rating);
+    }
+    // Sober before, sober long after, and at least two bands in between.
+    assert!(ratings.len() >= 3, "{ratings:?}");
+    assert!(ratings.contains(&1), "{ratings:?}");
+}
+
+#[tokio::test]
+async fn the_suggestion_refuses_what_it_cannot_read() {
+    let name = "the_suggestion_refuses_what_it_cannot_read";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_reference_man("Refus")).await;
+
+    let (status, body) = body_of(
+        state.clone(),
+        &format!("/profiles/{}/feeling-suggestion", Uuid::now_v7()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["type"], "/problems/not_found");
+
+    for at in ["", "demain", "2025-08-20", "2025-08-20T25:00:00Z"] {
+        let (status, body) = body_of(
+            state.clone(),
+            &format!("/profiles/{profile}/feeling-suggestion?at={at}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{at}: {body}");
+        assert_eq!(body["type"], "/problems/validation_failed", "{at}");
+        assert_eq!(body["errors"][0]["field"], "at", "{at}: {body}");
+    }
+
+    let (status, body) = body_of(state, "/profiles/not-a-uuid/feeling-suggestion").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

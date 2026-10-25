@@ -1,5 +1,6 @@
 //! Blood alcohol curves: of a profile, and of every participant of an event
-//! (SPEC.md §5.6, §5.7).
+//! (SPEC.md §5.6, §5.7); and the feeling rating suggested to a profile at an
+//! instant, read from the value of its curve then (SPEC.md §5.3, §5.9).
 //!
 //! The module is split like [`crate::drink`]: [`model`] holds the payload
 //! types, [`query`] reads the window and the step, [`store`] holds every
@@ -24,7 +25,10 @@
 //!   its ingestion, and the current value is that of the minute of the
 //!   request;
 //! - a drink ingested before the birth date of its profile counts for
-//!   nothing (user decision of 2026-10-21).
+//!   nothing (user decision of 2026-10-21);
+//! - the suggestion reads the value `GET /profiles/{id}/bac` serves at the
+//!   same minute, and applies to it the scale of
+//!   [`domain::feeling::suggested_rating`].
 
 pub mod model;
 pub mod query;
@@ -41,14 +45,20 @@ use crate::extract::{Path, Query};
 use crate::timestamp::{self, Timestamp};
 use crate::{AppState, ProblemDetails};
 
-pub use model::{EventBac, ParticipantBac, ProfileBac};
-use query::{EventBacQuery, Grid, MINUTE_SECONDS, ProfileBacQuery, instant, minute_of};
+pub use model::{EventBac, FeelingSuggestion, ParticipantBac, ProfileBac};
+use query::{
+    EventBacQuery, FeelingSuggestionQuery, Grid, MINUTE_SECONDS, ProfileBacQuery, instant,
+    minute_of,
+};
 
 /// Where the curve of a profile is served, in the path syntax of axum 0.8.
 pub const PROFILE_PATH: &str = "/profiles/{id}/bac";
 
 /// Where the curves of an event are served.
 pub const EVENT_PATH: &str = "/events/{id}/bac";
+
+/// Where the feeling rating suggested to a profile is served.
+pub const FEELING_SUGGESTION_PATH: &str = "/profiles/{id}/feeling-suggestion";
 
 /// The instant `seconds` after the epoch, which a grid built from real
 /// instants always has.
@@ -60,7 +70,14 @@ fn at(seconds: i64) -> Result<Timestamp, ApiError> {
 /// a drink starting after both the window and the request changes no value
 /// of it.
 fn drinks_before(grid: Grid, now: Timestamp) -> Result<Timestamp, ApiError> {
-    at(grid.to.max(minute_of(now)))?
+    drinks_until(grid.to.max(minute_of(now)))
+}
+
+/// The exclusive bound on the ingestion time of the drinks that may change
+/// the value at `minute`: the end of that minute, a drink starting within it
+/// counting from it.
+fn drinks_until(minute: i64) -> Result<Timestamp, ApiError> {
+    at(minute)?
         .checked_add_signed(TimeDelta::seconds(MINUTE_SECONDS))
         .ok_or_else(|| ApiError::internal("no instant after the window"))
 }
@@ -176,6 +193,47 @@ pub async fn event(
     }))
 }
 
+/// The feeling rating suggested to a profile at an instant, and the blood
+/// alcohol concentration it is read from.
+#[utoipa::path(
+    get,
+    path = FEELING_SUGGESTION_PATH,
+    tag = "curves",
+    params(
+        ("id" = Uuid, Path, description = "Identifier of the profile"),
+        FeelingSuggestionQuery,
+    ),
+    responses(
+        (status = 200, description = "The rating suggested at the instant, and the value of the curve then", body = FeelingSuggestion),
+        (status = 400, description = "Unusable identifier or `at`", body = ProblemDetails),
+        (status = 404, description = "No profile carries that identifier", body = ProblemDetails),
+        (status = 409, description = "The settings in force at a drink give no positive body water", body = ProblemDetails),
+    ),
+)]
+pub async fn feeling_suggestion(
+    State(state): State<AppState>,
+    Path(profile_id): Path<Uuid>,
+    Query(query): Query<FeelingSuggestionQuery>,
+) -> Result<Json<FeelingSuggestion>, ApiError> {
+    let minute = query
+        .into_minute(timestamp::now())
+        .map_err(ApiError::validation)?;
+    let drinks = store::profile_drinks(&state.pool, profile_id, drinks_until(minute)?)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no profile with identifier {profile_id}")))?;
+    let intakes = drinks
+        .iter()
+        .map(|drink| series::intake(profile_id, drink))
+        .filter_map(Result::transpose)
+        .collect::<Result<Vec<_>, _>>()?;
+    let bac_g_per_l = series::value_at(&intakes, minute)?;
+    Ok(Json(FeelingSuggestion {
+        at: at(minute)?,
+        bac_g_per_l,
+        rating: domain::feeling::suggested_rating(bac_g_per_l),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +242,10 @@ mod tests {
     fn the_curves_hang_under_the_resources_they_are_of() {
         assert_eq!(PROFILE_PATH, format!("{}/bac", crate::profile::ITEM_PATH));
         assert_eq!(EVENT_PATH, format!("{}/bac", crate::event::ITEM_PATH));
+        assert_eq!(
+            FEELING_SUGGESTION_PATH,
+            format!("{}/feeling-suggestion", crate::profile::ITEM_PATH)
+        );
     }
 
     #[test]
