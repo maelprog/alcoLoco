@@ -2,8 +2,10 @@
 
 Every `<version>_<description>.sql` file of this directory is embedded in the
 `db` crate at compile time by `sqlx::migrate!("./migrations")`
-(`crates/db/src/lib.rs`) and applied in version order. sqlx only takes files
-whose name ends in `.sql`: this README is not a migration.
+(`crates/db/src/lib.rs`) and applied in version order. sqlx skips every file
+whose name is not `<something>_<something>.sql`, so this README is not a
+migration. Any other file kept here must not be named that way: sqlx would
+take it for a migration, and a prefix that is not an integer fails the build.
 
 ## Append-only
 
