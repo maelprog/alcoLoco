@@ -6,6 +6,8 @@ Every `<version>_<description>.sql` file of this directory is embedded in the
 whose name is not `<something>_<something>.sql`, so this README is not a
 migration. Any other file kept here must not be named that way: sqlx would
 take it for a migration, and a prefix that is not an integer fails the build.
+(`sqlx-core` 0.8.6: `src/migrate/source.rs` for the file names,
+`src/migrate/migration.rs` for the checksum.)
 
 ## Append-only
 
@@ -16,7 +18,7 @@ checksum of its **whole file**, comments and whitespace included. On every
 `migrate`, it recomputes the checksum of each file already applied and refuses
 to go on when one differs (`migration … was previously applied but has been
 modified`). Editing a merged file therefore breaks `migrate` on every database
-already migrated — development, CI fixtures, production alike.
+already migrated, development and production alike.
 
 A schema change goes in a new file. A comment that has become wrong goes in
 the errata below.
