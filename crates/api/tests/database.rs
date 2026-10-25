@@ -4634,6 +4634,59 @@ async fn deleting_a_profile_while_its_settings_change_leaves_no_half_state() {
 }
 
 #[tokio::test]
+async fn deleting_a_profile_keeps_an_event_another_profile_is_joining() {
+    // The deletion locks the events of the profile before deleting it (#75):
+    // a participant being added to an event the profile was alone in is
+    // either committed before the deletion looks for events left empty, or
+    // added after it. Here the addition is held open while
+    // `DELETE /profiles/{id}` runs: the deletion waits for it, then finds the
+    // event no longer empty and keeps it, with its new participant.
+    use sqlx::Connection as _;
+    let name = "deleting_a_profile_keeps_an_event_another_profile_is_joining";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let url = database_url(name).expect("checked by `migrated`");
+    let (gone, _) = create_profile(&state, &a_reference_man("Supprimé")).await;
+    let (joins, _) = create_profile(&state, &a_reference_man("Arrive")).await;
+    let event = event_with(&state, gone).await;
+
+    let mut addition = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("a second connection");
+    let addition_pid: i32 = sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+        .fetch_one(&mut addition)
+        .await
+        .expect("the pid");
+    sqlx::query("BEGIN")
+        .execute(&mut addition)
+        .await
+        .expect("BEGIN");
+    sqlx::query("INSERT INTO public.event_participant (event_id, profile_id) VALUES ($1, $2)")
+        .bind(event)
+        .bind(joins)
+        .execute(&mut addition)
+        .await
+        .expect("the addition itself");
+    let uri = format!("/profiles/{gone}");
+    let (answer, ()) = tokio::join!(send(state.clone(), "DELETE", &uri, None), async {
+        assert!(
+            wait_until_blocked_by(&state.pool, addition_pid).await,
+            "the deletion must wait for the addition"
+        );
+        sqlx::query("COMMIT")
+            .execute(&mut addition)
+            .await
+            .expect("the addition must commit");
+    });
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+
+    let (status, read) = body_of(state.clone(), &format!("/events/{event}")).await;
+    assert_eq!(status, StatusCode::OK, "the event must stay: {read}");
+    assert_eq!(participants_in(&read), [joins]);
+}
+
+#[tokio::test]
 async fn deleting_a_profile_waits_for_a_version_removal_whatever_the_cascade_order() {
     // `profile` fires its cascades in the order of their trigger names, which
     // follows the order in which the foreign keys were created. A database
