@@ -13,8 +13,10 @@ node_modules/
 # Worktrees des agents : contenu volatil, jamais versionné.
 /.claude/worktrees/
 
-# État de l'orchestrateur : local à ce poste. Seul le briefing
-# (.claude/orchestrator.md) reste versionné.
+# Outillage de l'orchestrateur : entièrement local à ce poste, rien n'est
+# versionné (briefing, historique, file d'issues, arbitrages, journaux).
+/.claude/orchestrator.md
+/.claude/orchestrator-history.md
 /.claude/issue-queue.md
 /.claude/issue-queue-done.md
 /.claude/arbitrages.md
