@@ -1,4 +1,6 @@
-//! The sampling grid of a series: its query parameters and its window.
+//! The sampling grid of a series: its query parameters and its window; and
+//! the `?at=` of a feeling suggestion, the minute it is read at
+//! ([`FeelingSuggestionQuery`]).
 //!
 //! A series is sampled on a grid starting on a whole minute, `from`,
 //! `from + step`, …, up to `to` included when it falls on the step. Every

@@ -3,7 +3,8 @@
 //! instant, read from the value of its curve then (SPEC.md §5.3, §5.9).
 //!
 //! The module is split like [`crate::drink`]: [`model`] holds the payload
-//! types, [`query`] reads the window and the step, [`store`] holds every
+//! types, [`query`] reads the window and the step of a curve and the `at` of
+//! a suggestion, [`store`] holds every
 //! statement, [`series`] turns the stored drinks into values, and this file
 //! holds the handlers. What is worth knowing before reading them:
 //!

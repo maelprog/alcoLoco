@@ -1,5 +1,6 @@
 //! What the front and the back have to spell identically: the problem
-//! identifiers below, and the pagination bounds at the end of the file.
+//! identifiers below, then the pagination bounds, then the feeling
+//! suggestion at the end of the file.
 //!
 //! `web/src/app/core/api/problem-details.ts` mirrors the problem identifiers of
 //! `crates/api/src/error.rs`. RFC 7807 makes `type` the stable member and the
@@ -17,8 +18,15 @@
 //!
 //! The test that *looked* like it covered this, `api-error.spec.ts`, enumerates
 //! the front's own constants; it can see neither a transcription error nor a
-//! seventh kind added on the backend. This file reads **both sources** and
-//! compares them, so it sees both.
+//! seventh kind added on the backend. For the problem identifiers and the
+//! pagination bounds, this file reads **both sources** and compares them, so
+//! it sees both.
+//!
+//! The feeling suggestion section checks the back alone, until the form of
+//! #29 ships the front side: every rating `GET /profiles/{id}/feeling-suggestion`
+//! can suggest is one the drink endpoints accept as `feeling_rating`, and its
+//! payload travels as `{ at, bac_g_per_l, rating }`. No TypeScript is read
+//! there yet, so a drift on the front side goes unnoticed.
 //!
 //! It lives on the Rust side for one reason: `include_str!` gives a compile-time
 //! read of a file two directories up, and the Rust gate runs on every pull
