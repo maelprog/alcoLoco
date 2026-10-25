@@ -66,3 +66,19 @@ Correct statement: no migration carries it. The rule lives in SPEC.md §10.3
 and in `EventBacQuery::into_grid` (`crates/api/src/bac/query.rs`). The column
 comment itself is stored in the database catalog, so `\d+ event` and
 `col_description()` still return the wrong text.
+
+### 3. `20260819090000_initial_schema.sql:245-265` and `:326-331` — concurrent removals of settings versions
+
+What the file says: class (d), two concurrent transactions each removing a
+different version of the same profile and leaving it without any, is open;
+readers of a profile's settings may not rely on the invariant under concurrent
+writes "for as long as #43 is open".
+
+What is true: #43 closed class (d). A profile can no longer be left without a
+settings version by concurrent removals; the second writer is refused
+(SQLSTATE 23000 under READ COMMITTED, 40001 under REPEATABLE READ and
+SERIALIZABLE). The measurements of class (d) remain the history of the defect.
+
+Correct statement:
+`20260919090000_settings_version_check_under_concurrency.sql:14-18` (what stops
+being true in the initial migration) and `:25-43` (how the check holds).
