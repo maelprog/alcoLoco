@@ -44,7 +44,17 @@
 --     towards the versions, before it holds the guard row, and the check can
 --     write it at COMMIT. Were the guard cascade to run first, the two would
 --     deadlock. The order rests on the names comparing as the oids do, which
---     holds as long as both oids have the same number of digits;
+--     holds as long as both oids have the same number of digits, and on the
+--     foreign keys keeping their creation order — which a restore does not:
+--     `pg_dump` recreates them in alphabetical order, the guard's before the
+--     versions', and the guard cascade then runs first. `DELETE
+--     /profiles/{id}` therefore does not rely on that order: it locks the
+--     profile row, then its versions, before deleting the profile, and waits
+--     for a removal holding nothing its COMMIT needs. A plain `DELETE FROM
+--     profile` that does not take those locks first, run on a database
+--     whose guard cascade runs first, can deadlock (40P01) with a concurrent
+--     removal of one of its versions: PostgreSQL aborts one of the two, which
+--     leaves nothing half done and can be replayed;
 --   * a guard row deleted by hand, class (b) of migration 20260919090000, is
 --     written again by an `INSERT`, which takes the `FOR KEY SHARE` lock: that
 --     check can then wait for, and deadlock with, a transaction holding the

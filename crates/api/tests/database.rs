@@ -4634,6 +4634,149 @@ async fn deleting_a_profile_while_its_settings_change_leaves_no_half_state() {
 }
 
 #[tokio::test]
+async fn deleting_a_profile_waits_for_a_version_removal_whatever_the_cascade_order() {
+    // `profile` fires its cascades in the order of their trigger names, which
+    // follows the order in which the foreign keys were created. A database
+    // restored by `pg_dump | psql` recreates them in alphabetical order, so
+    // that there the cascade towards the guard row runs before the one
+    // towards the versions. A deletion that reached the versions only through
+    // its cascade would then hold the guard row while waiting for a
+    // transaction that removed one of them — and that transaction writes the
+    // guard row at COMMIT: a deadlock. `DELETE /profiles/{id}` locks the
+    // versions first, and waits holding nothing that COMMIT needs.
+    //
+    // The order is swapped in a database of its own, created on the same
+    // server and dropped afterwards, so that no other test runs against it.
+    use sqlx::Connection as _;
+    let name = "deleting_a_profile_waits_for_a_version_removal_whatever_the_cascade_order";
+    let Some(url) = database_url(name) else {
+        return;
+    };
+    let (server, _) = url
+        .rsplit_once('/')
+        .expect("DATABASE_URL must name a database");
+    let database = format!("restored_{}", Uuid::now_v7().simple());
+    let mut admin = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("an administration connection");
+    sqlx::query(&format!("CREATE DATABASE {database}"))
+        .execute(&mut admin)
+        .await
+        .expect("the database of this test must be created");
+    let own_url = format!("{server}/{database}");
+    let state = state(&own_url);
+
+    // Run apart, so that a failure still drops the database before it is
+    // reported. The router's future is not `Send`: a local task.
+    let local = tokio::task::LocalSet::new();
+    let scenario = local.spawn_local({
+        let state = state.clone();
+        async move {
+            db::migrate(&state.pool)
+                .await
+                .expect("the migrations must apply");
+            sqlx::query(
+                "ALTER TABLE public.profile_settings_version
+                     DROP CONSTRAINT profile_settings_version_profile_id_fkey,
+                     ADD CONSTRAINT profile_settings_version_profile_id_fkey
+                         FOREIGN KEY (profile_id) REFERENCES public.profile (id)
+                         ON DELETE CASCADE",
+            )
+            .execute(&state.pool)
+            .await
+            .expect("the foreign key of the versions must be recreated");
+            let cascades: Vec<String> = sqlx::query_scalar(
+                "SELECT c.conrelid::pg_catalog.regclass::pg_catalog.text
+                 FROM pg_catalog.pg_trigger AS t
+                 JOIN pg_catalog.pg_constraint AS c ON c.oid = t.tgconstraint
+                 WHERE t.tgrelid = 'public.profile'::pg_catalog.regclass
+                   AND t.tgname LIKE 'RI\\_ConstraintTrigger\\_a\\_%'
+                   AND t.tgtype & 8 = 8
+                 ORDER BY t.tgname",
+            )
+            .fetch_all(&state.pool)
+            .await
+            .expect("the cascades of `profile` must be readable");
+            let position = |table: &str| {
+                cascades
+                    .iter()
+                    .position(|t| t == table)
+                    .unwrap_or_else(|| panic!("no cascade towards {table}: {cascades:?}"))
+            };
+            assert!(
+                position("profile_settings_guard") < position("profile_settings_version"),
+                "the guard cascade must now run first: {cascades:?}"
+            );
+
+            let (profile, _) = create_profile(&state, &a_reference_man("Restaurée")).await;
+            let mut heavier = a_reference_man("Restaurée");
+            heavier["settings"]["weight_kg"] = Value::from(85.0);
+            heavier["settings"]["valid_from"] = Value::from("2025-06-01T00:00:00Z");
+            let answer = send(
+                state.clone(),
+                "PUT",
+                &format!("/profiles/{profile}"),
+                Some(heavier),
+            )
+            .await;
+            assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+            assert_eq!(version_count(&state.pool, profile).await, 2);
+
+            let mut removal = sqlx::PgConnection::connect(&own_url)
+                .await
+                .expect("a second connection");
+            let removal_pid: i32 = sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+                .fetch_one(&mut removal)
+                .await
+                .expect("the pid");
+            sqlx::query("BEGIN")
+                .execute(&mut removal)
+                .await
+                .expect("BEGIN");
+            let removed = sqlx::query(
+                "DELETE FROM public.profile_settings_version
+                 WHERE profile_id = $1 AND valid_from > '2025-03-01T00:00:00Z'",
+            )
+            .bind(profile)
+            .execute(&mut removal)
+            .await
+            .expect("the removal itself")
+            .rows_affected();
+            assert_eq!(removed, 1);
+            let uri = format!("/profiles/{profile}");
+            let (answer, ()) = tokio::join!(send(state.clone(), "DELETE", &uri, None), async {
+                assert!(
+                    wait_until_blocked_by(&state.pool, removal_pid).await,
+                    "the deletion must wait for the removal"
+                );
+                sqlx::query("COMMIT")
+                    .execute(&mut removal)
+                    .await
+                    .expect("the removal must commit");
+            });
+            assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+            for table in ["profile_settings_version", "profile_settings_guard"] {
+                assert_eq!(
+                    rows_of_profile(&state.pool, table, profile).await,
+                    0,
+                    "{table}"
+                );
+            }
+        }
+    });
+    let scenario = local.run_until(scenario).await;
+
+    state.pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        .execute(&mut admin)
+        .await
+        .expect("the database of this test must be dropped");
+    if let Err(failure) = scenario {
+        std::panic::resume_unwind(failure.into_panic());
+    }
+}
+
+#[tokio::test]
 async fn the_window_of_an_event_follows_now_until_its_end() {
     // SPEC.md §10.3: the window closes three hours after the end of the
     // event, or after now while it is open-ended; an event yet to start is

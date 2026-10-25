@@ -131,5 +131,5 @@ The check only ever updates an existing guard row, which takes no lock on the
 profile row, so the interleavings of plain DML that motivated the absence of a
 foreign key still commit.
 
-Correct statement: `20261025090000_profile_settings_guard_follows_its_profile.sql:1-67`,
+Correct statement: `20261025090000_profile_settings_guard_follows_its_profile.sql:1-77`,
 whose `COMMENT ON TABLE` also replaces the stored table comment.

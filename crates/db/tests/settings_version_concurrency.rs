@@ -902,7 +902,11 @@ async fn deleting_a_profile_while_its_settings_change_does_not_deadlock() {
     // 1 and 2. t changes the settings of P and has not committed; t2 deletes
     //    P and waits for t; t commits, then t2. In the removal case the
     //    deletion waits in its cascade towards the versions, and must not be
-    //    holding the guard row t writes at COMMIT by then.
+    //    holding the guard row t writes at COMMIT by then. That holds on a
+    //    schema built by the migrations, where the guard cascade runs last;
+    //    on a restored one it runs first, and this plain deletion deadlocks —
+    //    which is why `DELETE /profiles/{id}` locks the versions beforehand
+    //    (see migration 20261025090000).
     for (label, removal) in [
         ("change first, removal", true),
         ("change first, addition", false),
