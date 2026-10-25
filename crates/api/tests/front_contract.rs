@@ -1,6 +1,7 @@
 //! What the front and the back have to spell identically: the problem
 //! identifiers below, then the pagination bounds, then the feeling
-//! suggestion, then the event deletion at the end of the file.
+//! suggestion, then the event deletion, then the profile deletion at the end
+//! of the file.
 //!
 //! `web/src/app/core/api/problem-details.ts` mirrors the problem identifiers of
 //! `crates/api/src/error.rs`. RFC 7807 makes `type` the stable member and the
@@ -31,6 +32,9 @@
 //! The event deletion section checks the back alone too, until the screen of
 //! #23 ships: a drink detached from a deleted event still travels with its
 //! `event_id` member, `null`.
+//!
+//! The profile deletion section reads both sides: a deleted profile is read
+//! back with the problem the front names `ProblemType.notFound`.
 //!
 //! It lives on the Rust side for one reason: `include_str!` gives a compile-time
 //! read of a file two directories up, and the Rust gate runs on every pull
@@ -307,4 +311,26 @@ fn a_drink_detached_from_its_event_travels_with_a_null_event_id() {
     let members = value.as_object().expect("an object");
     assert!(members.contains_key("event_id"), "{value}");
     assert!(value["event_id"].is_null(), "{value}");
+}
+
+// ---------------------------------------------------------------------------
+// Profile deletion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_deleted_profile_reads_as_the_not_found_problem_the_front_names() {
+    // `DELETE /profiles/{id}` (#75) answers 204 without a body, and every
+    // later read of the profile — `GET /profiles/{id}`, its drinks, its
+    // curve — the not-found problem. The front keeps the profile it chose in
+    // `localStorage` (`CurrentProfileStore`), so a profile deleted from
+    // another device is met that way; the screen of #9 has to recognise it
+    // by `type`, under the name `ProblemType.notFound`.
+    let front = between(TYPESCRIPT_SOURCE, "notFound:", "'", "'");
+    let back = api::ApiError::not_found("no profile with identifier …").to_problem_details();
+    assert_eq!(back.status, 404);
+    assert_eq!(
+        back.kind, front,
+        "web/src/app/core/api/problem-details.ts names another identifier \
+         `notFound` than the one a deleted profile is read with"
+    );
 }

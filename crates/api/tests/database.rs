@@ -4296,6 +4296,539 @@ async fn deleting_an_event_keeps_the_drinks_of_its_participants_in_their_history
     assert_eq!(answer.media_type, api::error::PROBLEM_JSON);
 }
 
+/// Every profile identifier `GET /profiles` serves, the whole collection
+/// walked.
+async fn listed_profiles(state: &AppState) -> Vec<Uuid> {
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let uri = match &cursor {
+            None => "/profiles?limit=200".to_owned(),
+            Some(cursor) => format!("/profiles?limit=200&cursor={cursor}"),
+        };
+        let (status, body) = body_of(state.clone(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for item in body["items"].as_array().expect("items") {
+            seen.push(
+                item["id"]
+                    .as_str()
+                    .and_then(|id| id.parse().ok())
+                    .expect("id"),
+            );
+        }
+        match body["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    seen
+}
+
+/// How many rows of `table` name `profile` in their `profile_id` column.
+async fn rows_of_profile(pool: &sqlx::PgPool, table: &str, profile: Uuid) -> i64 {
+    // The table names are the test's own literals, never input.
+    sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM public.{table} WHERE profile_id = $1"
+    ))
+    .bind(profile)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|error| panic!("{table}: {error}"))
+}
+
+#[tokio::test]
+async fn deleting_a_profile_deletes_everything_it_owns() {
+    // Acceptance criteria of #75: the profile is gone from its paths, from
+    // the list and from the participants of its events; nothing it owned is
+    // left in the database, its guard row included; an event it was the only
+    // participant of goes with it (decision of 2026-10-25). Another profile,
+    // its drink in the shared event, and the events it alone takes part in
+    // are left untouched, as is an event that had no participant before.
+    let name = "deleting_a_profile_deletes_everything_it_owns";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (gone, _) = create_profile(&state, &a_reference_man("Supprimé")).await;
+    let (stays, _) = create_profile(&state, &a_reference_man("Reste")).await;
+    let mut heavier = a_reference_man("Supprimé");
+    heavier["settings"]["weight_kg"] = Value::from(85.0);
+    heavier["settings"]["valid_from"] = Value::from("2025-06-01T00:00:00Z");
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/profiles/{gone}"),
+        Some(heavier),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(version_count(&state.pool, gone).await, 2);
+
+    let event = |participants: &[Uuid]| {
+        serde_json::json!({
+            "name": "Soirée",
+            "starts_at": "2025-05-10T20:00:00Z",
+            "ends_at": "2025-05-11T01:00:00Z",
+            "participant_ids": participants.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+        })
+    };
+    let (shared, _) = create_event(&state, &event(&[gone, stays])).await;
+    let (alone, _) = create_event(&state, &event(&[gone])).await;
+    let (other, _) = create_event(&state, &event(&[stays])).await;
+    let (empty, _) = create_event(&state, &event(&[])).await;
+    let mut in_shared = a_timed_beer("2025-05-10T21:00:00Z", 50.0);
+    in_shared["event_id"] = Value::from(shared.to_string());
+    let (gone_in_shared, _) = record_drink(&state, gone, &in_shared).await;
+    let (stays_in_shared, _) = record_drink(&state, stays, &in_shared).await;
+    let mut in_alone = a_timed_beer("2025-05-10T22:00:00Z", 25.0);
+    in_alone["event_id"] = Value::from(alone.to_string());
+    let (gone_in_alone, _) = record_drink(&state, gone, &in_alone).await;
+    let (gone_outside, _) =
+        record_drink(&state, gone, &a_vodka_orange("2025-05-12T21:00:00Z")).await;
+    let gone_drinks = [gone_in_shared, gone_in_alone, gone_outside];
+    for drink in gone_drinks {
+        assert!(component_count(&state.pool, drink).await > 0);
+    }
+
+    let answer = send(state.clone(), "DELETE", &format!("/profiles/{gone}"), None).await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+    assert!(answer.body.is_null(), "a 204 has no body: {}", answer.body);
+
+    // The profile is gone from its paths and from the list.
+    let no_profile = format!("no profile with identifier {gone}");
+    for uri in [
+        format!("/profiles/{gone}"),
+        format!("/profiles/{gone}/drinks"),
+        format!("/profiles/{gone}/bac?from=2025-05-10T20:00:00Z&to=2025-05-11T04:00:00Z&step=60"),
+    ] {
+        let answer = send(state.clone(), "GET", &uri, None).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::NOT_FOUND,
+            "{uri}: {}",
+            answer.body
+        );
+        assert_eq!(answer.media_type, api::error::PROBLEM_JSON, "{uri}");
+    }
+    let listed = listed_profiles(&state).await;
+    assert!(!listed.contains(&gone), "{gone} is still listed");
+    assert!(listed.contains(&stays), "{stays} is no longer listed");
+
+    // It no longer takes part in the shared event, nor in its curves; the
+    // other participant and its drink stay.
+    let (status, read) = body_of(state.clone(), &format!("/events/{shared}")).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(participants_in(&read), [stays]);
+    let (status, curves) = body_of(state.clone(), &format!("/events/{shared}/bac")).await;
+    assert_eq!(status, StatusCode::OK, "{curves}");
+    let served: Vec<&str> = curves["participants"]
+        .as_array()
+        .expect("participants")
+        .iter()
+        .map(|p| p["profile_id"].as_str().expect("an identifier"))
+        .collect();
+    assert_eq!(served, [stays.to_string()]);
+    assert_eq!(history_of(&state.pool, stays).await, [stays_in_shared]);
+
+    // The event it was alone in is gone; the others stay.
+    let answer = send(state.clone(), "GET", &format!("/events/{alone}"), None).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
+    let events = listed_events(&state).await;
+    assert!(!events.contains(&alone), "{alone} is still listed");
+    for kept in [shared, other, empty] {
+        assert!(events.contains(&kept), "{kept} is no longer listed");
+    }
+    let (_, read) = body_of(state.clone(), &format!("/events/{other}")).await;
+    assert_eq!(participants_in(&read), [stays]);
+
+    // Nothing it owned is left in the database.
+    for table in [
+        "profile_settings_version",
+        "event_participant",
+        "drink",
+        "profile_settings_guard",
+    ] {
+        assert_eq!(
+            rows_of_profile(&state.pool, table, gone).await,
+            0,
+            "{table}"
+        );
+    }
+    for drink in gone_drinks {
+        assert_eq!(component_count(&state.pool, drink).await, 0, "{drink}");
+    }
+    assert_eq!(
+        rows_of_profile(&state.pool, "profile_settings_guard", stays).await,
+        1,
+        "the guard row of the other profile stays"
+    );
+
+    // A second deletion finds nothing; an unreadable identifier is a 400.
+    let answer = send(state.clone(), "DELETE", &format!("/profiles/{gone}"), None).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
+    assert_eq!(answer.media_type, api::error::PROBLEM_JSON);
+    assert_eq!(answer.body["detail"], no_profile);
+    let answer = send(state, "DELETE", "/profiles/not-a-uuid", None).await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.media_type, api::error::PROBLEM_JSON);
+}
+
+/// Waits until some backend is blocked on a lock `holder` holds. Returns
+/// whether one got there within about 5 s.
+async fn wait_until_blocked_by(pool: &sqlx::PgPool, holder: i32) -> bool {
+    for _ in 0..500 {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity
+                            WHERE $1 = ANY (pg_catalog.pg_blocking_pids(pid)))",
+        )
+        .bind(holder)
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_activity must be readable");
+        if blocked {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn deleting_a_profile_while_its_settings_change_leaves_no_half_state() {
+    // Third acceptance criterion of #75. A transaction changing the settings
+    // of a profile is held open while `DELETE /profiles/{id}` runs, then the
+    // reverse: a transaction deleting the profile is held open while
+    // `PUT /profiles/{id}` runs. Whichever comes first, the other waits for
+    // it, and the end state is whole: either the profile with its versions,
+    // or nothing at all — no version, participation, drink or guard row left
+    // for a profile that is gone.
+    use sqlx::Connection as _;
+    let name = "deleting_a_profile_while_its_settings_change_leaves_no_half_state";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let url = database_url(name).expect("checked by `migrated`");
+    let nothing_left = |profile: Uuid| {
+        let pool = state.pool.clone();
+        async move {
+            for table in [
+                "profile",
+                "profile_settings_version",
+                "event_participant",
+                "drink",
+                "profile_settings_guard",
+            ] {
+                let column = if table == "profile" {
+                    "id"
+                } else {
+                    "profile_id"
+                };
+                let left: i64 = sqlx::query_scalar(&format!(
+                    "SELECT count(*) FROM public.{table} WHERE {column} = $1"
+                ))
+                .bind(profile)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("{table}: {error}"));
+                assert_eq!(left, 0, "{table}");
+            }
+        }
+    };
+
+    // The settings change first: the removal of the later version and the
+    // addition of another, as a retroactive `PUT` does, in plain DML. The
+    // deletion waits for it on the profile row, which the foreign key of the
+    // added version holds `FOR KEY SHARE`.
+    let (profile, _) = create_profile(&state, &a_reference_man("Course")).await;
+    let mut heavier = a_reference_man("Course");
+    heavier["settings"]["weight_kg"] = Value::from(85.0);
+    heavier["settings"]["valid_from"] = Value::from("2025-06-01T00:00:00Z");
+    let answer = send(
+        state.clone(),
+        "PUT",
+        &format!("/profiles/{profile}"),
+        Some(heavier),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    event_with(&state, profile).await;
+    record_drink(&state, profile, &a_timed_beer("2025-07-01T21:00:00Z", 25.0)).await;
+    let mut change = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("a second connection");
+    let change_pid: i32 = sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+        .fetch_one(&mut change)
+        .await
+        .expect("the pid");
+    sqlx::query("BEGIN")
+        .execute(&mut change)
+        .await
+        .expect("BEGIN");
+    let removed = sqlx::query(
+        "DELETE FROM public.profile_settings_version
+         WHERE profile_id = $1 AND valid_from > '2025-03-01T00:00:00Z'",
+    )
+    .bind(profile)
+    .execute(&mut change)
+    .await
+    .expect("the removal itself")
+    .rows_affected();
+    assert_eq!(removed, 1);
+    sqlx::query(
+        "INSERT INTO public.profile_settings_version (
+             id, profile_id, valid_from, weight_kg, height_cm, sex, birth_date
+         ) VALUES ($1, $2, '2025-03-01T00:00:00Z', 90, 180, 'male', '1996-08-20')",
+    )
+    .bind(api::new_id())
+    .bind(profile)
+    .execute(&mut change)
+    .await
+    .expect("the addition itself");
+    let uri = format!("/profiles/{profile}");
+    let (answer, ()) = tokio::join!(send(state.clone(), "DELETE", &uri, None), async {
+        assert!(
+            wait_until_blocked_by(&state.pool, change_pid).await,
+            "the deletion must wait for the settings change"
+        );
+        sqlx::query("COMMIT")
+            .execute(&mut change)
+            .await
+            .expect("the settings change must commit");
+    });
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+    nothing_left(profile).await;
+
+    // The deletion first: the `PUT` waits for it, then finds no profile.
+    let (profile, _) = create_profile(&state, &a_reference_man("Course")).await;
+    let mut deletion = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("a second connection");
+    let deletion_pid: i32 = sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+        .fetch_one(&mut deletion)
+        .await
+        .expect("the pid");
+    sqlx::query("BEGIN")
+        .execute(&mut deletion)
+        .await
+        .expect("BEGIN");
+    sqlx::query("DELETE FROM public.profile WHERE id = $1")
+        .bind(profile)
+        .execute(&mut deletion)
+        .await
+        .expect("the deletion itself");
+    let mut heavier = a_reference_man("Course");
+    heavier["settings"]["weight_kg"] = Value::from(85.0);
+    heavier["settings"]["valid_from"] = Value::from("2025-06-01T00:00:00Z");
+    let uri = format!("/profiles/{profile}");
+    let (answer, ()) = tokio::join!(send(state.clone(), "PUT", &uri, Some(heavier)), async {
+        assert!(
+            wait_until_blocked_by(&state.pool, deletion_pid).await,
+            "the update must wait for the deletion"
+        );
+        sqlx::query("COMMIT")
+            .execute(&mut deletion)
+            .await
+            .expect("the deletion must commit");
+    });
+    assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
+    nothing_left(profile).await;
+}
+
+#[tokio::test]
+async fn deleting_a_profile_keeps_an_event_another_profile_is_joining() {
+    // The deletion locks the events of the profile before deleting it (#75):
+    // a participant being added to an event the profile was alone in is
+    // either committed before the deletion looks for events left empty, or
+    // added after it. Here the addition is held open while
+    // `DELETE /profiles/{id}` runs: the deletion waits for it, then finds the
+    // event no longer empty and keeps it, with its new participant.
+    use sqlx::Connection as _;
+    let name = "deleting_a_profile_keeps_an_event_another_profile_is_joining";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let url = database_url(name).expect("checked by `migrated`");
+    let (gone, _) = create_profile(&state, &a_reference_man("Supprimé")).await;
+    let (joins, _) = create_profile(&state, &a_reference_man("Arrive")).await;
+    let event = event_with(&state, gone).await;
+
+    let mut addition = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("a second connection");
+    let addition_pid: i32 = sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+        .fetch_one(&mut addition)
+        .await
+        .expect("the pid");
+    sqlx::query("BEGIN")
+        .execute(&mut addition)
+        .await
+        .expect("BEGIN");
+    sqlx::query("INSERT INTO public.event_participant (event_id, profile_id) VALUES ($1, $2)")
+        .bind(event)
+        .bind(joins)
+        .execute(&mut addition)
+        .await
+        .expect("the addition itself");
+    let uri = format!("/profiles/{gone}");
+    let (answer, ()) = tokio::join!(send(state.clone(), "DELETE", &uri, None), async {
+        assert!(
+            wait_until_blocked_by(&state.pool, addition_pid).await,
+            "the deletion must wait for the addition"
+        );
+        sqlx::query("COMMIT")
+            .execute(&mut addition)
+            .await
+            .expect("the addition must commit");
+    });
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+
+    let (status, read) = body_of(state.clone(), &format!("/events/{event}")).await;
+    assert_eq!(status, StatusCode::OK, "the event must stay: {read}");
+    assert_eq!(participants_in(&read), [joins]);
+}
+
+#[tokio::test]
+async fn deleting_a_profile_waits_for_a_version_removal_whatever_the_cascade_order() {
+    // `profile` fires its cascades in the order of their trigger names, which
+    // follows the order in which the foreign keys were created. A database
+    // restored by `pg_dump | psql` recreates them in alphabetical order, so
+    // that there the cascade towards the guard row runs before the one
+    // towards the versions. A deletion that reached the versions only through
+    // its cascade would then hold the guard row while waiting for a
+    // transaction that removed one of them — and that transaction writes the
+    // guard row at COMMIT: a deadlock. `DELETE /profiles/{id}` locks the
+    // versions first, and waits holding nothing that COMMIT needs.
+    //
+    // The order is swapped in a database of its own, created on the same
+    // server and dropped afterwards, so that no other test runs against it.
+    use sqlx::Connection as _;
+    let name = "deleting_a_profile_waits_for_a_version_removal_whatever_the_cascade_order";
+    let Some(url) = database_url(name) else {
+        return;
+    };
+    let (server, _) = url
+        .rsplit_once('/')
+        .expect("DATABASE_URL must name a database");
+    let database = format!("restored_{}", Uuid::now_v7().simple());
+    let mut admin = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("an administration connection");
+    sqlx::query(&format!("CREATE DATABASE {database}"))
+        .execute(&mut admin)
+        .await
+        .expect("the database of this test must be created");
+    let own_url = format!("{server}/{database}");
+    let state = state(&own_url);
+
+    // Run apart, so that a failure still drops the database before it is
+    // reported. The router's future is not `Send`: a local task.
+    let local = tokio::task::LocalSet::new();
+    let scenario = local.spawn_local({
+        let state = state.clone();
+        async move {
+            db::migrate(&state.pool)
+                .await
+                .expect("the migrations must apply");
+            sqlx::query(
+                "ALTER TABLE public.profile_settings_version
+                     DROP CONSTRAINT profile_settings_version_profile_id_fkey,
+                     ADD CONSTRAINT profile_settings_version_profile_id_fkey
+                         FOREIGN KEY (profile_id) REFERENCES public.profile (id)
+                         ON DELETE CASCADE",
+            )
+            .execute(&state.pool)
+            .await
+            .expect("the foreign key of the versions must be recreated");
+            let cascades: Vec<String> = sqlx::query_scalar(
+                "SELECT c.conrelid::pg_catalog.regclass::pg_catalog.text
+                 FROM pg_catalog.pg_trigger AS t
+                 JOIN pg_catalog.pg_constraint AS c ON c.oid = t.tgconstraint
+                 WHERE t.tgrelid = 'public.profile'::pg_catalog.regclass
+                   AND t.tgname LIKE 'RI\\_ConstraintTrigger\\_a\\_%'
+                   AND t.tgtype & 8 = 8
+                 ORDER BY t.tgname",
+            )
+            .fetch_all(&state.pool)
+            .await
+            .expect("the cascades of `profile` must be readable");
+            let position = |table: &str| {
+                cascades
+                    .iter()
+                    .position(|t| t == table)
+                    .unwrap_or_else(|| panic!("no cascade towards {table}: {cascades:?}"))
+            };
+            assert!(
+                position("profile_settings_guard") < position("profile_settings_version"),
+                "the guard cascade must now run first: {cascades:?}"
+            );
+
+            let (profile, _) = create_profile(&state, &a_reference_man("Restaurée")).await;
+            let mut heavier = a_reference_man("Restaurée");
+            heavier["settings"]["weight_kg"] = Value::from(85.0);
+            heavier["settings"]["valid_from"] = Value::from("2025-06-01T00:00:00Z");
+            let answer = send(
+                state.clone(),
+                "PUT",
+                &format!("/profiles/{profile}"),
+                Some(heavier),
+            )
+            .await;
+            assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+            assert_eq!(version_count(&state.pool, profile).await, 2);
+
+            let mut removal = sqlx::PgConnection::connect(&own_url)
+                .await
+                .expect("a second connection");
+            let removal_pid: i32 = sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+                .fetch_one(&mut removal)
+                .await
+                .expect("the pid");
+            sqlx::query("BEGIN")
+                .execute(&mut removal)
+                .await
+                .expect("BEGIN");
+            let removed = sqlx::query(
+                "DELETE FROM public.profile_settings_version
+                 WHERE profile_id = $1 AND valid_from > '2025-03-01T00:00:00Z'",
+            )
+            .bind(profile)
+            .execute(&mut removal)
+            .await
+            .expect("the removal itself")
+            .rows_affected();
+            assert_eq!(removed, 1);
+            let uri = format!("/profiles/{profile}");
+            let (answer, ()) = tokio::join!(send(state.clone(), "DELETE", &uri, None), async {
+                assert!(
+                    wait_until_blocked_by(&state.pool, removal_pid).await,
+                    "the deletion must wait for the removal"
+                );
+                sqlx::query("COMMIT")
+                    .execute(&mut removal)
+                    .await
+                    .expect("the removal must commit");
+            });
+            assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+            for table in ["profile_settings_version", "profile_settings_guard"] {
+                assert_eq!(
+                    rows_of_profile(&state.pool, table, profile).await,
+                    0,
+                    "{table}"
+                );
+            }
+        }
+    });
+    let scenario = local.run_until(scenario).await;
+
+    state.pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        .execute(&mut admin)
+        .await
+        .expect("the database of this test must be dropped");
+    if let Err(failure) = scenario {
+        std::panic::resume_unwind(failure.into_panic());
+    }
+}
+
 #[tokio::test]
 async fn the_window_of_an_event_follows_now_until_its_end() {
     // SPEC.md §10.3: the window closes three hours after the end of the

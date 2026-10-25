@@ -93,7 +93,12 @@ pub fn app(state: AppState) -> Router {
             profile::COLLECTION_PATH,
             get(profile::list).post(profile::create),
         )
-        .route(profile::ITEM_PATH, get(profile::read).put(profile::update))
+        .route(
+            profile::ITEM_PATH,
+            get(profile::read)
+                .put(profile::update)
+                .delete(profile::delete),
+        )
         .route(
             drink::PROFILE_COLLECTION_PATH,
             get(drink::list).post(drink::create),

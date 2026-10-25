@@ -147,7 +147,8 @@ const UPDATE_PROFILE: &str = "
     WHERE id = $1
 ";
 
-/// Takes the row lock that serialises two updates of the same profile.
+/// Takes the row lock that serialises two updates of the same profile, and an
+/// update with a deletion of it.
 const LOCK_PROFILE: &str = "SELECT 1 FROM public.profile WHERE id = $1 FOR UPDATE";
 
 /// Every version of a profile starting strictly after an instant: the versions
@@ -163,6 +164,66 @@ const DELETE_VERSIONS_AFTER: &str = "
 const SELECT_SETTINGS_AT: &str = "
     SELECT valid_from, weight_kg, height_cm, sex::pg_catalog.text AS sex, birth_date
     FROM public.profile_settings_at($1, $2)
+";
+
+/// The events a profile takes part in, locked before the profile is deleted.
+///
+/// The lock is what makes [`DELETE_EVENTS_LEFT_EMPTY`] sound: adding a
+/// participant takes a `FOR KEY SHARE` lock on the event row, which conflicts
+/// with this one, so a participant being added concurrently is either
+/// committed before this statement returns — and seen by the next statement,
+/// under READ COMMITTED — or added after this transaction, when the event may
+/// already be gone. Ordered by `id`, so that two deletions lock in one order.
+const LOCK_EVENTS_OF_PROFILE: &str = "
+    SELECT e.id
+    FROM public.event AS e
+    WHERE e.id IN (
+        SELECT ep.event_id FROM public.event_participant AS ep WHERE ep.profile_id = $1
+    )
+    ORDER BY e.id
+    FOR UPDATE
+";
+
+/// The settings versions of a profile, locked once the profile row is.
+///
+/// The deletion of the profile reaches them anyway, through its cascade; this
+/// lock takes them **before** that cascade starts. `profile` fires its
+/// cascades in the order of their trigger names, which follows the order in
+/// which the foreign keys were created, and a database restored by `pg_dump`
+/// creates them in alphabetical order: there, the cascade towards the guard
+/// row runs before the one towards the versions. A transaction that removed
+/// one of these versions writes that guard row at `COMMIT`; were the deletion
+/// to wait for it while already holding the guard row, the two would
+/// deadlock. Waiting here, the deletion holds the profile row and the events,
+/// neither of which that `COMMIT` needs. Taken after the profile row, as
+/// [`update`] takes it before removing versions, so that the two wait for
+/// each other on the profile row rather than in opposite orders. Ordered by
+/// `id`, so that two deletions lock in one order.
+const LOCK_VERSIONS_OF_PROFILE: &str = "
+    SELECT v.id
+    FROM public.profile_settings_version AS v
+    WHERE v.profile_id = $1
+    ORDER BY v.id
+    FOR UPDATE
+";
+
+/// A profile. What it owns goes with it, by the foreign keys of the schema:
+/// its settings versions, its participations and its drinks (`ON DELETE
+/// CASCADE`, migration of #2), the components of those drinks (`ON DELETE
+/// CASCADE` on `drink`), and its guard row (`ON DELETE CASCADE`, migration of
+/// #75). The settings-version check does not refuse it: at `COMMIT` the
+/// profile no longer exists, and an absent profile has no version to keep.
+const DELETE_PROFILE: &str = "DELETE FROM public.profile WHERE id = $1";
+
+/// Among the events `$1` names, those left without any participant: the
+/// events the deleted profile took part in alone (decision of 2026-10-25 on
+/// #75). An event that had no participant before is not among them.
+const DELETE_EVENTS_LEFT_EMPTY: &str = "
+    DELETE FROM public.event AS e
+    WHERE e.id = ANY ($1::pg_catalog.uuid[])
+      AND NOT EXISTS (
+          SELECT 1 FROM public.event_participant AS ep WHERE ep.event_id = e.id
+      )
 ";
 
 /// Reads a row of [`SELECT_PAGE`] or [`SELECT_ONE`].
@@ -434,6 +495,64 @@ pub async fn update(pool: &PgPool, id: Uuid, profile: &ValidProfile) -> Result<U
         version_created,
         versions_replaced,
     })
+}
+
+/// What a deletion did, so that the handler can answer the right status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deleted {
+    /// No profile carries that identifier.
+    NoSuchProfile,
+    /// The profile and everything it owned are gone.
+    Done,
+}
+
+/// Deletes a profile, everything it owns, and the events it took part in
+/// alone, in one transaction.
+///
+/// It locks, in this order, the events of the profile, the profile row, then
+/// its settings versions, before deleting anything: see
+/// [`LOCK_EVENTS_OF_PROFILE`] and [`LOCK_VERSIONS_OF_PROFILE`] for what each
+/// lock prevents.
+///
+/// # Errors
+///
+/// Fails when a statement cannot be run.
+pub async fn delete(pool: &PgPool, id: Uuid) -> Result<Deleted, ApiError> {
+    let mut tx = pool.begin().await?;
+
+    let events: Vec<Uuid> = sqlx::query_scalar(LOCK_EVENTS_OF_PROFILE)
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+    let locked = sqlx::query(LOCK_PROFILE)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if locked.is_none() {
+        return Ok(Deleted::NoSuchProfile);
+    }
+    sqlx::query(LOCK_VERSIONS_OF_PROFILE)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+    let deleted = sqlx::query(DELETE_PROFILE)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if deleted == 0 {
+        return Ok(Deleted::NoSuchProfile);
+    }
+
+    sqlx::query(DELETE_EVENTS_LEFT_EMPTY)
+        .bind(&events)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(Deleted::Done)
 }
 
 #[cfg(test)]
