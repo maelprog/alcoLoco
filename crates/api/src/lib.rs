@@ -103,7 +103,10 @@ pub fn app(state: AppState) -> Router {
             get(drink::read).patch(drink::update).delete(drink::delete),
         )
         .route(event::COLLECTION_PATH, get(event::list).post(event::create))
-        .route(event::ITEM_PATH, get(event::read).put(event::update))
+        .route(
+            event::ITEM_PATH,
+            get(event::read).put(event::update).delete(event::delete),
+        )
         .route(
             event::PARTICIPANT_PATH,
             put(event::add_participant).delete(event::remove_participant),

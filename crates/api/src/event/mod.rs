@@ -11,9 +11,10 @@
 //!   `/events/{id}/participants/{profile_id}` adds (`PUT`) or removes
 //!   (`DELETE`) one at a time afterwards; a profile may take part in any
 //!   number of events;
-//! - removing a participant never deletes a drink: a drink belongs to the
-//!   history of its profile whatever the event (SPEC.md §4), and the drinks
-//!   it recorded from the event are kept there, detached from the event;
+//! - removing a participant, or deleting the event, never deletes a drink: a
+//!   drink belongs to the history of its profile whatever the event
+//!   (SPEC.md §4, §5.5), and the drinks recorded from the event are kept
+//!   there, detached from the event;
 //! - consumption is always tracked in V1: there is no per-event toggle
 //!   (SPEC.md §5.2, #30).
 
@@ -150,6 +151,30 @@ pub async fn update(
     let event = request.validate_replacement()?;
     match store::update(&state.pool, id, &event).await? {
         store::Written::Done => written(&state, id).await.map(Json),
+        _ => Err(no_such_event(id)),
+    }
+}
+
+/// Deletes an event and its participants. The drinks entered from it stay
+/// in the history of their profile, detached from it (`event_id` becomes
+/// `null`), and keep counting in its curve.
+#[utoipa::path(
+    delete,
+    path = ITEM_PATH,
+    tag = "events",
+    params(("id" = Uuid, Path, description = "Identifier of the event")),
+    responses(
+        (status = 204, description = "The event and its participants are deleted; the drinks entered from it stay in the history of their profile, with a null `event_id`"),
+        (status = 400, description = "The identifier is not a UUID", body = ProblemDetails),
+        (status = 404, description = "No event carries that identifier", body = ProblemDetails),
+    ),
+)]
+pub async fn delete(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    match store::delete(&state.pool, id).await? {
+        store::Written::Done => Ok(StatusCode::NO_CONTENT),
         _ => Err(no_such_event(id)),
     }
 }
