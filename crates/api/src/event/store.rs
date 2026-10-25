@@ -108,6 +108,12 @@ const DELETE_PARTICIPANT: &str = "
 /// does not take part in it.
 const SELECT_EVENT_EXISTS: &str = "SELECT 1 FROM public.event WHERE id = $1";
 
+/// An event. Its participants go with it (`event_participant`, `ON DELETE
+/// CASCADE`), and the drinks entered from it stay in the history of their
+/// profile, detached from it by the foreign key of `drink` (`ON DELETE SET
+/// NULL (event_id)`), both from the migration of #2.
+const DELETE_EVENT: &str = "DELETE FROM public.event WHERE id = $1";
+
 /// Reads a row of [`SELECT_EVENT`], participants aside.
 fn event_from_row(row: &PgRow, participants: Vec<Participant>) -> Result<Event, ApiError> {
     Ok(Event {
@@ -337,6 +343,25 @@ pub async fn remove_participant(
     })
 }
 
+/// Deletes an event and its participants. The drinks entered from it stay
+/// in the history of their profile, detached from it.
+///
+/// # Errors
+///
+/// Fails when the statement cannot be run.
+pub async fn delete(pool: &PgPool, id: Uuid) -> Result<Written, ApiError> {
+    let deleted = sqlx::query(DELETE_EVENT)
+        .bind(id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(if deleted == 0 {
+        Written::NoEvent
+    } else {
+        Written::Done
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +384,7 @@ mod tests {
             INSERT_PARTICIPANT,
             DELETE_PARTICIPANT,
             SELECT_EVENT_EXISTS,
+            DELETE_EVENT,
         ] {
             for keyword in ["FROM ", "INTO ", "UPDATE ", "JOIN ", "::"] {
                 for (at, _) in statement.match_indices(keyword) {

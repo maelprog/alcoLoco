@@ -4163,6 +4163,139 @@ async fn a_removed_participant_leaves_the_event_curves_and_keeps_its_own() {
     );
 }
 
+/// Every event identifier `GET /events` serves, the whole collection walked.
+async fn listed_events(state: &AppState) -> Vec<Uuid> {
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let uri = match &cursor {
+            None => "/events?limit=200".to_owned(),
+            Some(cursor) => format!("/events?limit=200&cursor={cursor}"),
+        };
+        let (status, body) = body_of(state.clone(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for item in body["items"].as_array().expect("items") {
+            seen.push(
+                item["id"]
+                    .as_str()
+                    .and_then(|id| id.parse().ok())
+                    .expect("id"),
+            );
+        }
+        match body["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    seen
+}
+
+#[tokio::test]
+async fn deleting_an_event_keeps_the_drinks_of_its_participants_in_their_history() {
+    // Acceptance criteria of #74: the event and its participations are gone,
+    // the drinks entered from it stay in the history of their profile,
+    // detached from it, and still count in its curve. Another event of the
+    // same profile is left untouched.
+    let name = "deleting_an_event_keeps_the_drinks_of_its_participants_in_their_history";
+    let Some(state) = migrated(name).await else {
+        return;
+    };
+    let (profile, _) = create_profile(&state, &a_reference_man("Effacé")).await;
+    let event_payload = serde_json::json!({
+        "name": "Erreur",
+        "starts_at": "2025-05-10T20:00:00Z",
+        "ends_at": "2025-05-11T01:00:00Z",
+        "participant_ids": [profile.to_string()],
+    });
+    let (event, _) = create_event(&state, &event_payload).await;
+    let (kept_event, _) = create_event(&state, &event_payload).await;
+    let mut from_event = a_timed_beer("2025-05-10T21:00:00Z", 50.0);
+    from_event["event_id"] = Value::from(event.to_string());
+    let (drink, _) = record_drink(&state, profile, &from_event).await;
+    let mut from_kept = a_timed_beer("2025-05-10T22:00:00Z", 25.0);
+    from_kept["event_id"] = Value::from(kept_event.to_string());
+    let (kept_drink, _) = record_drink(&state, profile, &from_kept).await;
+    let window = "from=2025-05-10T20:00:00Z&to=2025-05-11T04:00:00Z&step=60";
+    let before = profile_curve(&state, profile, window).await;
+    assert!(
+        before["bac_g_per_l"]
+            .as_array()
+            .expect("a series")
+            .iter()
+            .any(|value| value.as_f64().is_some_and(|bac| bac > 0.0)),
+        "{before}"
+    );
+
+    let answer = send(state.clone(), "DELETE", &format!("/events/{event}"), None).await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+    assert!(answer.body.is_null(), "a 204 has no body: {}", answer.body);
+
+    // The event is gone, from its own path, from its curves and from the
+    // list, and its participations with it.
+    let no_event = format!("no event with identifier {event}");
+    for uri in [format!("/events/{event}"), format!("/events/{event}/bac")] {
+        let answer = send(state.clone(), "GET", &uri, None).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::NOT_FOUND,
+            "{uri}: {}",
+            answer.body
+        );
+        assert_eq!(answer.media_type, api::error::PROBLEM_JSON, "{uri}");
+    }
+    let listed = listed_events(&state).await;
+    assert!(!listed.contains(&event), "{event} is still listed");
+    assert!(
+        listed.contains(&kept_event),
+        "{kept_event} is no longer listed"
+    );
+    let participations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM public.event_participant WHERE event_id = $1")
+            .bind(event)
+            .fetch_one(&state.pool)
+            .await
+            .expect("the count must run");
+    assert_eq!(participations, 0);
+
+    // The drink is still served by the history of its profile, detached.
+    let (status, history) = body_of(state.clone(), &format!("/profiles/{profile}/drinks")).await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let items = history["items"].as_array().expect("items");
+    let served = |id: Uuid| {
+        items
+            .iter()
+            .find(|item| item["id"] == id.to_string())
+            .unwrap_or_else(|| panic!("{id} is no longer in the history: {history}"))
+    };
+    let detached = served(drink);
+    assert!(
+        detached
+            .as_object()
+            .is_some_and(|members| members.contains_key("event_id")),
+        "{detached}"
+    );
+    assert!(detached["event_id"].is_null(), "{detached}");
+    assert_eq!(served(kept_drink)["event_id"], kept_event.to_string());
+    let (_, read) = body_of(state.clone(), &format!("/events/{kept_event}")).await;
+    assert_eq!(participants_in(&read), [profile]);
+
+    // It still counts in the curve of its profile, to the bit.
+    let after = profile_curve(&state, profile, window).await;
+    assert_eq!(
+        bits_of(&after["bac_g_per_l"]),
+        bits_of(&before["bac_g_per_l"])
+    );
+
+    // A second deletion finds nothing; an unreadable identifier is a 400.
+    let answer = send(state.clone(), "DELETE", &format!("/events/{event}"), None).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
+    assert_eq!(answer.media_type, api::error::PROBLEM_JSON);
+    assert_eq!(answer.body["detail"], no_event);
+    let answer = send(state, "DELETE", "/events/not-a-uuid", None).await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.media_type, api::error::PROBLEM_JSON);
+}
+
 #[tokio::test]
 async fn the_window_of_an_event_follows_now_until_its_end() {
     // SPEC.md §10.3: the window closes three hours after the end of the

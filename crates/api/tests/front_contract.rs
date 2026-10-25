@@ -1,6 +1,6 @@
 //! What the front and the back have to spell identically: the problem
 //! identifiers below, then the pagination bounds, then the feeling
-//! suggestion at the end of the file.
+//! suggestion, then the event deletion at the end of the file.
 //!
 //! `web/src/app/core/api/problem-details.ts` mirrors the problem identifiers of
 //! `crates/api/src/error.rs`. RFC 7807 makes `type` the stable member and the
@@ -27,6 +27,10 @@
 //! can suggest is one the drink endpoints accept as `feeling_rating`, and its
 //! payload travels as `{ at, bac_g_per_l, rating }`. No TypeScript is read
 //! there yet, so a drift on the front side goes unnoticed.
+//!
+//! The event deletion section checks the back alone too, until the screen of
+//! #23 ships: a drink detached from a deleted event still travels with its
+//! `event_id` member, `null`.
 //!
 //! It lives on the Rust side for one reason: `include_str!` gives a compile-time
 //! read of a file two directories up, and the Rust gate runs on every pull
@@ -270,4 +274,37 @@ fn a_feeling_suggestion_travels_under_the_members_the_front_reads() {
         "{value}"
     );
     assert_eq!(value["at"], "2026-08-20T23:04:00Z");
+}
+
+// ---------------------------------------------------------------------------
+// Event deletion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_drink_detached_from_its_event_travels_with_a_null_event_id() {
+    // `DELETE /events/{id}` (#74) keeps the drinks entered from the event in
+    // the history of their profile, detached from it. The screen of #23
+    // reads that history afterwards: a detached drink carries
+    // `"event_id": null`, the member present rather than left out, so that a
+    // client comparing it with `null` does not meet `undefined`.
+    let instant: api::Timestamp = "2026-08-20T21:00:00Z".parse().expect("a real instant");
+    let drink = api::drink::Drink {
+        id: api::new_id(),
+        profile_id: api::new_id(),
+        event_id: None,
+        name: "Bière".to_owned(),
+        ingested_at: instant,
+        ingestion_duration_seconds: 1200,
+        absorption_duration_seconds: 1800,
+        quantity_unit: api::profile::QuantityUnit::Cl,
+        volume_total_ml: None,
+        feeling_rating: None,
+        components: Vec::new(),
+        created_at: instant,
+        updated_at: instant,
+    };
+    let value = serde_json::to_value(&drink).expect("the payload must serialise");
+    let members = value.as_object().expect("an object");
+    assert!(members.contains_key("event_id"), "{value}");
+    assert!(value["event_id"].is_null(), "{value}");
 }
