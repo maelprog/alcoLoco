@@ -22,6 +22,9 @@
 //! rules, the pure alcohol of a drink whatever its unit, and the name proposed
 //! for it (SPEC.md §4, §5.3).
 //!
+//! The [`feeling`] module holds the feeling rating suggested for a blood
+//! alcohol concentration (SPEC.md §5.9).
+//!
 //! The figures pinned by the tests below are the reference cases of #5: every
 //! one of them is derived from the formulas of §6, not copied from a summary.
 
@@ -30,6 +33,7 @@ use std::fmt;
 pub mod absorption;
 pub mod curve;
 pub mod drink;
+pub mod feeling;
 
 /// Density of ethanol, in grams per millilitre (SPEC.md §6.1).
 pub const ETHANOL_DENSITY_G_PER_ML: f64 = 0.789;

@@ -1,5 +1,6 @@
 //! What the front and the back have to spell identically: the problem
-//! identifiers below, and the pagination bounds at the end of the file.
+//! identifiers below, then the pagination bounds, then the feeling
+//! suggestion at the end of the file.
 //!
 //! `web/src/app/core/api/problem-details.ts` mirrors the problem identifiers of
 //! `crates/api/src/error.rs`. RFC 7807 makes `type` the stable member and the
@@ -17,8 +18,15 @@
 //!
 //! The test that *looked* like it covered this, `api-error.spec.ts`, enumerates
 //! the front's own constants; it can see neither a transcription error nor a
-//! seventh kind added on the backend. This file reads **both sources** and
-//! compares them, so it sees both.
+//! seventh kind added on the backend. For the problem identifiers and the
+//! pagination bounds, this file reads **both sources** and compares them, so
+//! it sees both.
+//!
+//! The feeling suggestion section checks the back alone, until the form of
+//! #29 ships the front side: every rating `GET /profiles/{id}/feeling-suggestion`
+//! can suggest is one the drink endpoints accept as `feeling_rating`, and its
+//! payload travels as `{ at, bac_g_per_l, rating }`. No TypeScript is read
+//! there yet, so a drift on the front side goes unnoticed.
 //!
 //! It lives on the Rust side for one reason: `include_str!` gives a compile-time
 //! read of a file two directories up, and the Rust gate runs on every pull
@@ -211,4 +219,55 @@ fn the_front_pages_within_the_bounds_the_api_enforces() {
         "web/src/app/core/api/page.ts and crates/api/src/pagination.rs \
          no longer agree on the default page"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Feeling suggestion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_rating_suggested_is_one_a_drink_accepts() {
+    // The form of #29 pre-selects the `rating` of
+    // `GET /profiles/{id}/feeling-suggestion` and posts it back as the
+    // `feeling_rating` of the drink: a suggestion outside the scale the drink
+    // endpoints validate would be answered with a 400 the user never chose.
+    // Swept over the concentrations rather than read from the constants
+    // alone, so that a scale overshooting its own maximum fails too.
+    use api::drink::validation::{FEELING_RATING_MAX, FEELING_RATING_MIN};
+    use domain::feeling::{SUGGESTED_RATING_MAX, SUGGESTED_RATING_MIN, suggested_rating};
+
+    assert_eq!(i64::from(SUGGESTED_RATING_MIN), FEELING_RATING_MIN);
+    assert!(i64::from(SUGGESTED_RATING_MAX) <= FEELING_RATING_MAX);
+    for thousandths in 0..=10_000 {
+        let rating = i64::from(suggested_rating(f64::from(thousandths) / 1000.0));
+        assert!(
+            (FEELING_RATING_MIN..=FEELING_RATING_MAX).contains(&rating),
+            "{thousandths} mg/L suggests {rating}, which a drink refuses"
+        );
+    }
+}
+
+#[test]
+fn a_feeling_suggestion_travels_under_the_members_the_front_reads() {
+    // `{ at, bac_g_per_l, rating }`, the shape #73 sets for the form of #29,
+    // checked on the serialised payload rather than on the struct, so that a
+    // `serde` rename cannot slip past.
+    let suggestion = api::bac::FeelingSuggestion {
+        at: "2026-08-20T23:04:00Z".parse().expect("a real instant"),
+        bac_g_per_l: 0.0,
+        rating: 1,
+    };
+    let value = serde_json::to_value(&suggestion).expect("the payload must serialise");
+    let members: BTreeSet<&str> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        members,
+        BTreeSet::from(["at", "bac_g_per_l", "rating"]),
+        "{value}"
+    );
+    assert_eq!(value["at"], "2026-08-20T23:04:00Z");
 }

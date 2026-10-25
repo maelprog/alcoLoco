@@ -110,7 +110,8 @@ pub fn app(state: AppState) -> Router {
         )
         .route(library::COLLECTION_PATH, get(library::list))
         .route(bac::PROFILE_PATH, get(bac::profile))
-        .route(bac::EVENT_PATH, get(bac::event));
+        .route(bac::EVENT_PATH, get(bac::event))
+        .route(bac::FEELING_SUGGESTION_PATH, get(bac::feeling_suggestion));
 
     if state.config.environment.exposes_openapi() {
         router = router.route(openapi::DOCUMENT_PATH, get(openapi::document));

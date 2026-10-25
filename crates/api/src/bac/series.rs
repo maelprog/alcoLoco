@@ -116,6 +116,27 @@ pub fn intake(profile: uuid::Uuid, stored: &StoredDrink) -> Result<Option<Intake
     }))
 }
 
+/// What the engine refusing intakes built by [`intake`] means: a bug.
+fn refused(error: EngineError) -> ApiError {
+    ApiError::internal(format!("curve refused: {error}"))
+}
+
+/// The value at `at_seconds`, from the intakes of one profile.
+///
+/// # Errors
+///
+/// An internal failure when the engine refuses its input, which the intakes
+/// built by [`intake`] never make it do.
+pub fn value_at(intakes: &[Intake], at_seconds: i64) -> Result<f64, ApiError> {
+    curve::bac_at(
+        intakes,
+        &Trapezoid,
+        ELIMINATION_RATE_G_PER_L_PER_H,
+        at_seconds,
+    )
+    .map_err(refused)
+}
+
 /// The current value at the minute of `now` and the series on `grid`, from
 /// the intakes of one profile.
 ///
@@ -124,14 +145,7 @@ pub fn intake(profile: uuid::Uuid, stored: &StoredDrink) -> Result<Option<Intake
 /// An internal failure when the engine refuses its input, which the intakes
 /// built by [`intake`] never make it do.
 pub fn values(intakes: &[Intake], grid: Grid, now: Timestamp) -> Result<Values, ApiError> {
-    let engine = |error: EngineError| ApiError::internal(format!("curve refused: {error}"));
-    let current = curve::bac_at(
-        intakes,
-        &Trapezoid,
-        ELIMINATION_RATE_G_PER_L_PER_H,
-        minute_of(now),
-    )
-    .map_err(engine)?;
+    let current = value_at(intakes, minute_of(now))?;
     let series = if grid.is_empty() {
         Vec::new()
     } else {
@@ -143,7 +157,7 @@ pub fn values(intakes: &[Intake], grid: Grid, now: Timestamp) -> Result<Values, 
             grid.to,
             grid.step,
         )
-        .map_err(engine)?
+        .map_err(refused)?
         .into_iter()
         .map(|sample| sample.bac_g_per_l)
         .collect()
