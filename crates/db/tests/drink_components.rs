@@ -15,8 +15,8 @@
 //! before either commit, in a fixed commit order. They also need those two
 //! transactions to be the only ones in flight: under `SERIALIZABLE`,
 //! PostgreSQL detects conflicts through predicate locks that may cover more
-//! than the rows read, a whole `drink_component` relation when the check reads
-//! it by sequential scan, as it does on a small table. Two `SERIALIZABLE`
+//! than the rows read: index pages, or, depending on the plan the statistics
+//! lead to, a whole relation. Two `SERIALIZABLE`
 //! transactions writing components of different drinks can then fail one of
 //! them with 40001 (`could not serialize access due to read/write dependencies
 //! among transactions`): a false positive PostgreSQL documents, and which a
