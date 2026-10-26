@@ -25,7 +25,8 @@
 //! [`PAIRS_LOCK`], that keeps any other pair of this file, from this process
 //! or another one on the same database, out of its way. Within a pair, the one
 //! test expecting two `SERIALIZABLE` transactions on different drinks to both
-//! commit replays, as a client would, a transaction refused that way.
+//! commit replays, as a client would, a transaction refused that way, alone:
+//! under the same lock, once the pair has released it.
 
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions};
 use sqlx::{Connection, Executor};
@@ -539,7 +540,8 @@ async fn a_quantity_or_total_volume_that_is_not_finite_is_refused() {
 // ----- Under concurrency ----------------------------------------------------
 
 /// Key of the session advisory lock under which [`in_turn`] runs its pair of
-/// transactions, so that no two pairs overlap (see the head of this file).
+/// transactions and [`replayed_after_false_conflict`] its replay, so that none
+/// of them overlap (see the head of this file).
 const PAIRS_LOCK: i64 = 13;
 
 /// Two transactions at the given isolation levels each run their statement;
@@ -700,7 +702,8 @@ async fn a_unit_switch_and_a_component_insert_cannot_both_commit() {
 }
 
 /// What a client does with a transaction refused by PostgreSQL's serializable
-/// snapshot isolation itself: it runs it again, alone. Only when both
+/// snapshot isolation itself: it runs it again, here alone, under
+/// [`PAIRS_LOCK`] taken on a connection of its own. Only when both
 /// transactions were `SERIALIZABLE`, the one case where PostgreSQL may report
 /// a false conflict, and only for that report (`read/write dependencies`): a
 /// `concurrent update` of a guard row is the per-drink serialisation, and stays
@@ -717,12 +720,25 @@ async fn replayed_after_false_conflict(
                 && sqlstate(&error).as_deref() == Some(SERIALIZATION_FAILURE)
                 && error.to_string().contains("read/write dependencies") =>
         {
+            let mut gate = connection(url).await;
+            run(&mut gate, &format!("SELECT pg_advisory_lock({PAIRS_LOCK})"))
+                .await
+                .expect("the pairs lock must be taken");
             let mut conn = connection(url).await;
             run(&mut conn, &format!("BEGIN ISOLATION LEVEL {level}"))
                 .await
                 .expect("BEGIN");
-            run(&mut conn, sql).await?;
-            run(&mut conn, "COMMIT").await
+            let replayed = match run(&mut conn, sql).await {
+                Ok(()) => run(&mut conn, "COMMIT").await,
+                Err(error) => Err(error),
+            };
+            run(
+                &mut gate,
+                &format!("SELECT pg_advisory_unlock({PAIRS_LOCK})"),
+            )
+            .await
+            .expect("the pairs lock must be released");
+            replayed
         }
         outcome => outcome,
     }
