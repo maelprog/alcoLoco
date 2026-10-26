@@ -11,8 +11,21 @@
 //! ALCOLOCO_REQUIRE_DB=1 DATABASE_URL=postgres://… cargo test -p db --test drink_components
 //! ```
 //!
-//! The concurrent scenarios depend on no timing: both snapshots are taken
-//! before either commit, and the commit order is fixed.
+//! The concurrent scenarios run two transactions whose snapshots are both taken
+//! before either commit, in a fixed commit order. They also need those two
+//! transactions to be the only ones in flight: under `SERIALIZABLE`,
+//! PostgreSQL detects conflicts through predicate locks that may cover more
+//! than the rows read, a whole `drink_component` relation when the check reads
+//! it by sequential scan, as it does on a small table. Two `SERIALIZABLE`
+//! transactions writing components of different drinks can then fail one of
+//! them with 40001 (`could not serialize access due to read/write dependencies
+//! among transactions`): a false positive PostgreSQL documents, and which a
+//! client retries. The tests of this file, run in parallel threads, would
+//! otherwise inflict it on one another: each pair runs under an advisory lock,
+//! [`PAIRS_LOCK`], that keeps any other pair of this file, from this process
+//! or another one on the same database, out of its way. Within a pair, the one
+//! test expecting two `SERIALIZABLE` transactions on different drinks to both
+//! commit replays, as a client would, a transaction refused that way.
 
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions};
 use sqlx::{Connection, Executor};
@@ -525,14 +538,24 @@ async fn a_quantity_or_total_volume_that_is_not_finite_is_refused() {
 
 // ----- Under concurrency ----------------------------------------------------
 
+/// Key of the session advisory lock under which [`in_turn`] runs its pair of
+/// transactions, so that no two pairs overlap (see the head of this file).
+const PAIRS_LOCK: i64 = 13;
+
 /// Two transactions at the given isolation levels each run their statement;
 /// the first one commits, then the second. Both snapshots are taken before
-/// either commit.
+/// either commit, and no other pair runs meanwhile: the advisory lock is held
+/// on a third connection until both commits have returned, and released with
+/// that connection if the pair panics.
 async fn in_turn(
     url: &str,
     (first, first_sql): (&str, &str),
     (last, last_sql): (&str, &str),
 ) -> (Result<(), sqlx::Error>, Result<(), sqlx::Error>) {
+    let mut gate = connection(url).await;
+    run(&mut gate, &format!("SELECT pg_advisory_lock({PAIRS_LOCK})"))
+        .await
+        .expect("the pairs lock must be taken");
     let mut a = connection(url).await;
     let mut b = connection(url).await;
     run(&mut a, &format!("BEGIN ISOLATION LEVEL {first}"))
@@ -547,7 +570,14 @@ async fn in_turn(
     run(&mut b, last_sql)
         .await
         .expect("the statement itself must pass: the check is deferred to COMMIT");
-    (run(&mut a, "COMMIT").await, run(&mut b, "COMMIT").await)
+    let outcomes = (run(&mut a, "COMMIT").await, run(&mut b, "COMMIT").await);
+    run(
+        &mut gate,
+        &format!("SELECT pg_advisory_unlock({PAIRS_LOCK})"),
+    )
+    .await
+    .expect("the pairs lock must be released");
+    outcomes
 }
 
 /// What the last committer must get: under READ COMMITTED it re-reads and is
@@ -669,11 +699,42 @@ async fn a_unit_switch_and_a_component_insert_cannot_both_commit() {
     }
 }
 
+/// What a client does with a transaction refused by PostgreSQL's serializable
+/// snapshot isolation itself: it runs it again, alone. Only when both
+/// transactions were `SERIALIZABLE`, the one case where PostgreSQL may report
+/// a false conflict, and only for that report (`read/write dependencies`): a
+/// `concurrent update` of a guard row is the per-drink serialisation, and stays
+/// a failure.
+async fn replayed_after_false_conflict(
+    url: &str,
+    both_serializable: bool,
+    (level, sql): (&str, &str),
+    outcome: Result<(), sqlx::Error>,
+) -> Result<(), sqlx::Error> {
+    match outcome {
+        Err(error)
+            if both_serializable
+                && sqlstate(&error).as_deref() == Some(SERIALIZATION_FAILURE)
+                && error.to_string().contains("read/write dependencies") =>
+        {
+            let mut conn = connection(url).await;
+            run(&mut conn, &format!("BEGIN ISOLATION LEVEL {level}"))
+                .await
+                .expect("BEGIN");
+            run(&mut conn, sql).await?;
+            run(&mut conn, "COMMIT").await
+        }
+        outcome => outcome,
+    }
+}
+
 #[tokio::test]
 async fn concurrent_writes_on_different_drinks_do_not_interfere() {
     // The serialisation is per drink: emptying one drink's second component
     // while another transaction edits another drink commits both, at every
-    // level.
+    // level; when both are SERIALIZABLE, after replaying a transaction refused
+    // by a false conflict of PostgreSQL's predicate locks (see the head of
+    // this file).
     let Some(url) = database_url("concurrent_writes_on_different_drinks_do_not_interfere") else {
         return;
     };
@@ -685,20 +746,22 @@ async fn concurrent_writes_on_different_drinks_do_not_interfere() {
             let case = format!("{first} x {last}");
             let (one, a) = drink_with(&url, profile, "cl", None, &[40.0, 160.0]).await;
             let (other, b) = drink_with(&url, profile, "cl", None, &[40.0, 160.0]).await;
-            let (first_outcome, last_outcome) = in_turn(
+            let first_sql = format!("DELETE FROM drink_component WHERE id = '{}'", a[0]);
+            let last_sql = format!("DELETE FROM drink_component WHERE id = '{}'", b[0]);
+            let (first_outcome, last_outcome) =
+                in_turn(&url, (first, &first_sql), (last, &last_sql)).await;
+            let both_serializable = first == "SERIALIZABLE" && last == "SERIALIZABLE";
+            replayed_after_false_conflict(
                 &url,
-                (
-                    first,
-                    &format!("DELETE FROM drink_component WHERE id = '{}'", a[0]),
-                ),
-                (
-                    last,
-                    &format!("DELETE FROM drink_component WHERE id = '{}'", b[0]),
-                ),
+                both_serializable,
+                (first, &first_sql),
+                first_outcome,
             )
-            .await;
-            first_outcome.unwrap_or_else(|e| panic!("{case}: first: {e}"));
-            last_outcome.unwrap_or_else(|e| panic!("{case}: last: {e}"));
+            .await
+            .unwrap_or_else(|e| panic!("{case}: first: {e}"));
+            replayed_after_false_conflict(&url, both_serializable, (last, &last_sql), last_outcome)
+                .await
+                .unwrap_or_else(|e| panic!("{case}: last: {e}"));
             assert_eq!(component_count(&pool, one).await, 1, "{case}");
             assert_eq!(component_count(&pool, other).await, 1, "{case}");
         }
